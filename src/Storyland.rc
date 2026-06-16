@@ -1,0 +1,3 @@
+#include "resource.h"
+
+IDI_STORYLAND ICON "resources/storyland_sticky_notes_v2.ico"
