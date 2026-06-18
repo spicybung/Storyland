@@ -37,6 +37,52 @@
 #pragma comment(lib, "Opengl32.lib")
 #pragma comment(lib, "Gdi32.lib")
 
+
+#ifndef GL_VERTEX_SHADER
+#define GL_VERTEX_SHADER 0x8B31
+#endif
+#ifndef GL_FRAGMENT_SHADER
+#define GL_FRAGMENT_SHADER 0x8B30
+#endif
+#ifndef GL_COMPILE_STATUS
+#define GL_COMPILE_STATUS 0x8B81
+#endif
+#ifndef GL_LINK_STATUS
+#define GL_LINK_STATUS 0x8B82
+#endif
+#ifndef GL_INFO_LOG_LENGTH
+#define GL_INFO_LOG_LENGTH 0x8B84
+#endif
+#ifndef GL_TEXTURE0
+#define GL_TEXTURE0 0x84C0
+#endif
+#ifndef GL_MULTISAMPLE
+#define GL_MULTISAMPLE 0x809D
+#endif
+#ifndef GL_CLAMP_TO_EDGE
+#define GL_CLAMP_TO_EDGE 0x812F
+#endif
+
+typedef char GLchar;
+typedef GLuint (APIENTRY *PFNGLCREATESHADERPROC)(GLenum type);
+typedef void (APIENTRY *PFNGLSHADERSOURCEPROC)(GLuint shader, GLsizei count, const GLchar* const* string, const GLint* length);
+typedef void (APIENTRY *PFNGLCOMPILESHADERPROC)(GLuint shader);
+typedef void (APIENTRY *PFNGLGETSHADERIVPROC)(GLuint shader, GLenum pname, GLint* params);
+typedef void (APIENTRY *PFNGLGETSHADERINFOLOGPROC)(GLuint shader, GLsizei bufSize, GLsizei* length, GLchar* infoLog);
+typedef void (APIENTRY *PFNGLDELETESHADERPROC)(GLuint shader);
+typedef GLuint (APIENTRY *PFNGLCREATEPROGRAMPROC)();
+typedef void (APIENTRY *PFNGLATTACHSHADERPROC)(GLuint program, GLuint shader);
+typedef void (APIENTRY *PFNGLLINKPROGRAMPROC)(GLuint program);
+typedef void (APIENTRY *PFNGLGETPROGRAMIVPROC)(GLuint program, GLenum pname, GLint* params);
+typedef void (APIENTRY *PFNGLGETPROGRAMINFOLOGPROC)(GLuint program, GLsizei bufSize, GLsizei* length, GLchar* infoLog);
+typedef void (APIENTRY *PFNGLDELETEPROGRAMPROC)(GLuint program);
+typedef void (APIENTRY *PFNGLUSEPROGRAMPROC)(GLuint program);
+typedef GLint (APIENTRY *PFNGLGETUNIFORMLOCATIONPROC)(GLuint program, const GLchar* name);
+typedef void (APIENTRY *PFNGLUNIFORM1IPROC)(GLint location, GLint v0);
+typedef void (APIENTRY *PFNGLUNIFORM1FPROC)(GLint location, GLfloat v0);
+typedef void (APIENTRY *PFNGLUNIFORM3FPROC)(GLint location, GLfloat v0, GLfloat v1, GLfloat v2);
+typedef void (APIENTRY *PFNGLACTIVETEXTUREPROC)(GLenum texture);
+
 #define ID_FILE_OPEN 1001
 #define ID_FILE_SAVE_AS 1002
 #define ID_FILE_EXPORT_TEXTURE 1003
@@ -68,24 +114,24 @@
 #define ID_VIEW_CUSTOM_EXPORT_MATRIX_SKIN_PREVIEW 1029
 #define ID_FILE_OPEN_DTZ_IMG 1030
 #define ID_DTZ_REPLACE_SELECTED_ENTRY 1031
+#define ID_VIEW_RENDER_STORIES 1032
+#define ID_VIEW_RENDER_TEXTURED 1033
+#define ID_VIEW_RENDER_SOLID 1034
+#define ID_VIEW_RENDER_WIREFRAME 1035
+#define ID_VIEW_SHOW_GRID 1036
+#define ID_VIEW_SHOW_BONES 1037
+#define ID_VIEW_SHOW_BOUNDS 1038
+#define ID_VIEW_SHOW_VIEWCUBE 1039
 #define ID_TREE 2001
 #define ID_DETAILS 2002
 #define ID_PREVIEW 2003
 #define ID_STATUS 2004
-#define ID_PREVIEW_ZOOM_IN 2005
-#define ID_PREVIEW_ZOOM_OUT 2006
-#define ID_PREVIEW_RESET 2007
-#define ID_PREVIEW_FIT 2008
 
 static HINSTANCE gInstance = nullptr;
 static HWND gMainWindow = nullptr;
 static HWND gTree = nullptr;
 static HWND gDetails = nullptr;
 static HWND gPreview = nullptr;
-static HWND gPreviewZoomIn = nullptr;
-static HWND gPreviewZoomOut = nullptr;
-static HWND gPreviewReset = nullptr;
-static HWND gPreviewFit = nullptr;
 static HWND gStatus = nullptr;
 
 static LeedsTextureArchive gTextureArchive;
@@ -120,6 +166,37 @@ static bool gModelTextureUploadNeeded = false;
 static GLuint gModelTextureId = 0;
 static bool gModelFlipTextureV = false;
 
+enum class StorylandOpenGlRenderMode { Stories, Textured, Solid, Wireframe };
+static StorylandOpenGlRenderMode gOpenGlRenderMode = StorylandOpenGlRenderMode::Textured;
+static bool gOpenGlShowGrid = false;
+static bool gOpenGlShowBones = false;
+static bool gOpenGlShowBounds = false;
+static bool gOpenGlShowViewCube = true;
+static bool gModelViewCubeDrag = false;
+static GLuint gStoriesShaderProgram = 0;
+static bool gStoriesShaderTried = false;
+static bool gStoriesShaderReady = false;
+static std::string gStoriesShaderStatus;
+
+static PFNGLCREATESHADERPROC pglCreateShader = nullptr;
+static PFNGLSHADERSOURCEPROC pglShaderSource = nullptr;
+static PFNGLCOMPILESHADERPROC pglCompileShader = nullptr;
+static PFNGLGETSHADERIVPROC pglGetShaderiv = nullptr;
+static PFNGLGETSHADERINFOLOGPROC pglGetShaderInfoLog = nullptr;
+static PFNGLDELETESHADERPROC pglDeleteShader = nullptr;
+static PFNGLCREATEPROGRAMPROC pglCreateProgram = nullptr;
+static PFNGLATTACHSHADERPROC pglAttachShader = nullptr;
+static PFNGLLINKPROGRAMPROC pglLinkProgram = nullptr;
+static PFNGLGETPROGRAMIVPROC pglGetProgramiv = nullptr;
+static PFNGLGETPROGRAMINFOLOGPROC pglGetProgramInfoLog = nullptr;
+static PFNGLDELETEPROGRAMPROC pglDeleteProgram = nullptr;
+static PFNGLUSEPROGRAMPROC pglUseProgram = nullptr;
+static PFNGLGETUNIFORMLOCATIONPROC pglGetUniformLocation = nullptr;
+static PFNGLUNIFORM1IPROC pglUniform1i = nullptr;
+static PFNGLUNIFORM1FPROC pglUniform1f = nullptr;
+static PFNGLUNIFORM3FPROC pglUniform3f = nullptr;
+static PFNGLACTIVETEXTUREPROC pglActiveTexture = nullptr;
+
 struct StorylandModelTextureRegion {
     std::string name;
     int sourceIndex = -1;
@@ -135,13 +212,177 @@ struct StorylandModelTextureRegion {
 
 static std::vector<StorylandModelTextureRegion> gModelTextureRegions;
 
+struct StorylandVec3 {
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+};
+
+struct StorylandQuat {
+    float w = 1.0f;
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+};
+
+static float vecDot(const StorylandVec3& a, const StorylandVec3& b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+static StorylandVec3 vecCross(const StorylandVec3& a, const StorylandVec3& b) {
+    return {
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x
+    };
+}
+
+static StorylandVec3 vecNormalize(StorylandVec3 v) {
+    float len = std::sqrt(std::max(0.00000001f, vecDot(v, v)));
+    v.x /= len;
+    v.y /= len;
+    v.z /= len;
+    return v;
+}
+
+static StorylandQuat quatNormalize(StorylandQuat q) {
+    float lenSq = q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z;
+    if (lenSq < 0.00000001f) lenSq = 0.00000001f;
+    float len = std::sqrt(lenSq);
+    q.w /= len;
+    q.x /= len;
+    q.y /= len;
+    q.z /= len;
+    return q;
+}
+
+static StorylandQuat quatMul(const StorylandQuat& a, const StorylandQuat& b) {
+    return quatNormalize({
+        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
+        a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+        a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w
+    });
+}
+
+static StorylandQuat quatFromAxisAngle(float degrees, float x, float y, float z) {
+    StorylandVec3 axis = vecNormalize({x, y, z});
+    float radians = degrees * 0.01745329251994329577f;
+    float half = radians * 0.5f;
+    float s = std::sin(half);
+    return quatNormalize({std::cos(half), axis.x * s, axis.y * s, axis.z * s});
+}
+
+static StorylandQuat quatFromVectors(StorylandVec3 from, StorylandVec3 to) {
+    from = vecNormalize(from);
+    to = vecNormalize(to);
+    float dot = vecDot(from, to);
+    if (dot < -1.0f) dot = -1.0f;
+    else if (dot > 1.0f) dot = 1.0f;
+    if (dot > 0.9999f) return {};
+    if (dot < -0.9999f) {
+        StorylandVec3 axis = vecCross({1.0f, 0.0f, 0.0f}, from);
+        if (vecDot(axis, axis) < 0.000001f) axis = vecCross({0.0f, 1.0f, 0.0f}, from);
+        axis = vecNormalize(axis);
+        return {0.0f, axis.x, axis.y, axis.z};
+    }
+    StorylandVec3 axis = vecCross(from, to);
+    return quatNormalize({1.0f + dot, axis.x, axis.y, axis.z});
+}
+
+static void glMultModelQuat(const StorylandQuat& q) {
+    StorylandQuat n = quatNormalize(q);
+    float xx = n.x * n.x;
+    float yy = n.y * n.y;
+    float zz = n.z * n.z;
+    float xy = n.x * n.y;
+    float xz = n.x * n.z;
+    float yz = n.y * n.z;
+    float wx = n.w * n.x;
+    float wy = n.w * n.y;
+    float wz = n.w * n.z;
+    GLfloat m[16] = {
+        1.0f - 2.0f * (yy + zz), 2.0f * (xy + wz),        2.0f * (xz - wy),        0.0f,
+        2.0f * (xy - wz),        1.0f - 2.0f * (xx + zz), 2.0f * (yz + wx),        0.0f,
+        2.0f * (xz + wy),        2.0f * (yz - wx),        1.0f - 2.0f * (xx + yy), 0.0f,
+        0.0f,                    0.0f,                    0.0f,                    1.0f
+    };
+    glMultMatrixf(m);
+}
+
+static StorylandVec3 arcballPointFromMouse(HWND hwnd, int x, int y) {
+    RECT rc{};
+    GetClientRect(hwnd, &rc);
+    float width = float(std::max<LONG>(1, rc.right - rc.left));
+    float height = float(std::max<LONG>(1, rc.bottom - rc.top));
+    float scale = std::min(width, height) * 0.48f;
+    float px = (float(x) - width * 0.5f) / scale;
+    float py = (height * 0.5f - float(y)) / scale;
+    float len2 = px * px + py * py;
+    if (len2 <= 1.0f) {
+        return vecNormalize({px, py, std::sqrt(1.0f - len2)});
+    }
+    float inv = 1.0f / std::sqrt(len2);
+    return {px * inv, py * inv, 0.0f};
+}
+
+static RECT viewCubeRect(HWND hwnd) {
+    RECT rc{};
+    GetClientRect(hwnd, &rc);
+    int width = std::max<LONG>(1, rc.right - rc.left);
+    int size = std::min(112, std::max(72, width / 8));
+    int margin = 12;
+    RECT out{};
+    out.right = rc.right - margin;
+    out.left = out.right - size;
+    out.top = rc.top + margin;
+    out.bottom = out.top + size;
+    return out;
+}
+
+static bool pointInRect(const RECT& rc, int x, int y) {
+    return x >= rc.left && x < rc.right && y >= rc.top && y < rc.bottom;
+}
+
+static bool pointInViewCube(HWND hwnd, int x, int y) {
+    if (!gOpenGlShowViewCube) return false;
+    return pointInRect(viewCubeRect(hwnd), x, y);
+}
+
+static StorylandVec3 viewCubePointFromMouse(HWND hwnd, int x, int y) {
+    RECT rc = viewCubeRect(hwnd);
+    float width = float(std::max<LONG>(1, rc.right - rc.left));
+    float height = float(std::max<LONG>(1, rc.bottom - rc.top));
+    float scale = std::min(width, height) * 0.46f;
+    float px = (float(x) - float(rc.left + rc.right) * 0.5f) / scale;
+    float py = (float(rc.top + rc.bottom) * 0.5f - float(y)) / scale;
+    float len2 = px * px + py * py;
+    if (len2 <= 1.0f) return vecNormalize({px, py, std::sqrt(1.0f - len2)});
+    float inv = 1.0f / std::sqrt(len2);
+    return {px * inv, py * inv, 0.0f};
+}
+
+static StorylandVec3 rotateVecByQuat(const StorylandQuat& q, StorylandVec3 v) {
+    StorylandQuat n = quatNormalize(q);
+    StorylandVec3 u{n.x, n.y, n.z};
+    float s = n.w;
+    StorylandVec3 uv = vecCross(u, v);
+    StorylandVec3 uuv = vecCross(u, uv);
+    return {
+        v.x + 2.0f * (s * uv.x + uuv.x),
+        v.y + 2.0f * (s * uv.y + uuv.y),
+        v.z + 2.0f * (s * uv.z + uuv.z)
+    };
+}
+
 static HGLRC gOpenGlContext = nullptr;
 static bool gOpenGlReady = false;
 static bool gModelLeftDrag = false;
 static bool gModelRightDrag = false;
 static POINT gModelLastMouse = {};
-static float gModelYawDegrees = -35.0f;
-static float gModelPitchDegrees = 20.0f;
+static StorylandQuat gModelViewRotation = {};
+static StorylandQuat gModelDragStartRotation = {};
+static StorylandVec3 gModelDragStartPoint = {};
 static float gModelDistance = 3.5f;
 static float gModelPanX = 0.0f;
 static float gModelPanY = 0.0f;
@@ -303,8 +544,11 @@ static bool writeWholeFileBinary(const std::wstring& path, const std::vector<uin
 static std::wstring buildDtzPreviewExtractRoot();
 static void clearDtzEmbeddedPreviewState();
 static bool currentModeUsesInteractiveModelViewport();
+static void drawOpenGlViewCube(HWND hwnd, int width, int height);
+static void drawOpenGlViewCubeLabels(HWND hwnd, HDC dc);
 static void applyModelViewportZoom(float scale);
 static void fitModelViewportCloser();
+static bool handleModelViewportShortcut(WPARAM key);
 static bool prepareDtzDirEntryPreview(int index, std::wstring& previewSummary);
 static void openSelectedDtzDirEntryStandalone();
 
@@ -1330,8 +1574,10 @@ static void clearView() {
 }
 
 static void resetModelViewport() {
-    gModelYawDegrees = -35.0f;
-    gModelPitchDegrees = 20.0f;
+    gModelViewRotation = quatMul(quatFromAxisAngle(-35.0f, 0.0f, 1.0f, 0.0f), quatFromAxisAngle(20.0f, 1.0f, 0.0f, 0.0f));
+    gModelDragStartRotation = gModelViewRotation;
+    gModelDragStartPoint = {};
+    gModelViewCubeDrag = false;
     gModelDistance = 3.5f;
     gModelPanX = 0.0f;
     gModelPanY = 0.0f;
@@ -1339,7 +1585,9 @@ static void resetModelViewport() {
 
 static void applyModelViewportZoom(float scale) {
     if (scale <= 0.0f) return;
-    gModelDistance = std::max(0.25f, std::min(80.0f, gModelDistance * scale));
+    gModelDistance *= scale;
+    if (gModelDistance < 0.05f) gModelDistance = 0.05f;
+    else if (gModelDistance > 240.0f) gModelDistance = 240.0f;
     if (gPreview) InvalidateRect(gPreview, nullptr, FALSE);
 }
 
@@ -1348,6 +1596,376 @@ static void fitModelViewportCloser() {
     gModelPanX = 0.0f;
     gModelPanY = 0.0f;
     if (gPreview) InvalidateRect(gPreview, nullptr, FALSE);
+}
+
+static const wchar_t* openGlRenderModeName(StorylandOpenGlRenderMode mode) {
+    switch (mode) {
+    case StorylandOpenGlRenderMode::Stories: return L"Stories shader";
+    case StorylandOpenGlRenderMode::Textured: return L"Texture";
+    case StorylandOpenGlRenderMode::Solid: return L"Solid";
+    case StorylandOpenGlRenderMode::Wireframe: return L"Wire";
+    }
+    return L"OpenGL";
+}
+
+static void setOpenGlRenderMode(StorylandOpenGlRenderMode mode) {
+    gOpenGlRenderMode = mode;
+    if (gPreview) InvalidateRect(gPreview, nullptr, FALSE);
+}
+
+static void rotateModelViewport(float degrees, float x, float y, float z) {
+    gModelViewRotation = quatMul(quatFromAxisAngle(degrees, x, y, z), gModelViewRotation);
+    if (gPreview) InvalidateRect(gPreview, nullptr, FALSE);
+}
+
+static bool moveArchiveViewportKey(WPARAM key) {
+    if (gMode != StorylandMode::ArchiveFile) return false;
+
+    float panStep = std::max(0.04f, gModelDistance * 0.055f);
+    float zoomIn = 0.78f;
+    float zoomOut = 1.28f;
+
+    switch (key) {
+    case 'W':
+        applyModelViewportZoom(zoomIn);
+        setStatus(L"LVZ/IMG: moved in. W/S move in/out, A/D strafe, Q/E vertical, right-drag pan.");
+        return true;
+    case 'S':
+        applyModelViewportZoom(zoomOut);
+        setStatus(L"LVZ/IMG: moved out. W/S move in/out, A/D strafe, Q/E vertical, right-drag pan.");
+        return true;
+    case 'A':
+        gModelPanX += panStep;
+        if (gPreview) InvalidateRect(gPreview, nullptr, FALSE);
+        setStatus(L"LVZ/IMG: strafe left/right with A/D.");
+        return true;
+    case 'D':
+        gModelPanX -= panStep;
+        if (gPreview) InvalidateRect(gPreview, nullptr, FALSE);
+        setStatus(L"LVZ/IMG: strafe left/right with A/D.");
+        return true;
+    case 'Q':
+        gModelPanY -= panStep;
+        if (gPreview) InvalidateRect(gPreview, nullptr, FALSE);
+        setStatus(L"LVZ/IMG: vertical move with Q/E.");
+        return true;
+    case 'E':
+        gModelPanY += panStep;
+        if (gPreview) InvalidateRect(gPreview, nullptr, FALSE);
+        setStatus(L"LVZ/IMG: vertical move with Q/E.");
+        return true;
+    }
+
+    return false;
+}
+
+static bool handleModelViewportShortcut(WPARAM key) {
+    if (!currentModeUsesInteractiveModelViewport()) return false;
+    if (moveArchiveViewportKey(key)) return true;
+
+    switch (key) {
+    case VK_OEM_PLUS:
+    case VK_ADD:
+    case VK_PRIOR:
+        applyModelViewportZoom(0.82f);
+        setStatus(L"Preview zoomed in. Keys: + / - zoom, F fit, R/0 reset, 1-4 render. LVZ/IMG: W/S/A/D/Q/E move.");
+        return true;
+
+    case VK_OEM_MINUS:
+    case VK_SUBTRACT:
+    case VK_NEXT:
+        applyModelViewportZoom(1.22f);
+        setStatus(L"Preview zoomed out. Keys: + / - zoom, F fit, R/0 reset, 1-4 render. LVZ/IMG: W/S/A/D/Q/E move.");
+        return true;
+
+    case VK_LEFT:
+        rotateModelViewport(-5.0f, 0.0f, 1.0f, 0.0f);
+        return true;
+    case VK_RIGHT:
+        rotateModelViewport(5.0f, 0.0f, 1.0f, 0.0f);
+        return true;
+    case VK_UP:
+        rotateModelViewport(-5.0f, 1.0f, 0.0f, 0.0f);
+        return true;
+    case VK_DOWN:
+        rotateModelViewport(5.0f, 1.0f, 0.0f, 0.0f);
+        return true;
+
+    case 'F':
+        fitModelViewportCloser();
+        setStatus(L"Preview fit closer. Keys: + / - zoom, F fit, R/0 reset, 1-4 render. LVZ/IMG: W/S/A/D/Q/E move.");
+        return true;
+
+    case 'R':
+    case '0':
+        resetModelViewport();
+        if (gPreview) InvalidateRect(gPreview, nullptr, FALSE);
+        setStatus(L"Preview view reset. Keys: + / - zoom, F fit, R/0 reset, 1-4 render. LVZ/IMG: W/S/A/D/Q/E move.");
+        return true;
+
+    case '1':
+        setOpenGlRenderMode(StorylandOpenGlRenderMode::Stories);
+        setStatus(L"OpenGL render: Stories shader.");
+        return true;
+    case '2':
+        setOpenGlRenderMode(StorylandOpenGlRenderMode::Textured);
+        setStatus(L"OpenGL render: texture.");
+        return true;
+    case '3':
+        setOpenGlRenderMode(StorylandOpenGlRenderMode::Solid);
+        setStatus(L"OpenGL render: solid.");
+        return true;
+    case '4':
+        setOpenGlRenderMode(StorylandOpenGlRenderMode::Wireframe);
+        setStatus(L"OpenGL render: wireframe.");
+        return true;
+    case 'G':
+        gOpenGlShowGrid = !gOpenGlShowGrid;
+        if (gPreview) InvalidateRect(gPreview, nullptr, FALSE);
+        setStatus(gOpenGlShowGrid ? L"OpenGL grid on." : L"OpenGL grid off.");
+        return true;
+    case 'B':
+        gOpenGlShowBones = !gOpenGlShowBones;
+        if (gPreview) InvalidateRect(gPreview, nullptr, FALSE);
+        setStatus(gOpenGlShowBones ? L"OpenGL bones on." : L"OpenGL bones off.");
+        return true;
+    case 'N':
+        gOpenGlShowBounds = !gOpenGlShowBounds;
+        if (gPreview) InvalidateRect(gPreview, nullptr, FALSE);
+        setStatus(gOpenGlShowBounds ? L"OpenGL bounds on." : L"OpenGL bounds off.");
+        return true;
+    case 'C':
+        gOpenGlShowViewCube = !gOpenGlShowViewCube;
+        if (gPreview) InvalidateRect(gPreview, nullptr, FALSE);
+        setStatus(gOpenGlShowViewCube ? L"Viewport cube on." : L"Viewport cube off.");
+        return true;
+    }
+
+    return false;
+}
+
+static void* getOpenGlProcAddress(const char* name) {
+    void* proc = reinterpret_cast<void*>(wglGetProcAddress(name));
+    if (proc == reinterpret_cast<void*>(0x1) || proc == reinterpret_cast<void*>(0x2) || proc == reinterpret_cast<void*>(0x3) || proc == reinterpret_cast<void*>(-1)) {
+        proc = nullptr;
+    }
+    if (!proc) {
+        HMODULE module = GetModuleHandleW(L"opengl32.dll");
+        if (module) proc = reinterpret_cast<void*>(GetProcAddress(module, name));
+    }
+    return proc;
+}
+
+static bool loadStoriesShaderFunctions() {
+    pglCreateShader = reinterpret_cast<PFNGLCREATESHADERPROC>(getOpenGlProcAddress("glCreateShader"));
+    pglShaderSource = reinterpret_cast<PFNGLSHADERSOURCEPROC>(getOpenGlProcAddress("glShaderSource"));
+    pglCompileShader = reinterpret_cast<PFNGLCOMPILESHADERPROC>(getOpenGlProcAddress("glCompileShader"));
+    pglGetShaderiv = reinterpret_cast<PFNGLGETSHADERIVPROC>(getOpenGlProcAddress("glGetShaderiv"));
+    pglGetShaderInfoLog = reinterpret_cast<PFNGLGETSHADERINFOLOGPROC>(getOpenGlProcAddress("glGetShaderInfoLog"));
+    pglDeleteShader = reinterpret_cast<PFNGLDELETESHADERPROC>(getOpenGlProcAddress("glDeleteShader"));
+    pglCreateProgram = reinterpret_cast<PFNGLCREATEPROGRAMPROC>(getOpenGlProcAddress("glCreateProgram"));
+    pglAttachShader = reinterpret_cast<PFNGLATTACHSHADERPROC>(getOpenGlProcAddress("glAttachShader"));
+    pglLinkProgram = reinterpret_cast<PFNGLLINKPROGRAMPROC>(getOpenGlProcAddress("glLinkProgram"));
+    pglGetProgramiv = reinterpret_cast<PFNGLGETPROGRAMIVPROC>(getOpenGlProcAddress("glGetProgramiv"));
+    pglGetProgramInfoLog = reinterpret_cast<PFNGLGETPROGRAMINFOLOGPROC>(getOpenGlProcAddress("glGetProgramInfoLog"));
+    pglDeleteProgram = reinterpret_cast<PFNGLDELETEPROGRAMPROC>(getOpenGlProcAddress("glDeleteProgram"));
+    pglUseProgram = reinterpret_cast<PFNGLUSEPROGRAMPROC>(getOpenGlProcAddress("glUseProgram"));
+    pglGetUniformLocation = reinterpret_cast<PFNGLGETUNIFORMLOCATIONPROC>(getOpenGlProcAddress("glGetUniformLocation"));
+    pglUniform1i = reinterpret_cast<PFNGLUNIFORM1IPROC>(getOpenGlProcAddress("glUniform1i"));
+    pglUniform1f = reinterpret_cast<PFNGLUNIFORM1FPROC>(getOpenGlProcAddress("glUniform1f"));
+    pglUniform3f = reinterpret_cast<PFNGLUNIFORM3FPROC>(getOpenGlProcAddress("glUniform3f"));
+    pglActiveTexture = reinterpret_cast<PFNGLACTIVETEXTUREPROC>(getOpenGlProcAddress("glActiveTexture"));
+
+    return pglCreateShader && pglShaderSource && pglCompileShader && pglGetShaderiv && pglGetShaderInfoLog &&
+           pglDeleteShader && pglCreateProgram && pglAttachShader && pglLinkProgram && pglGetProgramiv &&
+           pglGetProgramInfoLog && pglDeleteProgram && pglUseProgram && pglGetUniformLocation && pglUniform1i &&
+           pglUniform1f && pglUniform3f;
+}
+
+static const char* storylandStoriesVertexShaderSource() {
+    return
+        "#version 120\n"
+        "varying vec4 vColor;\n"
+        "varying vec2 vTex0;\n"
+        "varying vec3 vNormal;\n"
+        "varying float vFog;\n"
+        "void main(){\n"
+        "  vec4 eyePos = gl_ModelViewMatrix * gl_Vertex;\n"
+        "  gl_Position = gl_ModelViewProjectionMatrix * gl_Vertex;\n"
+        "  vColor = gl_Color;\n"
+        "  vTex0 = gl_MultiTexCoord0.xy;\n"
+        "  vNormal = normalize(gl_NormalMatrix * gl_Normal);\n"
+        "  float z = abs(eyePos.z);\n"
+        "  vFog = clamp((95.0 - z) / 90.0, 0.0, 1.0);\n"
+        "}\n";
+}
+
+static const char* storylandStoriesFragmentShaderSource() {
+    return
+        "#version 120\n"
+        "uniform sampler2D tex0;\n"
+        "uniform int uUseTexture;\n"
+        "uniform int uRenderMode;\n"
+        "uniform vec3 uFogColor;\n"
+        "varying vec4 vColor;\n"
+        "varying vec2 vTex0;\n"
+        "varying vec3 vNormal;\n"
+        "varying float vFog;\n"
+        "void main(){\n"
+        "  vec4 base = vec4(vColor.rgb, 1.0);\n"
+        "  if(uUseTexture != 0){ vec4 tex = texture2D(tex0, vTex0); base.rgb *= tex.rgb; }\n"
+        "  vec3 n = normalize(vNormal);\n"
+        "  vec3 l0 = normalize(vec3(0.25, 0.55, 0.78));\n"
+        "  vec3 l1 = normalize(vec3(-0.60, -0.25, 0.50));\n"
+        "  float d0 = max(dot(n, l0), 0.0);\n"
+        "  float d1 = max(dot(n, l1), 0.0) * 0.32;\n"
+        "  vec3 v = vec3(0.0, 0.0, 1.0);\n"
+        "  float spec = pow(max(dot(reflect(-l0, n), v), 0.0), 18.0) * 0.14;\n"
+        "  vec3 lit = base.rgb;\n"
+        "  if(uRenderMode == 0 || uRenderMode == 2){\n"
+        "    lit = base.rgb * (0.62 + d0 * 0.55 + d1) + spec;\n"
+        "  }\n"
+        "  lit = mix(uFogColor, clamp(lit, 0.0, 1.0), vFog);\n"
+        "  gl_FragColor = vec4(lit, 1.0);\n"
+        "}\n";
+}
+
+static GLuint compileStoriesShader(GLenum type, const char* source, std::string& error) {
+    GLuint shader = pglCreateShader(type);
+    if (shader == 0) {
+        error = "glCreateShader failed";
+        return 0;
+    }
+
+    const GLchar* sources[] = { source };
+    pglShaderSource(shader, 1, sources, nullptr);
+    pglCompileShader(shader);
+
+    GLint ok = 0;
+    pglGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        GLint length = 0;
+        pglGetShaderiv(shader, GL_INFO_LOG_LENGTH, &length);
+        std::string log(size_t(std::max(1, length)), '\0');
+        GLsizei written = 0;
+        pglGetShaderInfoLog(shader, GLsizei(log.size()), &written, log.data());
+        if (written >= 0 && size_t(written) < log.size()) log.resize(size_t(written));
+        error = log.empty() ? "shader compile failed" : log;
+        pglDeleteShader(shader);
+        return 0;
+    }
+
+    return shader;
+}
+
+static bool buildStoriesShaderProgram() {
+    if (gStoriesShaderTried) return gStoriesShaderReady;
+    gStoriesShaderTried = true;
+    gStoriesShaderStatus.clear();
+
+    if (!loadStoriesShaderFunctions()) {
+        gStoriesShaderStatus = "OpenGL shader functions unavailable; fixed pipeline fallback active";
+        return false;
+    }
+
+    std::string error;
+    GLuint vertexShader = compileStoriesShader(GL_VERTEX_SHADER, storylandStoriesVertexShaderSource(), error);
+    if (vertexShader == 0) {
+        gStoriesShaderStatus = "vertex shader: " + error;
+        return false;
+    }
+
+    GLuint fragmentShader = compileStoriesShader(GL_FRAGMENT_SHADER, storylandStoriesFragmentShaderSource(), error);
+    if (fragmentShader == 0) {
+        pglDeleteShader(vertexShader);
+        gStoriesShaderStatus = "fragment shader: " + error;
+        return false;
+    }
+
+    GLuint program = pglCreateProgram();
+    pglAttachShader(program, vertexShader);
+    pglAttachShader(program, fragmentShader);
+    pglLinkProgram(program);
+    pglDeleteShader(vertexShader);
+    pglDeleteShader(fragmentShader);
+
+    GLint linked = 0;
+    pglGetProgramiv(program, GL_LINK_STATUS, &linked);
+    if (!linked) {
+        GLint length = 0;
+        pglGetProgramiv(program, GL_INFO_LOG_LENGTH, &length);
+        std::string log(size_t(std::max(1, length)), '\0');
+        GLsizei written = 0;
+        pglGetProgramInfoLog(program, GLsizei(log.size()), &written, log.data());
+        if (written >= 0 && size_t(written) < log.size()) log.resize(size_t(written));
+        pglDeleteProgram(program);
+        gStoriesShaderStatus = log.empty() ? "shader link failed" : log;
+        return false;
+    }
+
+    gStoriesShaderProgram = program;
+    gStoriesShaderReady = true;
+    gStoriesShaderStatus = "Stories GLSL shader active";
+    return true;
+}
+
+static void stopStoriesShaderProgram() {
+    if (pglUseProgram) pglUseProgram(0);
+}
+
+static bool beginStoriesShaderProgram(bool useTexture) {
+    if (!buildStoriesShaderProgram()) return false;
+    if (!pglUseProgram || gStoriesShaderProgram == 0) return false;
+
+    pglUseProgram(gStoriesShaderProgram);
+    GLint loc = pglGetUniformLocation(gStoriesShaderProgram, "tex0");
+    if (loc >= 0) pglUniform1i(loc, 0);
+    loc = pglGetUniformLocation(gStoriesShaderProgram, "uUseTexture");
+    if (loc >= 0) pglUniform1i(loc, useTexture ? 1 : 0);
+    loc = pglGetUniformLocation(gStoriesShaderProgram, "uRenderMode");
+    if (loc >= 0) {
+        int mode = 0;
+        if (gOpenGlRenderMode == StorylandOpenGlRenderMode::Textured) mode = 1;
+        else if (gOpenGlRenderMode == StorylandOpenGlRenderMode::Solid) mode = 2;
+        else if (gOpenGlRenderMode == StorylandOpenGlRenderMode::Wireframe) mode = 3;
+        pglUniform1i(loc, mode);
+    }
+    loc = pglGetUniformLocation(gStoriesShaderProgram, "uFogColor");
+    if (loc >= 0) pglUniform3f(loc, 0.115f, 0.120f, 0.128f);
+    return true;
+}
+
+static void setupFixedPipelineStoriesLighting(bool lit) {
+    if (!lit) {
+        glDisable(GL_LIGHTING);
+        glDisable(GL_COLOR_MATERIAL);
+        return;
+    }
+
+    glEnable(GL_LIGHTING);
+    glEnable(GL_LIGHT0);
+    glEnable(GL_LIGHT1);
+    glEnable(GL_NORMALIZE);
+    glEnable(GL_COLOR_MATERIAL);
+    glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE);
+
+    GLfloat ambientModel[] = {0.42f, 0.42f, 0.44f, 1.0f};
+    glLightModelfv(GL_LIGHT_MODEL_AMBIENT, ambientModel);
+    GLfloat light0Pos[] = {0.35f, 0.55f, 0.78f, 0.0f};
+    GLfloat light0Diffuse[] = {0.92f, 0.92f, 0.88f, 1.0f};
+    GLfloat light0Spec[] = {0.16f, 0.16f, 0.15f, 1.0f};
+    glLightfv(GL_LIGHT0, GL_POSITION, light0Pos);
+    glLightfv(GL_LIGHT0, GL_DIFFUSE, light0Diffuse);
+    glLightfv(GL_LIGHT0, GL_SPECULAR, light0Spec);
+    GLfloat light1Pos[] = {-0.60f, -0.25f, 0.50f, 0.0f};
+    GLfloat light1Diffuse[] = {0.42f, 0.42f, 0.46f, 1.0f};
+    GLfloat light1Spec[] = {0.0f, 0.0f, 0.0f, 1.0f};
+    glLightfv(GL_LIGHT1, GL_POSITION, light1Pos);
+    glLightfv(GL_LIGHT1, GL_DIFFUSE, light1Diffuse);
+    glLightfv(GL_LIGHT1, GL_SPECULAR, light1Spec);
+    GLfloat materialSpec[] = {0.18f, 0.18f, 0.16f, 1.0f};
+    glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, materialSpec);
+    glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 18.0f);
 }
 
 static bool initializeOpenGlPreview(HWND hwnd) {
@@ -1391,9 +2009,15 @@ static bool initializeOpenGlPreview(HWND hwnd) {
     }
 
     glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
     glDisable(GL_CULL_FACE);
     glShadeModel(GL_SMOOTH);
-    glClearColor(0.06f, 0.06f, 0.065f, 1.0f);
+    glEnable(GL_NORMALIZE);
+    glEnable(GL_LINE_SMOOTH);
+    glHint(GL_LINE_SMOOTH_HINT, GL_NICEST);
+    glClearColor(0.115f, 0.120f, 0.128f, 1.0f);
+
+    buildStoriesShaderProgram();
 
     wglMakeCurrent(nullptr, nullptr);
     ReleaseDC(hwnd, dc);
@@ -1404,7 +2028,20 @@ static bool initializeOpenGlPreview(HWND hwnd) {
 static void destroyOpenGlPreview() {
     clearModelTexture();
     if (gOpenGlContext) {
-        wglMakeCurrent(nullptr, nullptr);
+        HDC dc = gPreview ? GetDC(gPreview) : nullptr;
+        if (dc) wglMakeCurrent(dc, gOpenGlContext);
+        if (gStoriesShaderProgram != 0 && pglDeleteProgram) {
+            pglDeleteProgram(gStoriesShaderProgram);
+        }
+        gStoriesShaderProgram = 0;
+        gStoriesShaderReady = false;
+        gStoriesShaderTried = false;
+        if (dc) {
+            wglMakeCurrent(nullptr, nullptr);
+            ReleaseDC(gPreview, dc);
+        } else {
+            wglMakeCurrent(nullptr, nullptr);
+        }
         wglDeleteContext(gOpenGlContext);
         gOpenGlContext = nullptr;
     }
@@ -2441,12 +3078,9 @@ static void selectAnimOverview() {
     }
     ss << L"\r\n";
 
-    ss << L"Controls:\r\n"
-       << L"  View > Play/Pause Animation\r\n"
-       << L"  View > Stop Animation\r\n"
-       << L"  View > Step Animation Back / Forward\r\n"
-       << L"  LMB rotate, RMB pan, mouse wheel zoom.\r\n\r\n"
-       << L"Important: if this specific .anim layout is not decoded yet, Storyland keeps it attached and inspectable without popping up modal warnings.\r\n\r\n";
+    ss << L"Viewer keys:\r\n"
+       << L"  + / Page Up zoom in, - / Page Down zoom out, F fit closer, R or 0 reset.\r\n"
+       << L"  LMB rotate, RMB pan, mouse wheel zoom.\r\n\r\n";
 
     ss << L"String/name hints found in the file:\r\n";
     const auto& hints = gAnimFile.stringHints();
@@ -2649,13 +3283,6 @@ static StorylandModelPoint displayBonePosition(const StorylandModelBone& bone);
 static float lengthStorylandPoint(const StorylandModelPoint& a);
 static bool boneHasVisiblePreviewPosition(const StorylandModelBone& bone);
 
-struct StorylandQuat {
-    float x = 0.0f;
-    float y = 0.0f;
-    float z = 0.0f;
-    float w = 1.0f;
-};
-
 static std::vector<StorylandQuat> gLastAnimatedBoneWorldRotations;
 static std::vector<StorylandModelPoint> gLastAnimatedBoneRawPositions;
 
@@ -2756,9 +3383,12 @@ static StorylandQuat slerpIdentityToQuat(const StorylandQuat& q, float factor) {
         target.w = -target.w;
     }
 
-    factor = std::max(0.0f, std::min(1.0f, factor));
+    if (factor < 0.0f) factor = 0.0f;
+    else if (factor > 1.0f) factor = 1.0f;
 
-    float dot = std::max(-1.0f, std::min(1.0f, target.w));
+    float dot = target.w;
+    if (dot < -1.0f) dot = -1.0f;
+    else if (dot > 1.0f) dot = 1.0f;
     if (dot > 0.9995f) {
         StorylandQuat out;
         out.x = target.x * factor;
@@ -2787,7 +3417,10 @@ static StorylandQuat slerpIdentityToQuat(const StorylandQuat& q, float factor) {
 
 static float quatDeltaAngleRadians(const StorylandQuat& q) {
     StorylandQuat normalized = normalizeStorylandQuat(q);
-    float w = std::fabs(std::max(-1.0f, std::min(1.0f, normalized.w)));
+    float w = normalized.w;
+    if (w < -1.0f) w = -1.0f;
+    else if (w > 1.0f) w = 1.0f;
+    w = std::fabs(w);
     return 2.0f * std::acos(w);
 }
 
@@ -5446,8 +6079,7 @@ static void drawAnimPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
     glTranslatef(gModelPanX, gModelPanY, -gModelDistance);
-    glRotatef(gModelPitchDegrees, 1.0f, 0.0f, 0.0f);
-    glRotatef(gModelYawDegrees, 0.0f, 1.0f, 0.0f);
+    glMultModelQuat(gModelViewRotation);
 
     float minX = -0.85f, maxX = 0.85f;
     float minY = -0.35f, maxY = 0.35f;
@@ -5530,7 +6162,6 @@ static void drawAnimPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
         L" / " + std::to_wstring(gAnimFile.durationSeconds()) +
         L"  |  " + (gAnimPlaying ? L"playing" : L"paused") +
         L"  |  LMB rotate, RMB pan, wheel zoom";
-    drawOpenGlTextOverlayFallback(dc, rc, title);
 }
 
 
@@ -6090,8 +6721,7 @@ static void selectModelBone(int index) {
         }
     }
 
-    ss << L"This is imported from MDL RslNode1/RslNode2 frame data. "
-       << L"RslNode3 geometry-extension candidates are not drawn as skeleton bones, and the OpenGL preview uses accumulated local-frame space instead of raw LTM/world space.\r\n";
+    ss << L"Source: RslNode1/RslNode2 frame data. Preview uses accumulated local frame space.\r\n";
 
     setDetails(ss.str());
     InvalidateRect(gPreview, nullptr, TRUE);
@@ -6099,93 +6729,72 @@ static void selectModelBone(int index) {
 
 static void selectModelField(int index) {
     const auto& fields = gModelFile.fields();
-    std::wstringstream ss;
-    ss << L"MDL: " << widen(gModelFile.modelKindName()) << L"\r\n"
-       << L"Size: " << gModelFile.fileSize() << L" bytes / " << ((gModelFile.fileSize() + 2047) / 2048) << L" sectors\r\n";
-    if (!gModelTextureStatus.empty()) {
-        ss << L"Texture status: " << gModelTextureStatus << L"\r\n";
+
+    size_t weightedVertices = 0;
+    uint32_t influenceTotal = 0;
+    for (const auto& weights : gModelFile.previewSkinWeights()) {
+        if (!weights.valid) continue;
+        weightedVertices++;
+        influenceTotal += weights.influenceCount;
     }
-    if (gModelAnimLoaded) {
-        ss << L"Attached ANIM: " << gModelAnimPath << L"\r\n"
-           << L"ANIM status: " << gModelAnimStatus << L"\r\n"
-           << L"ANIM time: " << gAnimCurrentTime << L" / " << gAnimFile.durationSeconds() << L"\r\n";
-        if (!gAnimFile.hasDecodedMotion()) {
-            ss << L"ANIM decode: no Leeds clip/channel descriptors decoded for this file yet.\r\n";
-        } else if (modelHasUsableTrueSkinWeights(gModelFile.previewPoints())) {
-            uint32_t validSkinWeightCount = 0;
-            uint32_t influenceTotal = 0;
-            for (const auto& weights : gModelFile.previewSkinWeights()) {
-                if (!weights.valid) continue;
-                validSkinWeightCount++;
-                influenceTotal += weights.influenceCount;
-            }
-            ss << L"ANIM mesh preview: " << (shouldUseCustomExportMatrixSkinPreview() ? L"custom/BLeeds delta-skeleton + matrix skin path, retail HAnim path bypassed" : L"retail HAnim pivot path from sl_hanim_linear_order_fix") << L"\r\n";
-            ss << L"Custom/BLeeds matrix skin preview toggle: " << (gCustomExportMatrixSkinPreview ? L"on" : L"off") << L"; auto-detect=" << (modelTextureSetLooksLikeCustomBleedsPedExport() ? L"custom-like" : L"retail-like") << L"\r\n";
-            ss << L"Custom path solver: " << (shouldUseCustomExportMatrixSkinPreview() ? L"all-ANIM first-key delta skeleton + matrix palette" : L"inactive") << L"\r\n";
-            ss << L"PED skin displacement clamp: platform-aware; LCS full-skeleton previews no longer use weapon clamps\r\n";
-            ss << L"Skin vertices: " << validSkinWeightCount << L"/" << gModelFile.previewSkinWeights().size()
-               << L" weighted, influences=" << influenceTotal << L"\r\n";
-            ss << L"PED skin word decode: BLeeds byte0 token + bytes1..3 float weight\r\n";
-            ss << L"PED skin packet parse: exact sequential PED VIF first; marker-local fallback only\r\n";
-            ss << L"PED skin palette remap: auto LCS/VCS canonical palette; LCS uses hierarchy-table/left-arm-first skin token order\r\n";
-            bool currentModelIsLcsPed = currentModelLooksLikeLcsPedSkeleton(gModelFile.armatureBones());
-            bool activeClipIsWeaponLike = currentAttachedAnimLooksWeaponLike() && !currentModelIsLcsPed;
-            ss << L"ANIM root translation lock: " << (currentModelIsLcsPed ? L"off for LCS full-skeleton mode" : (gLockAnimRootPreview ? L"on" : L"off")) << L"\r\n";
-            if (currentModelIsLcsPed) {
-                ss << L"LCS weapon-name special-cases: disabled; every LCS PED clip drives the full skeleton\r\n";
-            } else {
-                ss << L"Weapon/layer safeguards active: " << (activeClipIsWeaponLike ? L"yes" : L"no") << L"\r\n";
-                if (activeClipIsWeaponLike) {
-                    ss << L"Weapon lower-body hard bind-pose freeze: " << (gLockWeaponLowerBodyPreview ? L"on" : L"off") << L"\r\n";
-                    ss << L"Weapon upper-body layer mask: " << (gWeaponUpperBodyLayerMaskPreview ? L"on" : L"off") << L"\r\n";
-                    ss << L"Weapon overlay solver: arm/clavicle/hand layer only; root/torso/head/legs frozen in bind pose\r\n";
-                }
-            }
-            ss << L"ANIM root rotation lock: " << (currentModelIsLcsPed ? L"off for LCS full-skeleton mode" : L"default") << L"\r\n";
-            ss << L"LCS strict-local hierarchy anim path: raw local-frame animation is basis-mapped back onto mesh/display space\r\n";
-            ss << L"LCS all-anim mesh skinning: raw-space LBS uses weighted animated*inverse(bind) bone transforms\r\n";
-            ss << L"LCS segment/dominant-bone mesh hacks: disabled for LCS PED preview\r\n";
-            ss << L"LCS zero-LTM ANIM rebase: local deltas use composed bind-world rotations, not identity LTM\r\n";
-            ss << L"LCS static bind-space guard: skin-centroid bind poses stay in preview space, but animation uses strict local hierarchy\r\n";
-            ss << L"LCS parent resolver: real RslNode parent pointers override generic commonBoneParents table for thighs/clavicles\r\n";
-            ss << L"LCS armature guard: no-weight finger/toe display bones stay parent-anchored, not mesh-center collapsed\r\n";
-            ss << L"LCS absolute-pose solver: every LCS PED clip uses current*inverse(rest) delta order\r\n";
-            ss << L"LCS skin token order guard: indices 6..10 map to left arm, 11..15 map to right arm\r\n";
-            ss << L"ANIM pose solve: VCS weapon clips use first-key layer delta; LCS PED clips use absolute-local pose\r\n";
-            ss << L"ANIM/MDL bridge: BLeeds direct-id map active; raw hierarchy node order is not used as anim id.\r\n";
-            ss << L"MDL hierarchy IDs: assigned from BLeeds bone-name direct-id map; raw entry byte fallback disabled\r\n";
-            ss << L"MDL hierarchy order: RslTAnim allocation-order frames with canonical PED parents\r\n";
-        } else if (gApproximateAnimMeshPreview) {
-            ss << L"ANIM mesh preview: true MDL skin weights were not found for these preview vertices, using approximate fallback binding.\r\n";
-            ss << L"ANIM root/pelvis preview lock: " << (gLockAnimRootPreview ? L"on" : L"off") << L"\r\n";
-            ss << L"Weapon lower-body preview lock: " << (gLockWeaponLowerBodyPreview ? L"on" : L"off") << L"\r\n";
-        } else {
-            ss << L"ANIM mesh preview: mesh binding is disabled. The armature still uses decoded ANIM transform channels.\r\n";
-        }
+
+    std::wstringstream ss;
+    ss << L"MDL\r\n"
+       << L"Type: " << widen(gModelFile.modelKindName()) << L"\r\n"
+       << L"Size: " << gModelFile.fileSize() << L" bytes / " << ((gModelFile.fileSize() + 2047) / 2048) << L" sectors\r\n";
+
+    if (!gModelTextureStatus.empty()) {
+        ss << L"Texture: " << gModelTextureStatus << L"\r\n";
     }
     if (gModelTextureLoaded) {
         ss << L"Texture archive: " << gModelTexturePath << L"\r\n"
-           << L"Texture atlas: " << widen(gModelTextureName) << L" firstIndex=" << gModelTextureIndex
-           << L" size=" << gModelTextureImage.width << L"x" << gModelTextureImage.height << L"\r\n";
-        if (!gModelTextureRegions.empty()) {
-            ss << L"Texture atlas entries:";
-            for (const auto& region : gModelTextureRegions) {
-                ss << L" " << region.sourceIndex << L":" << widen(region.name);
-            }
-            ss << L"\r\n";
-        }
+           << L"Texture atlas: " << widen(gModelTextureName)
+           << L" [" << gModelTextureImage.width << L"x" << gModelTextureImage.height << L"]\r\n";
     }
-    ss << L"\r\n";
+
+    ss << L"\r\nPreview\r\n"
+       << L"Vertices: " << gModelFile.previewPoints().size() << L"\r\n"
+       << L"Triangles: " << gModelFile.previewTriangles().size() << L"\r\n"
+       << L"Texcoords: " << gModelFile.previewTexcoords().size() << L"\r\n"
+       << L"Bones: " << gModelFile.armatureBones().size() << L"\r\n";
+
+    if (!gModelFile.previewSkinWeights().empty()) {
+        ss << L"Skin: " << weightedVertices << L"/" << gModelFile.previewSkinWeights().size()
+           << L" weighted vertices";
+        if (influenceTotal != 0) ss << L", " << influenceTotal << L" influences";
+        ss << L"\r\n";
+    }
+
+    const auto& materialNames = gModelFile.previewMaterialTextureNames();
+    if (!materialNames.empty()) {
+        ss << L"Materials:";
+        size_t shown = 0;
+        for (size_t i = 0; i < materialNames.size() && shown < 12; ++i) {
+            if (materialNames[i].empty()) continue;
+            ss << L" " << i << L":" << widen(materialNames[i]);
+            shown++;
+        }
+        if (materialNames.size() > shown) ss << L" +" << (materialNames.size() - shown) << L" more";
+        ss << L"\r\n";
+    }
+
+    if (gModelAnimLoaded) {
+        ss << L"\r\nANIM\r\n"
+           << L"File: " << gModelAnimPath << L"\r\n"
+           << L"Time: " << gAnimCurrentTime << L" / " << gAnimFile.durationSeconds() << L"\r\n"
+           << L"State: " << (gAnimFile.hasDecodedMotion() ? L"decoded" : L"inspection only") << L"\r\n";
+    }
+
     if (index >= 0 && size_t(index) < fields.size()) {
         const auto& f = fields[size_t(index)];
-        ss << L"Selected field:\r\n"
+        ss << L"\r\nField\r\n"
            << L"Group: " << widen(f.group) << L"\r\n"
            << L"Name: " << widen(f.name) << L"\r\n"
            << L"Offset: " << hexWide(f.offset, 6) << L"\r\n"
-           << L"Value: " << hexWide(f.value) << L"\r\n"
-           << L"Note: " << widen(f.note) << L"\r\n\r\n";
+           << L"Value: " << hexWide(f.value) << L"\r\n";
+        if (!f.note.empty()) ss << L"Note: " << widen(f.note) << L"\r\n";
     }
-    for (const auto& line : gModelFile.lines()) ss << widen(line.text) << L"\r\n";
+
     setDetails(ss.str());
     InvalidateRect(gPreview, nullptr, TRUE);
 }
@@ -7268,7 +7877,7 @@ static void openCompanionImgForCurrentDtz() {
 static void showAboutDialog() {
     MessageBoxW(
         gMainWindow,
-        L"Storyland\r\n\r\nmade by spicybung\r\nhttps://github.com/spicybung\r\n\r\nLeeds/Stories file workbench. CHK/XTX/TEX, MDL/DFF, IMG/LVZ, and GAME.DTZ.",
+        L"Storyland\r\n\r\nauthor: spicybung\r\nhttps://github.com/spicybung\r\n\r\nAn analyzer, editor, and viewer for Grand Theft Auto Stories file formats.",
         L"About Storyland",
         MB_OK | MB_ICONINFORMATION
     );
@@ -7584,8 +8193,7 @@ static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
         title += L"  |  bpp=" + std::to_wstring(texture.bpp);
         title += L"  |  header=" + hexWide(texture.headerOffset, 6);
         title += L"  |  no .DIR";
-        drawOpenGlTextOverlayFallback(dc, rc, title);
-        return;
+            return;
     }
 
     double aspect = double(width) / double(height);
@@ -7593,12 +8201,8 @@ static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
 
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
-    float archiveCameraDistance = std::max(4.0f, gModelDistance);
-    if (gSelectedKind == StorylandTreeKind::ArchiveMeshResource ||
-        gSelectedKind == StorylandTreeKind::ArchiveTextureResource ||
-        gSelectedKind == StorylandTreeKind::ArchiveEntry) {
-        archiveCameraDistance = std::max(2.2f, gModelDistance * 0.45f);
-    }
+    float archiveCameraDistance = gModelDistance;
+    if (archiveCameraDistance < 0.05f) archiveCameraDistance = 0.05f;
     glTranslatef(gModelPanX, gModelPanY, -archiveCameraDistance);
 
     const auto& entries = gArchiveBrowser.entries();
@@ -7750,8 +8354,7 @@ static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
     float largestSpan = std::max(spanX, std::max(spanY, spanZ));
     float modelScale = 2.4f / std::max(1.0f, largestSpan);
 
-    glRotatef(gModelPitchDegrees, 1.0f, 0.0f, 0.0f);
-    glRotatef(gModelYawDegrees, 0.0f, 0.0f, 1.0f);
+    glMultModelQuat(gModelViewRotation);
     glScalef(modelScale, modelScale, modelScale);
     glTranslatef(-centerX, -centerY, -centerZ);
 
@@ -7852,8 +8455,11 @@ static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
         glPointSize(1.0f);
     }
 
+    drawOpenGlViewCube(hwnd, width, height);
+
     glFlush();
     SwapBuffers(dc);
+    drawOpenGlViewCubeLabels(hwnd, dc);
     wglMakeCurrent(nullptr, nullptr);
 
     std::wstring title = L"OpenGL LVZ+IMG mesh viewport  |  ";
@@ -7866,9 +8472,146 @@ static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
     title += L"  |  instances=" + std::to_wstring(drawnInstances);
     title += L"  |  tris=" + std::to_wstring(drawnTriangles);
     if (drawnTriangles >= triangleSafetyCap) title += L" capped";
-    title += L"  |  no .DIR  |  LMB rotate, RMB pan, wheel zoom";
-    drawOpenGlTextOverlayFallback(dc, rc, title);
+    title += L"  |  LMB rotate, RMB pan, wheel/+/- zoom, W/S/A/D/Q/E move";
 }
+
+
+static StorylandModelPoint previewTriangleNormal(const StorylandModelPoint& a, const StorylandModelPoint& b, const StorylandModelPoint& c) {
+    StorylandModelPoint ab{b.x - a.x, b.y - a.y, b.z - a.z};
+    StorylandModelPoint ac{c.x - a.x, c.y - a.y, c.z - a.z};
+    StorylandModelPoint n = crossStorylandPoint(ab, ac);
+    return normalizeStorylandPoint(n, StorylandModelPoint{0.0f, 0.0f, 1.0f});
+}
+
+static void emitPreviewVertexWithNormal(const StorylandModelPoint& p, const StorylandModelPoint& n) {
+    glNormal3f(n.x, n.y, n.z);
+    glVertex3f(p.x, p.y, p.z);
+}
+
+static void drawOpenGlViewCubeFaces() {
+    glBegin(GL_QUADS);
+
+    glColor3f(0.68f, 0.18f, 0.16f);
+    glVertex3f(0.42f, -0.42f, -0.42f); glVertex3f(0.42f, 0.42f, -0.42f); glVertex3f(0.42f, 0.42f, 0.42f); glVertex3f(0.42f, -0.42f, 0.42f);
+
+    glColor3f(0.22f, 0.58f, 0.22f);
+    glVertex3f(-0.42f, 0.42f, -0.42f); glVertex3f(0.42f, 0.42f, -0.42f); glVertex3f(0.42f, 0.42f, 0.42f); glVertex3f(-0.42f, 0.42f, 0.42f);
+
+    glColor3f(0.18f, 0.32f, 0.70f);
+    glVertex3f(-0.42f, -0.42f, 0.42f); glVertex3f(0.42f, -0.42f, 0.42f); glVertex3f(0.42f, 0.42f, 0.42f); glVertex3f(-0.42f, 0.42f, 0.42f);
+
+    glColor3f(0.42f, 0.12f, 0.11f);
+    glVertex3f(-0.42f, -0.42f, -0.42f); glVertex3f(-0.42f, -0.42f, 0.42f); glVertex3f(-0.42f, 0.42f, 0.42f); glVertex3f(-0.42f, 0.42f, -0.42f);
+
+    glColor3f(0.12f, 0.36f, 0.12f);
+    glVertex3f(-0.42f, -0.42f, -0.42f); glVertex3f(-0.42f, -0.42f, 0.42f); glVertex3f(0.42f, -0.42f, 0.42f); glVertex3f(0.42f, -0.42f, -0.42f);
+
+    glColor3f(0.10f, 0.20f, 0.44f);
+    glVertex3f(-0.42f, -0.42f, -0.42f); glVertex3f(0.42f, -0.42f, -0.42f); glVertex3f(0.42f, 0.42f, -0.42f); glVertex3f(-0.42f, 0.42f, -0.42f);
+
+    glEnd();
+}
+
+static void drawOpenGlViewCube(HWND hwnd, int width, int height) {
+    if (!gOpenGlShowViewCube) return;
+
+    RECT cubeRc = viewCubeRect(hwnd);
+    int cubeW = std::max<int>(1, int(cubeRc.right - cubeRc.left));
+    int cubeH = std::max<int>(1, int(cubeRc.bottom - cubeRc.top));
+    int cubeBottom = height - cubeRc.bottom;
+
+    stopStoriesShaderProgram();
+    setupFixedPipelineStoriesLighting(false);
+
+    glViewport(cubeRc.left, cubeBottom, cubeW, cubeH);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(cubeRc.left, cubeBottom, cubeW, cubeH);
+    glClearColor(0.145f, 0.150f, 0.158f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glDisable(GL_SCISSOR_TEST);
+
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glOrtho(-1.15, 1.15, -1.15, 1.15, -4.0, 4.0);
+
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+    glMultModelQuat(gModelViewRotation);
+
+    glDisable(GL_TEXTURE_2D);
+    glEnable(GL_DEPTH_TEST);
+    glDisable(GL_LIGHTING);
+    glDisable(GL_CULL_FACE);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    drawOpenGlViewCubeFaces();
+    glDisable(GL_BLEND);
+
+    glLineWidth(1.2f);
+    glColor3f(0.82f, 0.86f, 0.88f);
+    glBegin(GL_LINES);
+    auto edge = [](float ax, float ay, float az, float bx, float by, float bz) {
+        glVertex3f(ax, ay, az); glVertex3f(bx, by, bz);
+    };
+    float s = 0.42f;
+    edge(-s,-s,-s, s,-s,-s); edge(s,-s,-s, s,s,-s); edge(s,s,-s, -s,s,-s); edge(-s,s,-s, -s,-s,-s);
+    edge(-s,-s, s, s,-s, s); edge(s,-s, s, s,s, s); edge(s,s, s, -s,s, s); edge(-s,s, s, -s,-s, s);
+    edge(-s,-s,-s, -s,-s, s); edge(s,-s,-s, s,-s, s); edge(s,s,-s, s,s, s); edge(-s,s,-s, -s,s, s);
+    glEnd();
+
+    glLineWidth(3.0f);
+    glBegin(GL_LINES);
+    glColor3f(1.0f, 0.18f, 0.14f); glVertex3f(0,0,0); glVertex3f(0.95f,0,0);
+    glColor3f(0.20f, 0.95f, 0.25f); glVertex3f(0,0,0); glVertex3f(0,0.95f,0);
+    glColor3f(0.25f, 0.52f, 1.0f); glVertex3f(0,0,0); glVertex3f(0,0,0.95f);
+    glEnd();
+
+    glPointSize(5.0f);
+    glBegin(GL_POINTS);
+    glColor3f(1.0f, 0.18f, 0.14f); glVertex3f(0.95f,0,0);
+    glColor3f(0.20f, 0.95f, 0.25f); glVertex3f(0,0.95f,0);
+    glColor3f(0.25f, 0.52f, 1.0f); glVertex3f(0,0,0.95f);
+    glEnd();
+
+    glViewport(0, 0, width, height);
+}
+
+static void drawOpenGlViewCubeLabels(HWND hwnd, HDC dc) {
+    if (!gOpenGlShowViewCube) return;
+
+    RECT rc = viewCubeRect(hwnd);
+    int size = std::max<int>(1, int(rc.right - rc.left));
+    int cx = (rc.left + rc.right) / 2;
+    int cy = (rc.top + rc.bottom) / 2;
+    float labelRadius = float(size) * 0.38f;
+
+    auto labelPoint = [&](StorylandVec3 axis) -> POINT {
+        StorylandVec3 r = rotateVecByQuat(gModelViewRotation, axis);
+        POINT p{};
+        p.x = int(std::round(float(cx) + r.x * labelRadius));
+        p.y = int(std::round(float(cy) - r.y * labelRadius));
+        return p;
+    };
+
+    SetBkMode(dc, TRANSPARENT);
+    HFONT oldFont = nullptr;
+    HFONT font = CreateFontW(-13, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+    if (font) oldFont = reinterpret_cast<HFONT>(SelectObject(dc, font));
+
+    auto drawLabel = [&](const wchar_t* text, COLORREF color, POINT p) {
+        SetTextColor(dc, color);
+        TextOutW(dc, p.x - 5, p.y - 7, text, 1);
+    };
+
+    drawLabel(L"X", RGB(255, 80, 64), labelPoint({1.0f, 0.0f, 0.0f}));
+    drawLabel(L"Y", RGB(80, 240, 96), labelPoint({0.0f, 1.0f, 0.0f}));
+    drawLabel(L"Z", RGB(96, 150, 255), labelPoint({0.0f, 0.0f, 1.0f}));
+
+    if (oldFont) SelectObject(dc, oldFont);
+    if (font) DeleteObject(font);
+}
+
 
 static void drawModelPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
     const auto& sourcePts = gModelFile.previewPoints();
@@ -7901,6 +8644,9 @@ static void drawModelPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
     glViewport(0, 0, width, height);
 
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glDisable(GL_BLEND);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_ALPHA_TEST);
 
     bool textureAvailable = gModelTextureLoaded && !gModelTextureRegions.empty() && uploadModelTextureIfNeeded();
     bool hasRealTexcoords = texcoords.size() == pts.size() && modelTexcoordsLookUsable(texcoords);
@@ -7914,8 +8660,7 @@ static void drawModelPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
     glTranslatef(gModelPanX, gModelPanY, -gModelDistance);
-    glRotatef(gModelPitchDegrees, 1.0f, 0.0f, 0.0f);
-    glRotatef(gModelYawDegrees, 0.0f, 1.0f, 0.0f);
+    glMultModelQuat(gModelViewRotation);
 
     float minX = 0.0f, minY = 0.0f, minZ = 0.0f;
     float maxX = 0.0f, maxY = 0.0f, maxZ = 0.0f;
@@ -8007,19 +8752,23 @@ static void drawModelPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
     glScalef(modelScale, modelScale, modelScale);
     glTranslatef(-centerX, -centerY, -centerZ);
 
-    glLineWidth(1.0f);
-    glBegin(GL_LINES);
-    glColor3f(0.35f, 0.35f, 0.35f);
     float gridSize = std::max(1.0f, largestSpan);
-    for (int i = -10; i <= 10; ++i) {
-        float d = float(i) * gridSize / 10.0f;
-        glVertex3f(-gridSize, d, 0.0f); glVertex3f(gridSize, d, 0.0f);
-        glVertex3f(d, -gridSize, 0.0f); glVertex3f(d, gridSize, 0.0f);
+    if (gOpenGlShowGrid) {
+        setupFixedPipelineStoriesLighting(false);
+        glDisable(GL_TEXTURE_2D);
+        glLineWidth(1.0f);
+        glBegin(GL_LINES);
+        glColor3f(0.20f, 0.21f, 0.23f);
+        for (int i = -10; i <= 10; ++i) {
+            float d = float(i) * gridSize / 10.0f;
+            glVertex3f(-gridSize, d, 0.0f); glVertex3f(gridSize, d, 0.0f);
+            glVertex3f(d, -gridSize, 0.0f); glVertex3f(d, gridSize, 0.0f);
+        }
+        glColor3f(0.95f, 0.22f, 0.18f); glVertex3f(0.0f, 0.0f, 0.0f); glVertex3f(gridSize, 0.0f, 0.0f);
+        glColor3f(0.20f, 0.85f, 0.25f); glVertex3f(0.0f, 0.0f, 0.0f); glVertex3f(0.0f, gridSize, 0.0f);
+        glColor3f(0.25f, 0.48f, 1.0f); glVertex3f(0.0f, 0.0f, 0.0f); glVertex3f(0.0f, 0.0f, gridSize);
+        glEnd();
     }
-    glColor3f(1.0f, 0.2f, 0.2f); glVertex3f(0.0f, 0.0f, 0.0f); glVertex3f(gridSize, 0.0f, 0.0f);
-    glColor3f(0.2f, 1.0f, 0.2f); glVertex3f(0.0f, 0.0f, 0.0f); glVertex3f(0.0f, gridSize, 0.0f);
-    glColor3f(0.2f, 0.45f, 1.0f); glVertex3f(0.0f, 0.0f, 0.0f); glVertex3f(0.0f, 0.0f, gridSize);
-    glEnd();
 
     if (!tris.empty()) {
         const float safePreviewEdgeLimit = std::max(0.035f, largestSpan * 0.16f);
@@ -8076,51 +8825,84 @@ static void drawModelPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
             return true;
         };
 
-        glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
-        if (canUseTexture) {
+        const bool wireOnly = gOpenGlRenderMode == StorylandOpenGlRenderMode::Wireframe;
+        const bool wantsTexture = canUseTexture &&
+            (gOpenGlRenderMode == StorylandOpenGlRenderMode::Stories ||
+             gOpenGlRenderMode == StorylandOpenGlRenderMode::Textured);
+        const bool wantsLighting =
+            gOpenGlRenderMode == StorylandOpenGlRenderMode::Stories ||
+            gOpenGlRenderMode == StorylandOpenGlRenderMode::Solid;
+
+        if (wantsTexture) {
+            if (pglActiveTexture) pglActiveTexture(GL_TEXTURE0);
             glEnable(GL_TEXTURE_2D);
             glBindTexture(GL_TEXTURE_2D, gModelTextureId);
+            glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+        } else {
+            glDisable(GL_TEXTURE_2D);
         }
-        glBegin(GL_TRIANGLES);
-        glColor3f(1.0f, 1.0f, 1.0f);
-        for (const auto& tri : tris) {
-            if (tri.a >= pts.size() || tri.b >= pts.size() || tri.c >= pts.size()) continue;
-            const auto& a = pts[tri.a];
-            const auto& b = pts[tri.b];
-            const auto& c = pts[tri.c];
-            if (!previewTriangleIsSafe(a, b, c)) continue;
-            int textureRegion = canUseTexture ? chooseModelTextureRegionForTriangle(tri, pts, minX, minY, minZ, spanX, spanY, spanZ) : -1;
-            if (canUseTexture) emitModelPreviewTexcoordInRegion(tri.a, textureRegion, pts, texcoords, hasRealTexcoords, minX, minY, minZ, spanX, spanY, spanZ);
-            glVertex3f(a.x, a.y, a.z);
-            if (canUseTexture) emitModelPreviewTexcoordInRegion(tri.b, textureRegion, pts, texcoords, hasRealTexcoords, minX, minY, minZ, spanX, spanY, spanZ);
-            glVertex3f(b.x, b.y, b.z);
-            if (canUseTexture) emitModelPreviewTexcoordInRegion(tri.c, textureRegion, pts, texcoords, hasRealTexcoords, minX, minY, minZ, spanX, spanY, spanZ);
-            glVertex3f(c.x, c.y, c.z);
+
+        bool usingStoriesShader = false;
+        if (!wireOnly && (gOpenGlRenderMode == StorylandOpenGlRenderMode::Stories ||
+                          gOpenGlRenderMode == StorylandOpenGlRenderMode::Textured ||
+                          gOpenGlRenderMode == StorylandOpenGlRenderMode::Solid)) {
+            usingStoriesShader = beginStoriesShaderProgram(wantsTexture);
         }
-        glEnd();
+        if (!usingStoriesShader) setupFixedPipelineStoriesLighting(wantsLighting && !wireOnly);
+
+        if (!wireOnly) {
+            glEnable(GL_POLYGON_OFFSET_FILL);
+            glPolygonOffset(1.0f, 1.0f);
+            glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+            glBegin(GL_TRIANGLES);
+            if (gOpenGlRenderMode == StorylandOpenGlRenderMode::Solid) glColor3f(0.76f, 0.78f, 0.74f);
+            else glColor3f(1.0f, 1.0f, 1.0f);
+            for (const auto& tri : tris) {
+                if (tri.a >= pts.size() || tri.b >= pts.size() || tri.c >= pts.size()) continue;
+                const auto& a = pts[tri.a];
+                const auto& b = pts[tri.b];
+                const auto& c = pts[tri.c];
+                if (!previewTriangleIsSafe(a, b, c)) continue;
+                StorylandModelPoint normal = previewTriangleNormal(a, b, c);
+                int textureRegion = wantsTexture ? chooseModelTextureRegionForTriangle(tri, pts, minX, minY, minZ, spanX, spanY, spanZ) : -1;
+                if (wantsTexture) emitModelPreviewTexcoordInRegion(tri.a, textureRegion, pts, texcoords, hasRealTexcoords, minX, minY, minZ, spanX, spanY, spanZ);
+                emitPreviewVertexWithNormal(a, normal);
+                if (wantsTexture) emitModelPreviewTexcoordInRegion(tri.b, textureRegion, pts, texcoords, hasRealTexcoords, minX, minY, minZ, spanX, spanY, spanZ);
+                emitPreviewVertexWithNormal(b, normal);
+                if (wantsTexture) emitModelPreviewTexcoordInRegion(tri.c, textureRegion, pts, texcoords, hasRealTexcoords, minX, minY, minZ, spanX, spanY, spanZ);
+                emitPreviewVertexWithNormal(c, normal);
+            }
+            glEnd();
+            glDisable(GL_POLYGON_OFFSET_FILL);
+        }
+
+        stopStoriesShaderProgram();
+        setupFixedPipelineStoriesLighting(false);
         glDisable(GL_TEXTURE_2D);
 
-        glLineWidth(1.0f);
-        glBegin(GL_LINES);
-        glColor3f(0.14f, 0.14f, 0.14f);
-        auto emitSafePreviewWireEdge = [&](const StorylandModelPoint& a, const StorylandModelPoint& b) {
-            float edgeLengthSq = previewEdgeLengthSq(a, b);
-            if (!std::isfinite(edgeLengthSq)) return;
-            if (!staticDecodedModelPreview && !usingAnimatedMeshPreview && edgeLengthSq > safePreviewEdgeLimitSq) return;
-            glVertex3f(a.x, a.y, a.z);
-            glVertex3f(b.x, b.y, b.z);
-        };
-        for (const auto& tri : tris) {
-            if (tri.a >= pts.size() || tri.b >= pts.size() || tri.c >= pts.size()) continue;
-            const auto& a = pts[tri.a];
-            const auto& b = pts[tri.b];
-            const auto& c = pts[tri.c];
-            if (!previewTriangleIsSafe(a, b, c)) continue;
-            emitSafePreviewWireEdge(a, b);
-            emitSafePreviewWireEdge(b, c);
-            emitSafePreviewWireEdge(c, a);
+        if (wireOnly) {
+            glLineWidth(1.25f);
+            glBegin(GL_LINES);
+            glColor3f(0.86f, 0.88f, 0.82f);
+            auto emitSafePreviewWireEdge = [&](const StorylandModelPoint& a, const StorylandModelPoint& b) {
+                float edgeLengthSq = previewEdgeLengthSq(a, b);
+                if (!std::isfinite(edgeLengthSq)) return;
+                if (!staticDecodedModelPreview && !usingAnimatedMeshPreview && edgeLengthSq > safePreviewEdgeLimitSq) return;
+                glVertex3f(a.x, a.y, a.z);
+                glVertex3f(b.x, b.y, b.z);
+            };
+            for (const auto& tri : tris) {
+                if (tri.a >= pts.size() || tri.b >= pts.size() || tri.c >= pts.size()) continue;
+                const auto& a = pts[tri.a];
+                const auto& b = pts[tri.b];
+                const auto& c = pts[tri.c];
+                if (!previewTriangleIsSafe(a, b, c)) continue;
+                emitSafePreviewWireEdge(a, b);
+                emitSafePreviewWireEdge(b, c);
+                emitSafePreviewWireEdge(c, a);
+            }
+            glEnd();
         }
-        glEnd();
     } else if (!pts.empty()) {
         glPointSize(2.0f);
         glBegin(GL_POINTS);
@@ -8131,7 +8913,9 @@ static void drawModelPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
         glEnd();
     }
 
-    if (!bones.empty()) {
+    if (!bones.empty() && gOpenGlShowBones) {
+        stopStoriesShaderProgram();
+        setupFixedPipelineStoriesLighting(false);
         glDisable(GL_TEXTURE_2D);
         glDisable(GL_CULL_FACE);
         glLineWidth(3.0f);
@@ -8162,62 +8946,37 @@ static void drawModelPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
         glEnd();
     }
 
-    glLineWidth(1.0f);
-    glColor3f(0.8f, 0.8f, 0.8f);
-    glBegin(GL_LINE_LOOP);
-    glVertex3f(minX, minY, minZ);
-    glVertex3f(maxX, minY, minZ);
-    glVertex3f(maxX, maxY, minZ);
-    glVertex3f(minX, maxY, minZ);
-    glEnd();
-    glBegin(GL_LINE_LOOP);
-    glVertex3f(minX, minY, maxZ);
-    glVertex3f(maxX, minY, maxZ);
-    glVertex3f(maxX, maxY, maxZ);
-    glVertex3f(minX, maxY, maxZ);
-    glEnd();
-    glBegin(GL_LINES);
-    glVertex3f(minX, minY, minZ); glVertex3f(minX, minY, maxZ);
-    glVertex3f(maxX, minY, minZ); glVertex3f(maxX, minY, maxZ);
-    glVertex3f(maxX, maxY, minZ); glVertex3f(maxX, maxY, maxZ);
-    glVertex3f(minX, maxY, minZ); glVertex3f(minX, maxY, maxZ);
-    glEnd();
+    if (gOpenGlShowBounds) {
+        stopStoriesShaderProgram();
+        setupFixedPipelineStoriesLighting(false);
+        glLineWidth(1.0f);
+        glColor3f(0.55f, 0.58f, 0.62f);
+        glBegin(GL_LINE_LOOP);
+        glVertex3f(minX, minY, minZ);
+        glVertex3f(maxX, minY, minZ);
+        glVertex3f(maxX, maxY, minZ);
+        glVertex3f(minX, maxY, minZ);
+        glEnd();
+        glBegin(GL_LINE_LOOP);
+        glVertex3f(minX, minY, maxZ);
+        glVertex3f(maxX, minY, maxZ);
+        glVertex3f(maxX, maxY, maxZ);
+        glVertex3f(minX, maxY, maxZ);
+        glEnd();
+        glBegin(GL_LINES);
+        glVertex3f(minX, minY, minZ); glVertex3f(minX, minY, maxZ);
+        glVertex3f(maxX, minY, minZ); glVertex3f(maxX, minY, maxZ);
+        glVertex3f(maxX, maxY, minZ); glVertex3f(maxX, maxY, maxZ);
+        glVertex3f(minX, maxY, minZ); glVertex3f(minX, maxY, maxZ);
+        glEnd();
+    }
+
+    drawOpenGlViewCube(hwnd, width, height);
 
     glFlush();
     SwapBuffers(dc);
+    drawOpenGlViewCubeLabels(hwnd, dc);
     wglMakeCurrent(nullptr, nullptr);
-
-    std::wstring textureOverlay;
-    if (canUseTexture) {
-        textureOverlay = L"  |  texture=" + widen(gModelTextureName);
-        if (gModelTextureRegions.size() > 1) textureOverlay += L" / atlas regions=" + std::to_wstring(gModelTextureRegions.size());
-        if (usingProjectedTexcoords) textureOverlay += L" / projected UV";
-        if (gModelFlipTextureV) textureOverlay += L" / flipped V";
-    } else if (gModelTextureLoaded) {
-        textureOverlay = L"  |  texture loaded/upload failed";
-    } else {
-        textureOverlay = L"  |  no texture";
-    }
-
-    std::wstring animOverlay;
-    if (gModelAnimLoaded) {
-        animOverlay = L"  |  anim=" + getFileStemPart(gModelAnimPath);
-        if (!gAnimFile.hasDecodedMotion()) animOverlay += L" / attached raw";
-        else {
-            animOverlay += gAnimPlaying ? L" / playing" : L" / paused";
-            if (modelHasUsableTrueSkinWeights(sourcePts)) animOverlay += L" / true skin";
-            else animOverlay += gApproximateAnimMeshPreview ? L" / approximate mesh" : L" / armature only";
-        }
-    }
-
-    std::wstring title = L"OpenGL MDL viewport  |  " + widen(gModelFile.modelKindName()) +
-        L"  |  vertices=" + std::to_wstring(pts.size()) +
-        L"  |  triangles=" + std::to_wstring(tris.size()) +
-        L"  |  bones=" + std::to_wstring(bones.size()) +
-        textureOverlay +
-        animOverlay +
-        L"  |  LMB rotate, RMB pan, wheel zoom";
-    drawOpenGlTextOverlayFallback(dc, rc, title);
 }
 
 static LRESULT CALLBACK previewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -8236,10 +8995,19 @@ static LRESULT CALLBACK previewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         EndPaint(hwnd, &ps);
         return 0;
     }
+    if (msg == WM_KEYDOWN && handleModelViewportShortcut(wParam)) {
+        return 0;
+    }
     if (msg == WM_LBUTTONDOWN && currentModeUsesInteractiveModelViewport()) {
         gModelLeftDrag = true;
         gModelLastMouse.x = GET_X_LPARAM(lParam);
         gModelLastMouse.y = GET_Y_LPARAM(lParam);
+        gModelViewCubeDrag = pointInViewCube(hwnd, gModelLastMouse.x, gModelLastMouse.y);
+        gModelDragStartPoint = gModelViewCubeDrag ?
+            viewCubePointFromMouse(hwnd, gModelLastMouse.x, gModelLastMouse.y) :
+            arcballPointFromMouse(hwnd, gModelLastMouse.x, gModelLastMouse.y);
+        gModelDragStartRotation = gModelViewRotation;
+        SetFocus(hwnd);
         SetCapture(hwnd);
         return 0;
     }
@@ -8251,7 +9019,10 @@ static LRESULT CALLBACK previewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         return 0;
     }
     if ((msg == WM_LBUTTONUP || msg == WM_RBUTTONUP) && currentModeUsesInteractiveModelViewport()) {
-        if (msg == WM_LBUTTONUP) gModelLeftDrag = false;
+        if (msg == WM_LBUTTONUP) {
+            gModelLeftDrag = false;
+            gModelViewCubeDrag = false;
+        }
         if (msg == WM_RBUTTONUP) gModelRightDrag = false;
         if (!gModelLeftDrag && !gModelRightDrag) ReleaseCapture();
         return 0;
@@ -8264,15 +9035,18 @@ static LRESULT CALLBACK previewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         gModelLastMouse.x = x;
         gModelLastMouse.y = y;
         if (gModelLeftDrag) {
-            gModelYawDegrees += float(dx) * 0.45f;
-            gModelPitchDegrees += float(dy) * 0.45f;
-            gModelPitchDegrees = std::max(-89.0f, std::min(89.0f, gModelPitchDegrees));
+            StorylandVec3 currentPoint = gModelViewCubeDrag ?
+                viewCubePointFromMouse(hwnd, x, y) :
+                arcballPointFromMouse(hwnd, x, y);
+            StorylandQuat dragDelta = quatFromVectors(gModelDragStartPoint, currentPoint);
+            gModelViewRotation = quatMul(dragDelta, gModelDragStartRotation);
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
         if (gModelRightDrag) {
-            gModelPanX += float(dx) * 0.005f;
-            gModelPanY -= float(dy) * 0.005f;
+            float panScale = (gMode == StorylandMode::ArchiveFile) ? std::max(0.006f, gModelDistance * 0.004f) : 0.005f;
+            gModelPanX += float(dx) * panScale;
+            gModelPanY -= float(dy) * panScale;
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
@@ -8312,14 +9086,9 @@ static void layoutChildren(HWND hwnd) {
     const int leftW = std::max<int>(300, clientWidth / 3);
     const int rightW = clientWidth - leftW;
     const int topH = clientHeight - statusHeight;
-    const int controlH = 34;
     const int previewH = std::max<int>(180, topH / 2);
     const int rightX = leftW + 4;
     const int rightClientW = std::max<int>(0, rightW - 4);
-    const int buttonY = previewH + 5;
-    const int buttonH = 26;
-    const int buttonW = 82;
-    const int buttonGap = 6;
 
     MoveWindow(gTree, 0, 0, leftW, topH, TRUE);
 
@@ -8332,23 +9101,12 @@ static void layoutChildren(HWND hwnd) {
         TRUE
     );
 
-    MoveWindow(gPreviewZoomIn, rightX, buttonY, buttonW, buttonH, TRUE);
-    MoveWindow(gPreviewZoomOut, rightX + (buttonW + buttonGap), buttonY, buttonW, buttonH, TRUE);
-    MoveWindow(gPreviewFit, rightX + 2 * (buttonW + buttonGap), buttonY, buttonW, buttonH, TRUE);
-    MoveWindow(gPreviewReset, rightX + 3 * (buttonW + buttonGap), buttonY, buttonW, buttonH, TRUE);
-
-    bool viewportControls = currentModeUsesInteractiveModelViewport();
-    EnableWindow(gPreviewZoomIn, viewportControls);
-    EnableWindow(gPreviewZoomOut, viewportControls);
-    EnableWindow(gPreviewFit, viewportControls);
-    EnableWindow(gPreviewReset, viewportControls);
-
     MoveWindow(
         gDetails,
         rightX,
-        previewH + controlH + 4,
+        previewH + 4,
         rightClientW,
-        topH - previewH - controlH - 4,
+        topH - previewH - 4,
         TRUE
     );
 }
@@ -8505,22 +9263,25 @@ static void createMenuBar(HWND hwnd) {
     CheckMenuItem(view, ID_VIEW_FLIP_TEXTURE_PREVIEW_V, MF_BYCOMMAND | (gTexturePreviewFlipV ? MF_CHECKED : MF_UNCHECKED));
     AppendMenuW(view, MF_STRING, ID_VIEW_FLIP_MODEL_TEXTURE_V, L"Flip MDL texture V");
     CheckMenuItem(view, ID_VIEW_FLIP_MODEL_TEXTURE_V, MF_BYCOMMAND | (gModelFlipTextureV ? MF_CHECKED : MF_UNCHECKED));
-    AppendMenuW(view, MF_STRING, ID_VIEW_APPROX_ANIM_MESH_PREVIEW, L"Approximate ANIM Mesh Fallback");
-    CheckMenuItem(view, ID_VIEW_APPROX_ANIM_MESH_PREVIEW, MF_BYCOMMAND | (gApproximateAnimMeshPreview ? MF_CHECKED : MF_UNCHECKED));
-    AppendMenuW(view, MF_STRING, ID_VIEW_LOCK_ANIM_ROOT_PREVIEW, L"Lock ANIM Root/Pelvis Preview");
-    CheckMenuItem(view, ID_VIEW_LOCK_ANIM_ROOT_PREVIEW, MF_BYCOMMAND | (gLockAnimRootPreview ? MF_CHECKED : MF_UNCHECKED));
-    AppendMenuW(view, MF_STRING, ID_VIEW_LOCK_WEAPON_LOWER_BODY_PREVIEW, L"Lock Weapon Lower Body Preview");
-    CheckMenuItem(view, ID_VIEW_LOCK_WEAPON_LOWER_BODY_PREVIEW, MF_BYCOMMAND | (gLockWeaponLowerBodyPreview ? MF_CHECKED : MF_UNCHECKED));
-    AppendMenuW(view, MF_STRING, ID_VIEW_WEAPON_UPPER_BODY_LAYER_MASK, L"Weapon Upper-Body Layer Mask");
-    CheckMenuItem(view, ID_VIEW_WEAPON_UPPER_BODY_LAYER_MASK, MF_BYCOMMAND | (gWeaponUpperBodyLayerMaskPreview ? MF_CHECKED : MF_UNCHECKED));
     AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(view, MF_STRING, ID_VIEW_CUSTOM_EXPORT_MATRIX_SKIN_PREVIEW, L"Custom/BLeeds Export Matrix Skin Preview");
-    CheckMenuItem(view, ID_VIEW_CUSTOM_EXPORT_MATRIX_SKIN_PREVIEW, MF_BYCOMMAND | (gCustomExportMatrixSkinPreview ? MF_CHECKED : MF_UNCHECKED));
+    AppendMenuW(view, MF_STRING, ID_VIEW_RENDER_STORIES, L"OpenGL render: Stories shader");
+    AppendMenuW(view, MF_STRING, ID_VIEW_RENDER_TEXTURED, L"OpenGL render: texture");
+    AppendMenuW(view, MF_STRING, ID_VIEW_RENDER_SOLID, L"OpenGL render: solid");
+    AppendMenuW(view, MF_STRING, ID_VIEW_RENDER_WIREFRAME, L"OpenGL render: wireframe");
+    UINT checkedRender = ID_VIEW_RENDER_STORIES;
+    if (gOpenGlRenderMode == StorylandOpenGlRenderMode::Textured) checkedRender = ID_VIEW_RENDER_TEXTURED;
+    else if (gOpenGlRenderMode == StorylandOpenGlRenderMode::Solid) checkedRender = ID_VIEW_RENDER_SOLID;
+    else if (gOpenGlRenderMode == StorylandOpenGlRenderMode::Wireframe) checkedRender = ID_VIEW_RENDER_WIREFRAME;
+    CheckMenuRadioItem(view, ID_VIEW_RENDER_STORIES, ID_VIEW_RENDER_WIREFRAME, checkedRender, MF_BYCOMMAND);
     AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(view, MF_STRING, ID_ANIM_PLAY_PAUSE, L"Play/Pause Animation");
-    AppendMenuW(view, MF_STRING, ID_ANIM_STOP, L"Stop Animation");
-    AppendMenuW(view, MF_STRING, ID_ANIM_STEP_BACK, L"Step Animation Back");
-    AppendMenuW(view, MF_STRING, ID_ANIM_STEP_FORWARD, L"Step Animation Forward");
+    AppendMenuW(view, MF_STRING, ID_VIEW_SHOW_GRID, L"Show OpenGL grid");
+    CheckMenuItem(view, ID_VIEW_SHOW_GRID, MF_BYCOMMAND | (gOpenGlShowGrid ? MF_CHECKED : MF_UNCHECKED));
+    AppendMenuW(view, MF_STRING, ID_VIEW_SHOW_BONES, L"Show bones");
+    CheckMenuItem(view, ID_VIEW_SHOW_BONES, MF_BYCOMMAND | (gOpenGlShowBones ? MF_CHECKED : MF_UNCHECKED));
+    AppendMenuW(view, MF_STRING, ID_VIEW_SHOW_BOUNDS, L"Show bounds");
+    CheckMenuItem(view, ID_VIEW_SHOW_BOUNDS, MF_BYCOMMAND | (gOpenGlShowBounds ? MF_CHECKED : MF_UNCHECKED));
+    AppendMenuW(view, MF_STRING, ID_VIEW_SHOW_VIEWCUBE, L"Show viewport cube");
+    CheckMenuItem(view, ID_VIEW_SHOW_VIEWCUBE, MF_BYCOMMAND | (gOpenGlShowViewCube ? MF_CHECKED : MF_UNCHECKED));
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(view), L"View");
 
     HMENU help = CreatePopupMenu();
@@ -8544,10 +9305,6 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         RegisterClassW(&previewClass);
         gPreview = CreateWindowExW(WS_EX_CLIENTEDGE, previewClass.lpszClassName, nullptr, WS_CHILD | WS_VISIBLE, 0, 0, 100, 100, hwnd, reinterpret_cast<HMENU>(ID_PREVIEW), gInstance, nullptr);
         initializeOpenGlPreview(gPreview);
-        gPreviewZoomIn = CreateWindowW(L"BUTTON", L"Zoom +", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0, 80, 24, hwnd, reinterpret_cast<HMENU>(ID_PREVIEW_ZOOM_IN), gInstance, nullptr);
-        gPreviewZoomOut = CreateWindowW(L"BUTTON", L"Zoom -", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0, 80, 24, hwnd, reinterpret_cast<HMENU>(ID_PREVIEW_ZOOM_OUT), gInstance, nullptr);
-        gPreviewFit = CreateWindowW(L"BUTTON", L"Fit close", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0, 80, 24, hwnd, reinterpret_cast<HMENU>(ID_PREVIEW_FIT), gInstance, nullptr);
-        gPreviewReset = CreateWindowW(L"BUTTON", L"Reset view", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0, 80, 24, hwnd, reinterpret_cast<HMENU>(ID_PREVIEW_RESET), gInstance, nullptr);
         gDetails = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", nullptr, WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, 0, 0, 100, 100, hwnd, reinterpret_cast<HMENU>(ID_DETAILS), gInstance, nullptr);
         gStatus = CreateWindowExW(0, STATUSCLASSNAMEW, nullptr, WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(ID_STATUS), gInstance, nullptr);
         setStatus(L"Open .chk/.xtx textures, .mdl models, .anim files, or GAME.DTZ");
@@ -8572,23 +9329,6 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 
     case WM_COMMAND: {
         switch (LOWORD(wParam)) {
-        case ID_PREVIEW_ZOOM_IN:
-            applyModelViewportZoom(0.82f);
-            setStatus(L"Preview zoomed in.");
-            break;
-        case ID_PREVIEW_ZOOM_OUT:
-            applyModelViewportZoom(1.22f);
-            setStatus(L"Preview zoomed out.");
-            break;
-        case ID_PREVIEW_FIT:
-            fitModelViewportCloser();
-            setStatus(L"Preview fit closer.");
-            break;
-        case ID_PREVIEW_RESET:
-            resetModelViewport();
-            if (gPreview) InvalidateRect(gPreview, nullptr, FALSE);
-            setStatus(L"Preview view reset.");
-            break;
         case ID_FILE_OPEN: {
             std::wstring path = openFileDialog(L"Storyland files\0*.dtz;*.bin;*.img;*.lvz;*.area;*.mdl;*.dff;*.anim;*.chk;*.xtx;*.tex\0All files\0*.*\0");
             openStorylandFile(path);
@@ -8621,52 +9361,44 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             CheckMenuItem(GetMenu(hwnd), ID_VIEW_FLIP_MODEL_TEXTURE_V, MF_BYCOMMAND | (gModelFlipTextureV ? MF_CHECKED : MF_UNCHECKED));
             InvalidateRect(gPreview, nullptr, FALSE);
             break;
-        case ID_VIEW_APPROX_ANIM_MESH_PREVIEW:
-            gApproximateAnimMeshPreview = !gApproximateAnimMeshPreview;
-            CheckMenuItem(GetMenu(hwnd), ID_VIEW_APPROX_ANIM_MESH_PREVIEW, MF_BYCOMMAND | (gApproximateAnimMeshPreview ? MF_CHECKED : MF_UNCHECKED));
-            InvalidateRect(gPreview, nullptr, FALSE);
-            if (gMode == StorylandMode::ModelFile) {
-                selectModelField(0);
-            }
+        case ID_VIEW_RENDER_STORIES:
+            setOpenGlRenderMode(StorylandOpenGlRenderMode::Stories);
+            CheckMenuRadioItem(GetMenu(hwnd), ID_VIEW_RENDER_STORIES, ID_VIEW_RENDER_WIREFRAME, ID_VIEW_RENDER_STORIES, MF_BYCOMMAND);
             break;
-        case ID_VIEW_LOCK_ANIM_ROOT_PREVIEW:
-            gLockAnimRootPreview = !gLockAnimRootPreview;
-            CheckMenuItem(GetMenu(hwnd), ID_VIEW_LOCK_ANIM_ROOT_PREVIEW, MF_BYCOMMAND | (gLockAnimRootPreview ? MF_CHECKED : MF_UNCHECKED));
-            InvalidateRect(gPreview, nullptr, FALSE);
-            if (gMode == StorylandMode::ModelFile) {
-                selectModelField(0);
-            }
+        case ID_VIEW_RENDER_TEXTURED:
+            setOpenGlRenderMode(StorylandOpenGlRenderMode::Textured);
+            CheckMenuRadioItem(GetMenu(hwnd), ID_VIEW_RENDER_STORIES, ID_VIEW_RENDER_WIREFRAME, ID_VIEW_RENDER_TEXTURED, MF_BYCOMMAND);
             break;
-        case ID_VIEW_LOCK_WEAPON_LOWER_BODY_PREVIEW:
-            gLockWeaponLowerBodyPreview = !gLockWeaponLowerBodyPreview;
-            CheckMenuItem(GetMenu(hwnd), ID_VIEW_LOCK_WEAPON_LOWER_BODY_PREVIEW, MF_BYCOMMAND | (gLockWeaponLowerBodyPreview ? MF_CHECKED : MF_UNCHECKED));
-            InvalidateRect(gPreview, nullptr, FALSE);
-            if (gMode == StorylandMode::ModelFile) {
-                selectModelField(0);
-            }
+        case ID_VIEW_RENDER_SOLID:
+            setOpenGlRenderMode(StorylandOpenGlRenderMode::Solid);
+            CheckMenuRadioItem(GetMenu(hwnd), ID_VIEW_RENDER_STORIES, ID_VIEW_RENDER_WIREFRAME, ID_VIEW_RENDER_SOLID, MF_BYCOMMAND);
             break;
-        case ID_VIEW_WEAPON_UPPER_BODY_LAYER_MASK:
-            gWeaponUpperBodyLayerMaskPreview = !gWeaponUpperBodyLayerMaskPreview;
-            CheckMenuItem(GetMenu(hwnd), ID_VIEW_WEAPON_UPPER_BODY_LAYER_MASK, MF_BYCOMMAND | (gWeaponUpperBodyLayerMaskPreview ? MF_CHECKED : MF_UNCHECKED));
-            InvalidateRect(gPreview, nullptr, FALSE);
-            if (gMode == StorylandMode::ModelFile) {
-                selectModelField(0);
-            }
+        case ID_VIEW_RENDER_WIREFRAME:
+            setOpenGlRenderMode(StorylandOpenGlRenderMode::Wireframe);
+            CheckMenuRadioItem(GetMenu(hwnd), ID_VIEW_RENDER_STORIES, ID_VIEW_RENDER_WIREFRAME, ID_VIEW_RENDER_WIREFRAME, MF_BYCOMMAND);
             break;
-        case ID_VIEW_CUSTOM_EXPORT_MATRIX_SKIN_PREVIEW:
-            gCustomExportMatrixSkinPreview = !gCustomExportMatrixSkinPreview;
-            CheckMenuItem(GetMenu(hwnd), ID_VIEW_CUSTOM_EXPORT_MATRIX_SKIN_PREVIEW, MF_BYCOMMAND | (gCustomExportMatrixSkinPreview ? MF_CHECKED : MF_UNCHECKED));
+        case ID_VIEW_SHOW_GRID:
+            gOpenGlShowGrid = !gOpenGlShowGrid;
+            CheckMenuItem(GetMenu(hwnd), ID_VIEW_SHOW_GRID, MF_BYCOMMAND | (gOpenGlShowGrid ? MF_CHECKED : MF_UNCHECKED));
             InvalidateRect(gPreview, nullptr, FALSE);
-            if (gMode == StorylandMode::ModelFile) {
-                selectModelField(0);
-            }
+            break;
+        case ID_VIEW_SHOW_BONES:
+            gOpenGlShowBones = !gOpenGlShowBones;
+            CheckMenuItem(GetMenu(hwnd), ID_VIEW_SHOW_BONES, MF_BYCOMMAND | (gOpenGlShowBones ? MF_CHECKED : MF_UNCHECKED));
+            InvalidateRect(gPreview, nullptr, FALSE);
+            break;
+        case ID_VIEW_SHOW_BOUNDS:
+            gOpenGlShowBounds = !gOpenGlShowBounds;
+            CheckMenuItem(GetMenu(hwnd), ID_VIEW_SHOW_BOUNDS, MF_BYCOMMAND | (gOpenGlShowBounds ? MF_CHECKED : MF_UNCHECKED));
+            InvalidateRect(gPreview, nullptr, FALSE);
+            break;
+        case ID_VIEW_SHOW_VIEWCUBE:
+            gOpenGlShowViewCube = !gOpenGlShowViewCube;
+            CheckMenuItem(GetMenu(hwnd), ID_VIEW_SHOW_VIEWCUBE, MF_BYCOMMAND | (gOpenGlShowViewCube ? MF_CHECKED : MF_UNCHECKED));
+            InvalidateRect(gPreview, nullptr, FALSE);
             break;
         case ID_DTZ_PATCH_SELECTED: patchSelectedDtzRecord(); break;
         case ID_DTZ_PATCH_DATA_FIELD: patchSelectedDtzDataField(); break;
-        case ID_ANIM_PLAY_PAUSE: toggleAnimPlayback(); break;
-        case ID_ANIM_STOP: stopAnimPlayback(); break;
-        case ID_ANIM_STEP_BACK: stepAnimPlayback(-1.0f / std::max(1.0f, gAnimFile.framesPerSecond())); break;
-        case ID_ANIM_STEP_FORWARD: stepAnimPlayback(1.0f / std::max(1.0f, gAnimFile.framesPerSecond())); break;
         case ID_DTZ_PATCH_PLR_23: patchPlrPair23(); break;
         case ID_HELP_ABOUT: showAboutDialog(); break;
         }
@@ -8752,6 +9484,9 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR commandLine, int sh
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
+        if (msg.message == WM_KEYDOWN && handleModelViewportShortcut(msg.wParam)) {
+            continue;
+        }
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }

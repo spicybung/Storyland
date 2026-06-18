@@ -2124,29 +2124,22 @@ void StorylandModelFile::collectPreviewPoints() {
     bool usedHeaderTransform = false;
     if (appendExactLeedsStripGeometry(data, points, triangles, texcoords, skinWeights, materialTextureNames, stripCount, rejectedMarkerCount, partCount, usedHeaderTransform)) {
         std::ostringstream line;
-        line << "OpenGL preview source: " << points.size() << " vertices and " << triangles.size()
-             << " triangle-strip faces from " << stripCount << " exact Leeds strip markers across " << partCount << " material-bound parts";
-        if (usedHeaderTransform) {
-            line << " with GeometryHeader_Leeds/LCS native scale/translation applied";
-        } else {
-            line << " using raw packed coordinates";
-        }
-        line << ".";
+        line << "Preview: " << points.size() << " vertices, " << triangles.size()
+             << " triangles, strips=" << stripCount << ", parts=" << partCount;
+        line << (usedHeaderTransform ? ", header transform=yes" : ", header transform=no");
         if (data.size() >= 4 && data[0] == 'M' && data[1] == 'G' && data[2] == 0 && data[3] == 0) {
-            line << " MG multi-atomic compact vehicle preview path with guarded strip breaks.";
+            line << ", MG compact path";
         } else if (partCount > 0 && materialTextureNames.size() == 1 && materialTextureNames[0] == "<global-scan>") {
-            line << " Global exact-marker fallback path.";
+            line << ", global scan";
         }
-        if (rejectedMarkerCount > 0) {
-            line << " Rejected " << rejectedMarkerCount << " invalid strip/part markers.";
-        }
+        if (rejectedMarkerCount > 0) line << ", rejected=" << rejectedMarkerCount;
         outputLines.push_back({line.str()});
 
         if (!materialTextureNames.empty()) {
             std::ostringstream mats;
-            mats << "Material texture bindings:";
+            mats << "Materials:";
             for (size_t index = 0; index < materialTextureNames.size(); ++index) {
-                mats << " " << index << "=" << (materialTextureNames[index].empty() ? "<none>" : materialTextureNames[index]);
+                mats << " " << index << ":" << (materialTextureNames[index].empty() ? "-" : materialTextureNames[index]);
             }
             outputLines.push_back({mats.str()});
         }
@@ -2162,23 +2155,17 @@ void StorylandModelFile::collectPreviewPoints() {
 
             if (kind == StorylandModelKind::PedModel || kind == StorylandModelKind::CutsceneModel || validSkinWeightCount > 0) {
                 std::ostringstream skinLine;
-                skinLine << "PED skin weights imported: " << validSkinWeightCount << "/" << skinWeights.size()
-                         << " preview vertices have true MDL skin influences using BLeeds byte0-token skin decode"
-                         << " with exact sequential PED VIF payload parse plus marker-local fallback";
-                if (validSkinWeightCount > 0) {
-                    skinLine << " (" << influenceTotal << " total influences).";
-                } else {
-                    skinLine << ".";
-                }
+                skinLine << "Skin: " << validSkinWeightCount << "/" << skinWeights.size() << " weighted vertices";
+                if (validSkinWeightCount > 0) skinLine << ", influences=" << influenceTotal;
                 outputLines.push_back({skinLine.str()});
             } else {
-                outputLines.push_back({"Skin weights skipped: SimpleModel/VehicleModel resources are rigid/non-PED preview geometry."});
+                outputLines.push_back({"Skin: skipped for rigid model type."});
             }
         }
         return;
     }
 
-    outputLines.push_back({"OpenGL preview fallback: no exact Leeds strip markers found; showing only sane float point runs."});
+    outputLines.push_back({"Preview: no Leeds strip markers found; using float point runs."});
 
     struct RunCandidate { size_t offset = 0; size_t count = 0; };
     std::vector<RunCandidate> runs;
@@ -3447,7 +3434,7 @@ void StorylandModelFile::parse() {
     }
 
     std::ostringstream pointLine;
-    pointLine << "Preview geometry collected: " << points.size() << " vertices, " << triangles.size() << " triangles";
+    pointLine << "Geometry: " << points.size() << " vertices, " << triangles.size() << " triangles";
     outputLines.insert(outputLines.begin() + std::min<size_t>(2, outputLines.size()), {pointLine.str()});
 }
 

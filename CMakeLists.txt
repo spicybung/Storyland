@@ -27,3 +27,11 @@ add_executable(Storyland WIN32
 
 target_include_directories(Storyland PRIVATE src)
 target_link_libraries(Storyland PRIVATE ZLIB::ZLIB windowscodecs ole32 comctl32 comdlg32 shell32 opengl32 gdi32)
+
+
+add_custom_command(TARGET Storyland POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders"
+        "$<TARGET_FILE_DIR:Storyland>/shaders"
+    COMMENT "Copying Storyland shader files"
+)

@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"C:/Projects/Storyland/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
