@@ -1,39 +1,42 @@
 ﻿<?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
-    <ClCompile Include="C:\Projects\txtleeds\src\main.cpp">
+    <ClCompile Include="C:\Projects\Storyland\src\main.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="C:\Projects\txtleeds\src\leeds_texture.cpp">
+    <ClCompile Include="C:\Projects\Storyland\src\leeds_texture.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="C:\Projects\txtleeds\src\wic_image.cpp">
+    <ClCompile Include="C:\Projects\Storyland\src\wic_image.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="C:\Projects\txtleeds\src\storyland_dtz.cpp">
+    <ClCompile Include="C:\Projects\Storyland\src\storyland_dtz.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="C:\Projects\txtleeds\src\storyland_model.cpp">
+    <ClCompile Include="C:\Projects\Storyland\src\storyland_model.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="C:\Projects\txtleeds\src\storyland_archive.cpp">
+    <ClCompile Include="C:\Projects\Storyland\src\storyland_archive.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="C:\Projects\txtleeds\src\storyland_anim.cpp">
+    <ClCompile Include="C:\Projects\Storyland\src\storyland_anim.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Projects\Storyland\src\storyland_wbl.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <CustomBuild Include="C:\Projects\txtleeds\CMakeLists.txt" />
+    <CustomBuild Include="C:\Projects\Storyland\CMakeLists.txt" />
   </ItemGroup>
   <ItemGroup>
-    <ResourceCompile Include="C:\Projects\txtleeds\src\Storyland.rc">
+    <ResourceCompile Include="C:\Projects\Storyland\src\Storyland.rc">
       <Filter>Source Files</Filter>
     </ResourceCompile>
   </ItemGroup>
   <ItemGroup>
     <Filter Include="Source Files">
-      <UniqueIdentifier>{D5805612-928C-356B-AE07-8FF351891C14}</UniqueIdentifier>
+      <UniqueIdentifier>{8712EF5D-6DC1-3834-87AD-6BC277CF5BE8}</UniqueIdentifier>
     </Filter>
   </ItemGroup>
 </Project>
