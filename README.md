@@ -13,6 +13,7 @@ It can inspect and edit CHK, XTX, TEX, MDL, DFF, IMG, LVZ, GAME.DTZ files, as we
 - [X] Collision files (.col2)*
 - [X] Map files (.wrld, .wbl)*
 - [X] ZLib files (.lvz, .dtz)*
+- [X] Archive files  (.img)
 - [X] Animation files (.anim)*
 
 * all of the above are currently experimental, meaning not all files have been tested yet.
