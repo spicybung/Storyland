@@ -22,11 +22,12 @@ add_executable(Storyland WIN32
     src/storyland_model.cpp
     src/storyland_archive.cpp
     src/storyland_anim.cpp
+    src/storyland_wbl.cpp
     "${STORYLAND_RESOURCE_FILE}"
 )
 
 target_include_directories(Storyland PRIVATE src)
-target_link_libraries(Storyland PRIVATE ZLIB::ZLIB windowscodecs ole32 comctl32 comdlg32 shell32 opengl32 gdi32)
+target_link_libraries(Storyland PRIVATE ZLIB::ZLIB windowscodecs ole32 comctl32 comdlg32 shell32 opengl32 gdi32 dwmapi)
 
 
 add_custom_command(TARGET Storyland POST_BUILD

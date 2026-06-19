@@ -18,7 +18,8 @@ enum class LeedsPlatform {
 enum class TextureKind {
     Unknown,
     Psp,
-    Ps2
+    Ps2,
+    CtwTex
 };
 
 struct LeedsTextureEntry {

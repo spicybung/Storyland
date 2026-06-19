@@ -163,6 +163,201 @@ static bool parsePs2Header(const std::vector<uint8_t>& data, uint32_t offset, Le
     return true;
 }
 
+static bool finishDecodedTexture(RgbaImage& image);
+
+static bool parseCtwStandaloneTex(const std::vector<uint8_t>& data, LeedsTextureEntry& entry) {
+    if (data.size() < 12) return false;
+
+    uint16_t width = readU16(data, 0x00);
+    uint16_t height = readU16(data, 0x02);
+    uint16_t marker = readU16(data, 0x04);
+    uint16_t format = readU16(data, 0x06);
+    uint32_t storedBytes = readU32(data, 0x08);
+
+    if (!dimensionsReasonable(width, height)) return false;
+    if ((marker & 0xFF00u) != 0x8C00u) return false;
+    if (storedBytes == 0 || uint64_t(12u) + uint64_t(storedBytes) > uint64_t(data.size())) return false;
+
+    entry = LeedsTextureEntry{};
+    entry.name = "texture";
+    entry.kind = TextureKind::CtwTex;
+    entry.textureHeaderOffset = 0;
+    entry.rasterOffset = 12;
+    entry.blockSize = storedBytes;
+    entry.flags = uint32_t(format) | (uint32_t(marker) << 16);
+    entry.reserved0 = marker;
+    entry.reserved1 = format;
+    entry.width = width;
+    entry.height = height;
+    entry.widthPow2 = isPowerOfTwoInt(width) ? log2ExactInt(width) : 0;
+    entry.heightPow2 = isPowerOfTwoInt(height) ? log2ExactInt(height) : 0;
+
+    if (format == 0x0004u || format == 0x0104u) {
+        uint32_t need = uint32_t(((uint32_t(width) + 3u) / 4u) * ((uint32_t(height) + 3u) / 4u) * 8u);
+        if (storedBytes < need) return false;
+        entry.bpp = 4;
+        return true;
+    }
+
+    if (format == 0x0002u || format == 0x0102u) {
+        uint32_t need = uint32_t(((uint32_t(width) + 7u) / 8u) * ((uint32_t(height) + 3u) / 4u) * 8u);
+        if (storedBytes < need) return false;
+        entry.bpp = 2;
+        return true;
+    }
+
+    return false;
+}
+
+static uint32_t ctwPart1By1(uint32_t value) {
+    value &= 0x0000FFFFu;
+    value = (value | (value << 8)) & 0x00FF00FFu;
+    value = (value | (value << 4)) & 0x0F0F0F0Fu;
+    value = (value | (value << 2)) & 0x33333333u;
+    value = (value | (value << 1)) & 0x55555555u;
+    return value;
+}
+
+static uint32_t ctwMortonIndex(uint32_t x, uint32_t y) {
+    return ctwPart1By1(x) | (ctwPart1By1(y) << 1);
+}
+
+static uint8_t ctwExpand3(uint32_t value) {
+    value &= 0x7u;
+    return uint8_t((value << 5) | (value << 2) | (value >> 1));
+}
+
+static uint8_t ctwExpand4(uint32_t value) {
+    value &= 0xFu;
+    return uint8_t((value << 4) | value);
+}
+
+static uint8_t ctwExpand5(uint32_t value) {
+    value &= 0x1Fu;
+    return uint8_t((value << 3) | (value >> 2));
+}
+
+static void ctwPvrtcColorA(uint32_t colorData, uint8_t out[4]) {
+    if (colorData & 0x8000u) {
+        out[0] = ctwExpand5((colorData >> 10) & 0x1Fu);
+        out[1] = ctwExpand5((colorData >> 5) & 0x1Fu);
+        out[2] = ctwExpand4((colorData >> 1) & 0x0Fu);
+        out[3] = 255;
+    } else {
+        out[0] = ctwExpand4((colorData >> 8) & 0x0Fu);
+        out[1] = ctwExpand4((colorData >> 4) & 0x0Fu);
+        out[2] = ctwExpand3((colorData >> 1) & 0x07u);
+        out[3] = ctwExpand3((colorData >> 12) & 0x07u);
+    }
+}
+
+static void ctwPvrtcColorB(uint32_t colorData, uint8_t out[4]) {
+    if (colorData & 0x80000000u) {
+        out[0] = ctwExpand5((colorData >> 26) & 0x1Fu);
+        out[1] = ctwExpand5((colorData >> 21) & 0x1Fu);
+        out[2] = ctwExpand5((colorData >> 16) & 0x1Fu);
+        out[3] = 255;
+    } else {
+        out[0] = ctwExpand4((colorData >> 24) & 0x0Fu);
+        out[1] = ctwExpand4((colorData >> 20) & 0x0Fu);
+        out[2] = ctwExpand4((colorData >> 16) & 0x0Fu);
+        out[3] = ctwExpand3((colorData >> 28) & 0x07u);
+    }
+}
+
+static bool decodeCtwPvrtcTexture(const std::vector<uint8_t>& data, const LeedsTextureEntry& entry, RgbaImage& image, std::string& errorMessage) {
+    int width = entry.width;
+    int height = entry.height;
+    if (width <= 0 || height <= 0) {
+        errorMessage = "Invalid CTW TEX dimensions.";
+        return false;
+    }
+
+    bool twoBpp = (uint16_t(entry.flags & 0xFFFFu) == 0x0002u || uint16_t(entry.flags & 0xFFFFu) == 0x0102u);
+    uint32_t blockWidth = twoBpp ? 8u : 4u;
+    uint32_t blockHeight = 4u;
+    uint32_t blocksX = uint32_t((uint32_t(width) + blockWidth - 1u) / blockWidth);
+    uint32_t blocksY = uint32_t((uint32_t(height) + blockHeight - 1u) / blockHeight);
+    uint64_t need = uint64_t(blocksX) * uint64_t(blocksY) * 8ull;
+    if (uint64_t(entry.rasterOffset) + need > uint64_t(data.size())) {
+        errorMessage = "CTW TEX PVRTC payload is truncated.";
+        return false;
+    }
+
+    image.width = width;
+    image.height = height;
+    image.rgba.assign(size_t(width) * size_t(height) * 4u, 255);
+
+    const uint8_t* src = data.data() + entry.rasterOffset;
+    bool mortonBlocks = isPowerOfTwoInt(int(blocksX)) && isPowerOfTwoInt(int(blocksY));
+    uint32_t blockCount = blocksX * blocksY;
+    if (mortonBlocks && ctwMortonIndex(blocksX - 1u, blocksY - 1u) >= blockCount) mortonBlocks = false;
+
+    for (uint32_t by = 0; by < blocksY; ++by) {
+        for (uint32_t bx = 0; bx < blocksX; ++bx) {
+            uint32_t blockIndex = mortonBlocks ? ctwMortonIndex(bx, by) : (by * blocksX + bx);
+            size_t pos = size_t(blockIndex) * 8u;
+            if (pos + 8u > size_t(need)) continue;
+
+            uint32_t modulation = uint32_t(src[pos + 0]) | (uint32_t(src[pos + 1]) << 8) | (uint32_t(src[pos + 2]) << 16) | (uint32_t(src[pos + 3]) << 24);
+            uint32_t colorData = uint32_t(src[pos + 4]) | (uint32_t(src[pos + 5]) << 8) | (uint32_t(src[pos + 6]) << 16) | (uint32_t(src[pos + 7]) << 24);
+
+            uint8_t colorA[4] = {};
+            uint8_t colorB[4] = {};
+            ctwPvrtcColorA(colorData, colorA);
+            ctwPvrtcColorB(colorData, colorB);
+
+            for (uint32_t py = 0; py < blockHeight; ++py) {
+                for (uint32_t px = 0; px < blockWidth; ++px) {
+                    uint32_t x = bx * blockWidth + px;
+                    uint32_t y = by * blockHeight + py;
+                    if (x >= uint32_t(width) || y >= uint32_t(height)) continue;
+
+                    uint32_t weight = 0;
+                    if (twoBpp) {
+                        uint32_t bit = (modulation >> (py * blockWidth + px)) & 0x1u;
+                        weight = bit ? 8u : 0u;
+                    } else {
+                        uint32_t code = (modulation >> (2u * (py * blockWidth + px))) & 0x3u;
+                        static const uint32_t weights[4] = {0u, 3u, 5u, 8u};
+                        weight = weights[code];
+                    }
+
+                    size_t dst = (size_t(y) * size_t(width) + size_t(x)) * 4u;
+                    for (int ch = 0; ch < 4; ++ch) {
+                        image.rgba[dst + size_t(ch)] = uint8_t((uint32_t(colorA[ch]) * (8u - weight) + uint32_t(colorB[ch]) * weight) / 8u);
+                    }
+                }
+            }
+        }
+    }
+
+    return finishDecodedTexture(image);
+}
+
+static bool decodeCtwUnknownTexture(const std::vector<uint8_t>& data, const LeedsTextureEntry& entry, RgbaImage& image, std::string& errorMessage) {
+    int width = entry.width;
+    int height = entry.height;
+    if (width <= 0 || height <= 0) {
+        errorMessage = "Invalid CTW TEX dimensions.";
+        return false;
+    }
+
+    image.width = width;
+    image.height = height;
+    image.rgba.assign(size_t(width) * size_t(height) * 4u, 255);
+    const uint8_t* src = data.data() + entry.rasterOffset;
+    uint32_t available = entry.blockSize;
+    for (size_t i = 0; i < size_t(width) * size_t(height); ++i) {
+        uint8_t v = available ? src[i % available] : 0;
+        image.rgba[i * 4 + 0] = v;
+        image.rgba[i * 4 + 1] = v;
+        image.rgba[i * 4 + 2] = v;
+        image.rgba[i * 4 + 3] = 255;
+    }
+    return finishDecodedTexture(image);
+}
+
 static uint32_t swizzlePs2Index(int x, int y, int logw) {
     uint32_t nx = uint32_t(x & 7) ^ (uint32_t(((y >> 1) ^ (y >> 2)) << 2));
     nx = (nx & 7) | (uint32_t((x >> 1) & ~7));
@@ -952,13 +1147,20 @@ bool LeedsTextureArchive::saveToFile(const std::wstring& filePath, std::string& 
 
 bool LeedsTextureArchive::parse(LeedsPlatform platform, std::string& errorMessage) {
     entries.clear();
+
+    LeedsTextureEntry ctwTex;
+    if (parseCtwStandaloneTex(dataBytes, ctwTex)) {
+        entries.push_back(ctwTex);
+        return true;
+    }
+
     if (dataBytes.size() < 0x30) {
-        errorMessage = "File is too small for a CHK/XTX collection header.";
+        errorMessage = "File is too small for a CHK/XTX/TEX texture file.";
         return false;
     }
     std::string sig(reinterpret_cast<const char*>(dataBytes.data()), reinterpret_cast<const char*>(dataBytes.data() + 4));
     if (sig.rfind("xet", 0) != 0 && sig != "TCDT") {
-        errorMessage = "Not a recognized Leeds texture collection. Expected xet or TCDT.";
+        errorMessage = "Not a recognized Leeds/CTW texture file. Expected xet/TCDT collection or standalone CTW TEX.";
         return false;
     }
     if (sig == "TCDT") {
@@ -1019,22 +1221,33 @@ bool LeedsTextureArchive::parse(LeedsPlatform platform, std::string& errorMessag
         return false;
     }
 
-    std::vector<size_t> order(entries.size());
-    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
-    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return entries[a].rasterOffset < entries[b].rasterOffset; });
-    for (size_t sortedIndex = 0; sortedIndex < order.size(); ++sortedIndex) {
-        uint32_t start = entries[order[sortedIndex]].rasterOffset;
-        uint32_t end = 0;
-        if (sortedIndex + 1 < order.size()) {
-            end = entries[order[sortedIndex + 1]].rasterOffset;
-        } else {
-            std::vector<uint32_t> candidates;
-            for (uint32_t value : { global1, global2, collectionSize, uint32_t(dataBytes.size()) }) {
-                if (value > start && value <= dataBytes.size()) candidates.push_back(value);
-            }
-            end = candidates.empty() ? uint32_t(dataBytes.size()) : *std::min_element(candidates.begin(), candidates.end());
-        }
-        entries[order[sortedIndex]].blockSize = end > start ? end - start : 0;
+    std::vector<uint32_t> rasterBoundaries;
+    rasterBoundaries.reserve(entries.size() * 3 + 8);
+    auto addBoundary = [&](uint32_t value) {
+        if (value > 0 && value <= dataBytes.size()) rasterBoundaries.push_back(value);
+    };
+
+    addBoundary(collectionSize);
+    addBoundary(global1);
+    addBoundary(global2);
+    addBoundary(firstSlot);
+    addBoundary(lastSlot);
+    addBoundary(uint32_t(dataBytes.size()));
+
+    for (const LeedsTextureEntry& entry : entries) {
+        addBoundary(entry.rasterOffset);
+        addBoundary(entry.textureHeaderOffset);
+        addBoundary(entry.containerBase);
+    }
+
+    std::sort(rasterBoundaries.begin(), rasterBoundaries.end());
+    rasterBoundaries.erase(std::unique(rasterBoundaries.begin(), rasterBoundaries.end()), rasterBoundaries.end());
+
+    for (LeedsTextureEntry& entry : entries) {
+        uint32_t start = entry.rasterOffset;
+        auto it = std::upper_bound(rasterBoundaries.begin(), rasterBoundaries.end(), start);
+        uint32_t end = it == rasterBoundaries.end() ? uint32_t(dataBytes.size()) : *it;
+        entry.blockSize = end > start ? end - start : 0;
     }
 
     return true;
@@ -1047,6 +1260,15 @@ bool LeedsTextureArchive::decodeTexture(size_t textureIndex, RgbaImage& image, s
     }
     const LeedsTextureEntry& entry = entries[textureIndex];
     size_t pixelCount = size_t(entry.width) * size_t(entry.height);
+
+    if (entry.kind == TextureKind::CtwTex) {
+        uint16_t format = uint16_t(entry.flags & 0xFFFFu);
+        if (format == 0x0004u || format == 0x0104u || format == 0x0002u || format == 0x0102u) {
+            return decodeCtwPvrtcTexture(dataBytes, entry, image, errorMessage);
+        }
+        return decodeCtwUnknownTexture(dataBytes, entry, image, errorMessage);
+    }
+
     size_t baseBytes = 0;
     if (entry.bpp == 4) baseBytes = (pixelCount + 1) / 2;
     else if (entry.bpp == 8) baseBytes = pixelCount;
@@ -1154,6 +1376,10 @@ bool LeedsTextureArchive::replaceTextureAsBpp(size_t textureIndex, const RgbaIma
     if (targetBpp == 0) targetBpp = entry.bpp;
     if (targetBpp != 4 && targetBpp != 8 && targetBpp != 16 && targetBpp != 32) {
         errorMessage = "Target BPP must be 4, 8, 16, or 32. Use 0 to keep the original BPP.";
+        return false;
+    }
+    if (entry.kind == TextureKind::CtwTex) {
+        errorMessage = "Standalone CTW .tex replacement is not enabled yet.";
         return false;
     }
     if (entry.kind == TextureKind::Psp && targetBpp == 16) {
