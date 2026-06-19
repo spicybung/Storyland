@@ -17,6 +17,10 @@ It can inspect and edit CHK, XTX, TEX, MDL, DFF, IMG, LVZ, GAME.DTZ files, as we
 
 * all of the above are currently experimental, meaning not all files have been tested yet.
 
+## License
+
+This project is licensed under the GPL 3.0 License - see the [LICENSE](LICENSE) file for details.
+
 ## Acknowledgments
 - The GTA modding community.
 - The GTA Mods Wiki & GTAModding Wiki(RIP)for being a huge considerate help in figuring things, such as data structures, out.
