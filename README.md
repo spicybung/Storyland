@@ -1,8 +1,24 @@
 # Storyland
 
-Storyland is a small Win32 workbench for GTA Stories / Leeds files.
+[![License](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
+
+Storyland is an analyzer, editor, and viewer for Grand Theft Auto Stories file formats. It is also intended to support Chinatown Wars.
 
 It can inspect and edit CHK, XTX, TEX, MDL, DFF, IMG, LVZ, GAME.DTZ files, as well as .ANIM even.
 
+#### File Types
 
-Build normally with CMake and Visual Studio.
+- [X] Model files (.mdl, .wbl)*
+- [X] Texture Files (.chk, .xtx, .tex)*
+- [X] Collision files (.col2)*
+- [X] Map files (.wrld, .wbl)*
+- [X] Animation files
+
+* all of the above are currently experimental, meaning not all files have been tested yet.
+
+## Acknowledgments
+- The GTA modding community.
+- The GTA Mods Wiki & GTAModding Wiki(RIP)for being a huge considerate help in figuring things, such as data structures, out.
+- Daniel Sayanov, for his great help, knowledge in R* Leeds formats, as well as inspiration & motivation.
+- Last, but not least, The_Hero(apa) for their incredible knowledge and previous Leeds reverse engineering efforts. He has been invaluable to the community.
+
