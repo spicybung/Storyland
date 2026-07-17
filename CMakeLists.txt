@@ -23,6 +23,7 @@ add_executable(Storyland WIN32
     src/storyland_archive.cpp
     src/storyland_anim.cpp
     src/storyland_wbl.cpp
+    src/storyland_sky.cpp
     "${STORYLAND_RESOURCE_FILE}"
 )
 
@@ -34,5 +35,7 @@ add_custom_command(TARGET Storyland POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders"
         "$<TARGET_FILE_DIR:Storyland>/shaders"
-    COMMENT "Copying Storyland shader files"
+    COMMAND ${CMAKE_COMMAND} -E rm -f
+        "$<TARGET_FILE_DIR:Storyland>/timecyc.dat"
+    COMMENT "Copying Storyland shaders and removing the obsolete external timecycle"
 )

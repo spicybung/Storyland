@@ -30,6 +30,7 @@
 #include "storyland_wbl.h"
 #include "storyland_archive.h"
 #include "storyland_anim.h"
+#include "storyland_sky.h"
 #include "wic_image.h"
 #include "resource.h"
 
@@ -138,6 +139,17 @@ typedef void (APIENTRY *PFNGLACTIVETEXTUREPROC)(GLenum texture);
 #define ID_VIEW_SHOW_BONES 1037
 #define ID_VIEW_SHOW_BOUNDS 1038
 #define ID_VIEW_SHOW_VIEWCUBE 1039
+#define ID_VIEW_SHOW_SKY 1040
+#define ID_VIEW_SKY_LCS 1041
+#define ID_VIEW_SKY_VCS 1042
+#define ID_VIEW_SKY_MIDNIGHT 1043
+#define ID_VIEW_SKY_DAWN 1044
+#define ID_VIEW_SKY_NOON 1045
+#define ID_VIEW_SKY_SUNSET 1046
+#define ID_VIEW_SKY_WEATHER_SUNNY 1047
+#define ID_VIEW_SKY_WEATHER_CLOUDY 1048
+#define ID_VIEW_SKY_WEATHER_RAINY 1049
+#define ID_VIEW_SKY_WEATHER_FOGGY 1050
 #define ID_TREE 2001
 #define ID_DETAILS 2002
 #define ID_PREVIEW 2003
@@ -187,7 +199,7 @@ static GLuint gModelTextureId = 0;
 static bool gModelFlipTextureV = false;
 
 enum class StorylandOpenGlRenderMode { Stories, Textured, Solid, Wireframe };
-static StorylandOpenGlRenderMode gOpenGlRenderMode = StorylandOpenGlRenderMode::Textured;
+static StorylandOpenGlRenderMode gOpenGlRenderMode = StorylandOpenGlRenderMode::Stories;
 static bool gOpenGlShowGrid = false;
 static bool gOpenGlShowBones = false;
 static bool gOpenGlShowBounds = false;
@@ -197,6 +209,9 @@ static GLuint gStoriesShaderProgram = 0;
 static bool gStoriesShaderTried = false;
 static bool gStoriesShaderReady = false;
 static std::string gStoriesShaderStatus;
+static StorylandSky gStoriesSky;
+static std::string gStoriesSkyDataStatus;
+static DWORD gStoriesSkyLastTick = 0;
 
 static PFNGLCREATESHADERPROC pglCreateShader = nullptr;
 static PFNGLSHADERSOURCEPROC pglShaderSource = nullptr;
@@ -244,6 +259,10 @@ struct StorylandQuat {
     float y = 0.0f;
     float z = 0.0f;
 };
+
+static StorylandSkyRotation skyRotationFromModelRotation(const StorylandQuat& rotation) {
+    return {rotation.w, rotation.x, rotation.y, rotation.z};
+}
 
 static float vecDot(const StorylandVec3& a, const StorylandVec3& b) {
     return a.x * b.x + a.y * b.y + a.z * b.z;
@@ -1700,6 +1719,33 @@ static void setOpenGlRenderMode(StorylandOpenGlRenderMode mode) {
     if (gPreview) InvalidateRect(gPreview, nullptr, FALSE);
 }
 
+static const wchar_t* storiesSkyGameName() {
+    return gStoriesSky.game() == StorylandSkyGame::Lcs ? L"LCS" : L"VCS";
+}
+
+static const wchar_t* storiesSkyWeatherName() {
+    switch (gStoriesSky.weather()) {
+    case StorylandSkyWeather::Sunny: return L"Sunny";
+    case StorylandSkyWeather::Cloudy: return L"Cloudy";
+    case StorylandSkyWeather::Rainy: return L"Rainy";
+    case StorylandSkyWeather::Foggy: return L"Foggy";
+    }
+    return L"Weather";
+}
+
+static void stepStoriesSkyTime(float hours) {
+    gStoriesSky.stepTime(hours);
+    int totalMinutes = int(std::lround(gStoriesSky.time() * 60.0f)) % (24 * 60);
+    if (totalMinutes < 0) totalMinutes += 24 * 60;
+    std::wostringstream status;
+    status << storiesSkyGameName() << L" sky  "
+           << std::setw(2) << std::setfill(L'0') << (totalMinutes / 60) << L":"
+           << std::setw(2) << std::setfill(L'0') << (totalMinutes % 60) << L"  "
+           << storiesSkyWeatherName() << L"  |  [ previous hour, ] next hour";
+    setStatus(status.str());
+    if (gPreview) InvalidateRect(gPreview, nullptr, FALSE);
+}
+
 static void rotateModelViewport(float degrees, float x, float y, float z) {
     gModelViewRotation = quatMul(quatFromAxisAngle(degrees, x, y, z), gModelViewRotation);
     if (gPreview) InvalidateRect(gPreview, nullptr, FALSE);
@@ -1751,6 +1797,13 @@ static bool handleModelViewportShortcut(WPARAM key) {
     if (moveArchiveViewportKey(key)) return true;
 
     switch (key) {
+    case VK_OEM_4: // [
+        stepStoriesSkyTime(-1.0f);
+        return true;
+    case VK_OEM_6: // ]
+        stepStoriesSkyTime(1.0f);
+        return true;
+
     case VK_OEM_PLUS:
     case VK_ADD:
     case VK_PRIOR:
@@ -1874,16 +1927,29 @@ static const char* storylandStoriesVertexShaderSource() {
         "#version 120\n"
         "varying vec4 vColor;\n"
         "varying vec2 vTex0;\n"
-        "varying vec3 vNormal;\n"
+        "varying vec3 vLighting;\n"
+        "varying float vSpecular;\n"
         "varying float vFog;\n"
+        "uniform vec3 uAmbientColor;\n"
+        "uniform vec3 uDirectionalColor;\n"
+        "uniform vec3 uSunDirection;\n"
+        "uniform float uFogStart;\n"
+        "uniform float uFarClip;\n"
         "void main(){\n"
         "  vec4 eyePos = gl_ModelViewMatrix * gl_Vertex;\n"
         "  gl_Position = gl_ModelViewProjectionMatrix * gl_Vertex;\n"
         "  vColor = gl_Color;\n"
         "  vTex0 = gl_MultiTexCoord0.xy;\n"
-        "  vNormal = normalize(gl_NormalMatrix * gl_Normal);\n"
-        "  float z = abs(eyePos.z);\n"
-        "  vFog = clamp((95.0 - z) / 90.0, 0.0, 1.0);\n"
+        "  vec3 n = normalize(gl_NormalMatrix * gl_Normal);\n"
+        "  vec3 lightDir = normalize(gl_NormalMatrix * uSunDirection);\n"
+        "  float direct = max(dot(n, lightDir), 0.0);\n"
+        "  float bounce = max(dot(n, -lightDir), 0.0) * 0.22;\n"
+        "  vLighting = clamp(uAmbientColor + uDirectionalColor * (direct + bounce), 0.0, 1.35);\n"
+        "  vec3 viewDir = normalize(-eyePos.xyz);\n"
+        "  vSpecular = pow(max(dot(reflect(-lightDir, n), viewDir), 0.0), 18.0) * 0.12;\n"
+        "  float distanceFromCamera = length(eyePos.xyz);\n"
+        "  float fogRange = max(uFarClip - uFogStart, 0.001);\n"
+        "  vFog = clamp((uFarClip - distanceFromCamera) / fogRange, 0.0, 1.0);\n"
         "}\n";
 }
 
@@ -1894,23 +1960,18 @@ static const char* storylandStoriesFragmentShaderSource() {
         "uniform int uUseTexture;\n"
         "uniform int uRenderMode;\n"
         "uniform vec3 uFogColor;\n"
+        "uniform vec3 uDirectionalColor;\n"
         "varying vec4 vColor;\n"
         "varying vec2 vTex0;\n"
-        "varying vec3 vNormal;\n"
+        "varying vec3 vLighting;\n"
+        "varying float vSpecular;\n"
         "varying float vFog;\n"
         "void main(){\n"
         "  vec4 base = vec4(vColor.rgb, 1.0);\n"
         "  if(uUseTexture != 0){ vec4 tex = texture2D(tex0, vTex0); base.rgb *= tex.rgb; }\n"
-        "  vec3 n = normalize(vNormal);\n"
-        "  vec3 l0 = normalize(vec3(0.25, 0.55, 0.78));\n"
-        "  vec3 l1 = normalize(vec3(-0.60, -0.25, 0.50));\n"
-        "  float d0 = max(dot(n, l0), 0.0);\n"
-        "  float d1 = max(dot(n, l1), 0.0) * 0.32;\n"
-        "  vec3 v = vec3(0.0, 0.0, 1.0);\n"
-        "  float spec = pow(max(dot(reflect(-l0, n), v), 0.0), 18.0) * 0.14;\n"
         "  vec3 lit = base.rgb;\n"
         "  if(uRenderMode == 0 || uRenderMode == 2){\n"
-        "    lit = base.rgb * (0.62 + d0 * 0.55 + d1) + spec;\n"
+        "    lit = base.rgb * vLighting + vSpecular * uDirectionalColor;\n"
         "  }\n"
         "  lit = mix(uFogColor, clamp(lit, 0.0, 1.0), vFog);\n"
         "  gl_FragColor = vec4(lit, 1.0);\n"
@@ -2018,7 +2079,21 @@ static bool beginStoriesShaderProgram(bool useTexture) {
         pglUniform1i(loc, mode);
     }
     loc = pglGetUniformLocation(gStoriesShaderProgram, "uFogColor");
-    if (loc >= 0) pglUniform3f(loc, 0.115f, 0.120f, 0.128f);
+    if (loc >= 0) {
+        const StorylandSkyColor& fog = gStoriesSky.state().fog;
+        pglUniform3f(loc, fog.r, fog.g, fog.b);
+    }
+    const StorylandSkyState& sky = gStoriesSky.state();
+    loc = pglGetUniformLocation(gStoriesShaderProgram, "uAmbientColor");
+    if (loc >= 0) pglUniform3f(loc, sky.ambient.r, sky.ambient.g, sky.ambient.b);
+    loc = pglGetUniformLocation(gStoriesShaderProgram, "uDirectionalColor");
+    if (loc >= 0) pglUniform3f(loc, sky.directional.r, sky.directional.g, sky.directional.b);
+    loc = pglGetUniformLocation(gStoriesShaderProgram, "uSunDirection");
+    if (loc >= 0) pglUniform3f(loc, sky.sunDirectionX, sky.sunDirectionY, sky.sunDirectionZ);
+    loc = pglGetUniformLocation(gStoriesShaderProgram, "uFogStart");
+    if (loc >= 0) pglUniform1f(loc, sky.previewFogStart);
+    loc = pglGetUniformLocation(gStoriesShaderProgram, "uFarClip");
+    if (loc >= 0) pglUniform1f(loc, sky.previewFarClip);
     return true;
 }
 
@@ -2030,22 +2105,24 @@ static void setupFixedPipelineStoriesLighting(bool lit) {
     }
 
     glEnable(GL_LIGHTING);
+    glShadeModel(GL_SMOOTH);
     glEnable(GL_LIGHT0);
     glEnable(GL_LIGHT1);
     glEnable(GL_NORMALIZE);
     glEnable(GL_COLOR_MATERIAL);
     glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE);
 
-    GLfloat ambientModel[] = {0.42f, 0.42f, 0.44f, 1.0f};
+    const StorylandSkyState& sky = gStoriesSky.state();
+    GLfloat ambientModel[] = {sky.ambient.r, sky.ambient.g, sky.ambient.b, 1.0f};
     glLightModelfv(GL_LIGHT_MODEL_AMBIENT, ambientModel);
-    GLfloat light0Pos[] = {0.35f, 0.55f, 0.78f, 0.0f};
-    GLfloat light0Diffuse[] = {0.92f, 0.92f, 0.88f, 1.0f};
-    GLfloat light0Spec[] = {0.16f, 0.16f, 0.15f, 1.0f};
+    GLfloat light0Pos[] = {sky.sunDirectionX, sky.sunDirectionY, sky.sunDirectionZ, 0.0f};
+    GLfloat light0Diffuse[] = {sky.directional.r, sky.directional.g, sky.directional.b, 1.0f};
+    GLfloat light0Spec[] = {sky.directional.r * 0.18f, sky.directional.g * 0.18f, sky.directional.b * 0.18f, 1.0f};
     glLightfv(GL_LIGHT0, GL_POSITION, light0Pos);
     glLightfv(GL_LIGHT0, GL_DIFFUSE, light0Diffuse);
     glLightfv(GL_LIGHT0, GL_SPECULAR, light0Spec);
-    GLfloat light1Pos[] = {-0.60f, -0.25f, 0.50f, 0.0f};
-    GLfloat light1Diffuse[] = {0.42f, 0.42f, 0.46f, 1.0f};
+    GLfloat light1Pos[] = {-sky.sunDirectionX, -sky.sunDirectionY, 0.35f, 0.0f};
+    GLfloat light1Diffuse[] = {sky.ambient.r * 0.45f, sky.ambient.g * 0.45f, sky.ambient.b * 0.45f, 1.0f};
     GLfloat light1Spec[] = {0.0f, 0.0f, 0.0f, 1.0f};
     glLightfv(GL_LIGHT1, GL_POSITION, light1Pos);
     glLightfv(GL_LIGHT1, GL_DIFFUSE, light1Diffuse);
@@ -2148,6 +2225,21 @@ static void setPerspectiveProjection(double fovDegrees, double aspect, double zN
 
     glMatrixMode(GL_PROJECTION);
     glLoadMatrixd(matrix);
+}
+
+static void setStoriesViewportClearColor() {
+    const StorylandSkyColor& lower = gStoriesSky.state().lower;
+    if (gOpenGlRenderMode == StorylandOpenGlRenderMode::Stories && gStoriesSky.isEnabled()) {
+        glClearColor(lower.r, lower.g, lower.b, 1.0f);
+    } else {
+        glClearColor(0.115f, 0.120f, 0.128f, 1.0f);
+    }
+}
+
+static void drawStoriesViewportSky(float radius) {
+    if (gOpenGlRenderMode != StorylandOpenGlRenderMode::Stories || !gStoriesSky.isEnabled()) return;
+    stopStoriesShaderProgram();
+    gStoriesSky.drawBackground(skyRotationFromModelRotation(gModelViewRotation), radius);
 }
 
 static void drawOpenGlTextOverlayFallback(HDC dc, const RECT& rc, const std::wstring& text) {
@@ -2667,6 +2759,35 @@ static void populateModelList() {
     }
 
     const auto& fields = gModelFile.fields();
+    HTREEITEM structuresRoot = nullptr;
+    HTREEITEM headerStructuresRoot = nullptr;
+    HTREEITEM sceneStructuresRoot = nullptr;
+    HTREEITEM hierarchyStructuresRoot = nullptr;
+    HTREEITEM platformStructuresRoot = nullptr;
+    HTREEITEM diagnosticStructuresRoot = nullptr;
+    auto structureParentForGroup = [&](const std::string& group) -> HTREEITEM {
+        if (!structuresRoot) structuresRoot = addTreeItem(root, L"Decoded Leeds / RSL structures");
+        auto begins = [&](const char* prefix) { return group.rfind(prefix, 0) == 0; };
+        if (begins("sChunkHeader") || begins("Top-level") || begins("Resolved model") ||
+            begins("PedData") || begins("SimpleModelData") || begins("ElementGroupModelData")) {
+            if (!headerStructuresRoot) headerStructuresRoot = addTreeItem(structuresRoot, L"Model headers and family data");
+            return headerStructuresRoot;
+        }
+        if (begins("RslTAnim") || begins("RslNode")) {
+            if (!hierarchyStructuresRoot) hierarchyStructuresRoot = addTreeItem(structuresRoot, L"Frames and RslTAnim hierarchy");
+            return hierarchyStructuresRoot;
+        }
+        if (begins("sPspGeometry") || begins("sPspGeometryMesh") || begins("sPs2Geometry")) {
+            if (!platformStructuresRoot) platformStructuresRoot = addTreeItem(structuresRoot, L"Platform geometry streams");
+            return platformStructuresRoot;
+        }
+        if (begins("Pointer Table")) {
+            if (!diagnosticStructuresRoot) diagnosticStructuresRoot = addTreeItem(structuresRoot, L"Pointer diagnostics");
+            return diagnosticStructuresRoot;
+        }
+        if (!sceneStructuresRoot) sceneStructuresRoot = addTreeItem(structuresRoot, L"Clumps, atomics, geometry and materials");
+        return sceneStructuresRoot;
+    };
     std::vector<std::string> groups;
     std::vector<HTREEITEM> groupItems;
     for (size_t i = 0; i < fields.size(); ++i) {
@@ -2675,7 +2796,7 @@ static void populateModelList() {
         HTREEITEM groupItem = nullptr;
         if (found == groups.end()) {
             groups.push_back(f.group);
-            groupItem = addTreeItem(root, widen(f.group));
+            groupItem = addTreeItem(structureParentForGroup(f.group), widen(f.group));
             groupItems.push_back(groupItem);
         } else {
             groupItem = groupItems[size_t(found - groups.begin())];
@@ -2694,6 +2815,9 @@ static void populateModelList() {
 
     expandTreeItem(root);
     if (armatureRoot) expandTreeItem(armatureRoot);
+    if (structuresRoot) expandTreeItem(structuresRoot);
+    if (headerStructuresRoot) expandTreeItem(headerStructuresRoot);
+    if (hierarchyStructuresRoot) expandTreeItem(hierarchyStructuresRoot);
     if (gModelAnimLoaded) {
         setStatus(L"MDL loaded as " + widen(gModelFile.modelKindName()) + L"; attached ANIM: " + gModelAnimStatus);
     } else {
@@ -6284,10 +6408,12 @@ static void drawAnimPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
     int width = std::max<int>(1, static_cast<int>(rc.right - rc.left));
     int height = std::max<int>(1, static_cast<int>(rc.bottom - rc.top));
     glViewport(0, 0, width, height);
+    setStoriesViewportClearColor();
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
     double aspect = double(width) / double(height);
     setPerspectiveProjection(45.0, aspect, 0.01, 500.0);
+    drawStoriesViewportSky(100.0f);
 
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
@@ -8363,6 +8489,7 @@ static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
     int width = std::max<int>(1, static_cast<int>(rc.right - rc.left));
     int height = std::max<int>(1, static_cast<int>(rc.bottom - rc.top));
     glViewport(0, 0, width, height);
+    setStoriesViewportClearColor();
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     glDisable(GL_TEXTURE_2D);
 
@@ -8441,6 +8568,7 @@ static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
 
     double aspect = double(width) / double(height);
     setPerspectiveProjection(45.0, aspect, 0.05, 2000.0);
+    drawStoriesViewportSky(100.0f);
 
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
@@ -8726,6 +8854,37 @@ static StorylandModelPoint previewTriangleNormal(const StorylandModelPoint& a, c
     return normalizeStorylandPoint(n, StorylandModelPoint{0.0f, 0.0f, 1.0f});
 }
 
+static std::vector<StorylandModelPoint> buildPreviewGouraudNormals(
+    const std::vector<StorylandModelPoint>& points,
+    const std::vector<StorylandModelTriangle>& triangles
+) {
+    // Area-weighted accumulation matches RenderWare's smooth indexed-vertex
+    // lighting and keeps tiny triangles from overpowering their neighbours.
+    std::vector<StorylandModelPoint> normals(points.size());
+    for (const StorylandModelTriangle& triangle : triangles) {
+        if (triangle.a >= points.size() || triangle.b >= points.size() || triangle.c >= points.size()) continue;
+        const StorylandModelPoint& a = points[triangle.a];
+        const StorylandModelPoint& b = points[triangle.b];
+        const StorylandModelPoint& c = points[triangle.c];
+        StorylandModelPoint ab{b.x - a.x, b.y - a.y, b.z - a.z};
+        StorylandModelPoint ac{c.x - a.x, c.y - a.y, c.z - a.z};
+        StorylandModelPoint face = crossStorylandPoint(ab, ac);
+        if (!std::isfinite(face.x) || !std::isfinite(face.y) || !std::isfinite(face.z) ||
+            lengthSqStorylandPoint(face) <= 0.00000001f) {
+            continue;
+        }
+        for (uint32_t index : {triangle.a, triangle.b, triangle.c}) {
+            normals[index].x += face.x;
+            normals[index].y += face.y;
+            normals[index].z += face.z;
+        }
+    }
+    for (StorylandModelPoint& normal : normals) {
+        normal = normalizeStorylandPoint(normal, StorylandModelPoint{0.0f, 0.0f, 1.0f});
+    }
+    return normals;
+}
+
 static void emitPreviewVertexWithNormal(const StorylandModelPoint& p, const StorylandModelPoint& n) {
     glNormal3f(n.x, n.y, n.z);
     glVertex3f(p.x, p.y, p.z);
@@ -8876,6 +9035,7 @@ static void drawWblPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
     int width = std::max<int>(1, int(rc.right - rc.left));
     int height = std::max<int>(1, int(rc.bottom - rc.top));
     glViewport(0, 0, width, height);
+    setStoriesViewportClearColor();
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     glDisable(GL_BLEND);
     glDepthMask(GL_TRUE);
@@ -8884,6 +9044,7 @@ static void drawWblPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
 
     double aspect = double(width) / double(height);
     setPerspectiveProjection(45.0, aspect, 0.01, 5000.0);
+    drawStoriesViewportSky(100.0f);
 
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
@@ -9026,6 +9187,7 @@ static void drawModelPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
     int height = std::max<int>(1, static_cast<int>(rc.bottom - rc.top));
     glViewport(0, 0, width, height);
 
+    setStoriesViewportClearColor();
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     glDisable(GL_BLEND);
     glDepthMask(GL_TRUE);
@@ -9039,6 +9201,7 @@ static void drawModelPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
 
     double aspect = double(width) / double(height);
     setPerspectiveProjection(45.0, aspect, 0.01, 500.0);
+    drawStoriesViewportSky(100.0f);
 
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
@@ -9233,6 +9396,9 @@ static void drawModelPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
         }
         if (!usingStoriesShader) setupFixedPipelineStoriesLighting(wantsLighting && !wireOnly);
 
+        const std::vector<StorylandModelPoint> gouraudNormals =
+            (!wireOnly && wantsLighting) ? buildPreviewGouraudNormals(pts, tris) : std::vector<StorylandModelPoint>();
+
         if (!wireOnly) {
             glEnable(GL_POLYGON_OFFSET_FILL);
             glPolygonOffset(1.0f, 1.0f);
@@ -9246,14 +9412,17 @@ static void drawModelPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
                 const auto& b = pts[tri.b];
                 const auto& c = pts[tri.c];
                 if (!previewTriangleIsSafe(a, b, c)) continue;
-                StorylandModelPoint normal = previewTriangleNormal(a, b, c);
+                StorylandModelPoint faceNormal = previewTriangleNormal(a, b, c);
+                const StorylandModelPoint& normalA = tri.a < gouraudNormals.size() ? gouraudNormals[tri.a] : faceNormal;
+                const StorylandModelPoint& normalB = tri.b < gouraudNormals.size() ? gouraudNormals[tri.b] : faceNormal;
+                const StorylandModelPoint& normalC = tri.c < gouraudNormals.size() ? gouraudNormals[tri.c] : faceNormal;
                 int textureRegion = wantsTexture ? chooseModelTextureRegionForTriangle(tri, pts, minX, minY, minZ, spanX, spanY, spanZ) : -1;
                 if (wantsTexture) emitModelPreviewTexcoordInRegion(tri.a, textureRegion, pts, texcoords, hasRealTexcoords, minX, minY, minZ, spanX, spanY, spanZ);
-                emitPreviewVertexWithNormal(a, normal);
+                emitPreviewVertexWithNormal(a, normalA);
                 if (wantsTexture) emitModelPreviewTexcoordInRegion(tri.b, textureRegion, pts, texcoords, hasRealTexcoords, minX, minY, minZ, spanX, spanY, spanZ);
-                emitPreviewVertexWithNormal(b, normal);
+                emitPreviewVertexWithNormal(b, normalB);
                 if (wantsTexture) emitModelPreviewTexcoordInRegion(tri.c, textureRegion, pts, texcoords, hasRealTexcoords, minX, minY, minZ, spanX, spanY, spanZ);
-                emitPreviewVertexWithNormal(c, normal);
+                emitPreviewVertexWithNormal(c, normalC);
             }
             glEnd();
             glDisable(GL_POLYGON_OFFSET_FILL);
@@ -9667,6 +9836,29 @@ static void createMenuBar(HWND hwnd) {
     CheckMenuItem(view, ID_VIEW_SHOW_BOUNDS, MF_BYCOMMAND | (gOpenGlShowBounds ? MF_CHECKED : MF_UNCHECKED));
     AppendMenuW(view, MF_STRING, ID_VIEW_SHOW_VIEWCUBE, L"Show viewport cube");
     CheckMenuItem(view, ID_VIEW_SHOW_VIEWCUBE, MF_BYCOMMAND | (gOpenGlShowViewCube ? MF_CHECKED : MF_UNCHECKED));
+
+    HMENU sky = CreatePopupMenu();
+    AppendMenuW(sky, MF_STRING, ID_VIEW_SHOW_SKY, L"Show Stories sky");
+    CheckMenuItem(sky, ID_VIEW_SHOW_SKY, MF_BYCOMMAND | (gStoriesSky.isEnabled() ? MF_CHECKED : MF_UNCHECKED));
+    AppendMenuW(sky, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(sky, MF_STRING, ID_VIEW_SKY_LCS, L"Liberty City Stories");
+    AppendMenuW(sky, MF_STRING, ID_VIEW_SKY_VCS, L"Vice City Stories");
+    CheckMenuRadioItem(sky, ID_VIEW_SKY_LCS, ID_VIEW_SKY_VCS,
+                       gStoriesSky.game() == StorylandSkyGame::Lcs ? ID_VIEW_SKY_LCS : ID_VIEW_SKY_VCS,
+                       MF_BYCOMMAND);
+    AppendMenuW(sky, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(sky, MF_STRING, ID_VIEW_SKY_MIDNIGHT, L"Midnight");
+    AppendMenuW(sky, MF_STRING, ID_VIEW_SKY_DAWN, L"Dawn");
+    AppendMenuW(sky, MF_STRING, ID_VIEW_SKY_NOON, L"Noon");
+    AppendMenuW(sky, MF_STRING, ID_VIEW_SKY_SUNSET, L"Sunset");
+    AppendMenuW(sky, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(sky, MF_STRING, ID_VIEW_SKY_WEATHER_SUNNY, L"Sunny");
+    AppendMenuW(sky, MF_STRING, ID_VIEW_SKY_WEATHER_CLOUDY, L"Cloudy");
+    AppendMenuW(sky, MF_STRING, ID_VIEW_SKY_WEATHER_RAINY, L"Rainy");
+    AppendMenuW(sky, MF_STRING, ID_VIEW_SKY_WEATHER_FOGGY, L"Foggy");
+    CheckMenuRadioItem(sky, ID_VIEW_SKY_WEATHER_SUNNY, ID_VIEW_SKY_WEATHER_FOGGY,
+                       ID_VIEW_SKY_WEATHER_SUNNY, MF_BYCOMMAND);
+    AppendMenuW(view, MF_POPUP, reinterpret_cast<UINT_PTR>(sky), L"Stories sky");
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(view), L"View");
 
     HMENU help = CreatePopupMenu();
@@ -9692,6 +9884,8 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         initializeOpenGlPreview(gPreview);
         gDetails = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", nullptr, WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, 0, 0, 100, 100, hwnd, reinterpret_cast<HMENU>(ID_DETAILS), gInstance, nullptr);
         gStatus = CreateWindowExW(0, STATUSCLASSNAMEW, nullptr, WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(ID_STATUS), gInstance, nullptr);
+        gStoriesSkyLastTick = GetTickCount();
+        SetTimer(hwnd, 2, 33, nullptr);
         setStatus(L"Open .chk/.xtx/.tex textures, .mdl/.wbl models, .anim files, or GAME.DTZ");
         return 0;
     }
@@ -9701,6 +9895,16 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 
     case WM_TIMER:
         if (wParam == 1 && advanceAnimationPlaybackFrame()) {
+            return 0;
+        }
+        if (wParam == 2) {
+            DWORD tick = GetTickCount();
+            float elapsedSeconds = float(tick - gStoriesSkyLastTick) / 1000.0f;
+            gStoriesSkyLastTick = tick;
+            gStoriesSky.update(std::min(elapsedSeconds, 0.25f));
+            if (gOpenGlRenderMode == StorylandOpenGlRenderMode::Stories && gStoriesSky.isEnabled()) {
+                InvalidateRect(gPreview, nullptr, FALSE);
+            }
             return 0;
         }
         break;
@@ -9786,6 +9990,64 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             CheckMenuItem(GetMenu(hwnd), ID_VIEW_SHOW_VIEWCUBE, MF_BYCOMMAND | (gOpenGlShowViewCube ? MF_CHECKED : MF_UNCHECKED));
             InvalidateRect(gPreview, nullptr, FALSE);
             break;
+        case ID_VIEW_SHOW_SKY:
+            gStoriesSky.setEnabled(!gStoriesSky.isEnabled());
+            CheckMenuItem(GetMenu(hwnd), ID_VIEW_SHOW_SKY, MF_BYCOMMAND |
+                          (gStoriesSky.isEnabled() ? MF_CHECKED : MF_UNCHECKED));
+            InvalidateRect(gPreview, nullptr, FALSE);
+            break;
+        case ID_VIEW_SKY_LCS:
+            gStoriesSky.setGame(StorylandSkyGame::Lcs);
+            CheckMenuRadioItem(GetMenu(hwnd), ID_VIEW_SKY_LCS, ID_VIEW_SKY_VCS,
+                               ID_VIEW_SKY_LCS, MF_BYCOMMAND);
+            InvalidateRect(gPreview, nullptr, FALSE);
+            break;
+        case ID_VIEW_SKY_VCS:
+            gStoriesSky.setGame(StorylandSkyGame::Vcs);
+            CheckMenuRadioItem(GetMenu(hwnd), ID_VIEW_SKY_LCS, ID_VIEW_SKY_VCS,
+                               ID_VIEW_SKY_VCS, MF_BYCOMMAND);
+            InvalidateRect(gPreview, nullptr, FALSE);
+            break;
+        case ID_VIEW_SKY_MIDNIGHT:
+            gStoriesSky.setTime(0.0f);
+            InvalidateRect(gPreview, nullptr, FALSE);
+            break;
+        case ID_VIEW_SKY_DAWN:
+            gStoriesSky.setTime(6.0f);
+            InvalidateRect(gPreview, nullptr, FALSE);
+            break;
+        case ID_VIEW_SKY_NOON:
+            gStoriesSky.setTime(12.0f);
+            InvalidateRect(gPreview, nullptr, FALSE);
+            break;
+        case ID_VIEW_SKY_SUNSET:
+            gStoriesSky.setTime(19.0f);
+            InvalidateRect(gPreview, nullptr, FALSE);
+            break;
+        case ID_VIEW_SKY_WEATHER_SUNNY:
+            gStoriesSky.setWeather(StorylandSkyWeather::Sunny);
+            CheckMenuRadioItem(GetMenu(hwnd), ID_VIEW_SKY_WEATHER_SUNNY,
+                               ID_VIEW_SKY_WEATHER_FOGGY, ID_VIEW_SKY_WEATHER_SUNNY, MF_BYCOMMAND);
+            InvalidateRect(gPreview, nullptr, FALSE);
+            break;
+        case ID_VIEW_SKY_WEATHER_CLOUDY:
+            gStoriesSky.setWeather(StorylandSkyWeather::Cloudy);
+            CheckMenuRadioItem(GetMenu(hwnd), ID_VIEW_SKY_WEATHER_SUNNY,
+                               ID_VIEW_SKY_WEATHER_FOGGY, ID_VIEW_SKY_WEATHER_CLOUDY, MF_BYCOMMAND);
+            InvalidateRect(gPreview, nullptr, FALSE);
+            break;
+        case ID_VIEW_SKY_WEATHER_RAINY:
+            gStoriesSky.setWeather(StorylandSkyWeather::Rainy);
+            CheckMenuRadioItem(GetMenu(hwnd), ID_VIEW_SKY_WEATHER_SUNNY,
+                               ID_VIEW_SKY_WEATHER_FOGGY, ID_VIEW_SKY_WEATHER_RAINY, MF_BYCOMMAND);
+            InvalidateRect(gPreview, nullptr, FALSE);
+            break;
+        case ID_VIEW_SKY_WEATHER_FOGGY:
+            gStoriesSky.setWeather(StorylandSkyWeather::Foggy);
+            CheckMenuRadioItem(GetMenu(hwnd), ID_VIEW_SKY_WEATHER_SUNNY,
+                               ID_VIEW_SKY_WEATHER_FOGGY, ID_VIEW_SKY_WEATHER_FOGGY, MF_BYCOMMAND);
+            InvalidateRect(gPreview, nullptr, FALSE);
+            break;
         case ID_DTZ_PATCH_SELECTED: patchSelectedDtzRecord(); break;
         case ID_DTZ_PATCH_DATA_FIELD: patchSelectedDtzDataField(); break;
         case ID_DTZ_PATCH_PLR_23: patchPlrPair23(); break;
@@ -9814,6 +10076,7 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         break;
     }
     case WM_DESTROY:
+        KillTimer(hwnd, 2);
         deleteTextureBitmap();
         destroyOpenGlPreview();
         PostQuitMessage(0);
@@ -9835,8 +10098,36 @@ static HICON loadStorylandIcon(HINSTANCE instance, int width, int height) {
     return LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
 }
 
+static void loadEmbeddedVcsTimecycle() {
+    HRSRC resource = FindResourceW(
+        gInstance,
+        MAKEINTRESOURCEW(IDR_VCS_TIMECYC),
+        MAKEINTRESOURCEW(10) // RT_RCDATA, explicitly wide for FindResourceW
+    );
+    if (!resource) {
+        gStoriesSkyDataStatus = "Embedded VCS timecycle resource was not found; using fallback colours.";
+        return;
+    }
+    HGLOBAL loadedResource = LoadResource(gInstance, resource);
+    DWORD resourceSize = SizeofResource(gInstance, resource);
+    const char* resourceBytes = loadedResource ?
+        static_cast<const char*>(LockResource(loadedResource)) : nullptr;
+    if (!resourceBytes || resourceSize == 0) {
+        gStoriesSkyDataStatus = "Embedded VCS timecycle resource is empty; using fallback colours.";
+        return;
+    }
+
+    std::string error;
+    if (!gStoriesSky.loadVcsTimecycleText(std::string(resourceBytes, resourceSize), error)) {
+        gStoriesSkyDataStatus = error;
+        return;
+    }
+    gStoriesSkyDataStatus = "Embedded VCS timecycle loaded.";
+}
+
 int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR commandLine, int showCommand) {
     gInstance = hInstance;
+    loadEmbeddedVcsTimecycle();
     INITCOMMONCONTROLSEX icc = { sizeof(INITCOMMONCONTROLSEX), ICC_BAR_CLASSES | ICC_STANDARD_CLASSES | ICC_TREEVIEW_CLASSES };
     InitCommonControlsEx(&icc);
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);

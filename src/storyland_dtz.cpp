@@ -106,7 +106,7 @@ static bool validStreamingPair(uint32_t start, uint32_t count) {
 }
 
 static bool readWholeFile(const std::wstring& filePath, std::vector<uint8_t>& bytes, std::string& errorMessage) {
-    std::ifstream file(filePath, std::ios::binary);
+    std::ifstream file(std::filesystem::path(filePath), std::ios::binary);
     if (!file) {
         errorMessage = "Could not open file.";
         return false;
@@ -128,7 +128,7 @@ static bool readWholeFile(const std::wstring& filePath, std::vector<uint8_t>& by
 }
 
 static bool writeWholeFileDirect(const std::wstring& filePath, const std::vector<uint8_t>& bytes, std::string& errorMessage) {
-    std::ofstream file(filePath, std::ios::binary);
+    std::ofstream file(std::filesystem::path(filePath), std::ios::binary);
     if (!file) {
         errorMessage = "Could not create output file.";
         return false;
@@ -704,14 +704,50 @@ void StorylandDtzArchive::rebuildDirMatches() {
     std::map<std::pair<uint32_t, uint32_t>, std::string> internalNameByPair;
     std::vector<std::string> internalBaseNames = findInternalStreamingBaseNames();
 
-    auto addNamesFromSentinelTable = [&](size_t tableBase, const char* extension) {
+    size_t firstStreamingTableBase = findSentinelTableBaseByFirstPair(23u, 44u);
+    if (firstStreamingTableBase == std::numeric_limits<size_t>::max()) {
+        firstStreamingTableBase = findSentinelTableBaseByFirstPair(23u, 45u);
+    }
+    if (firstStreamingTableBase == std::numeric_limits<size_t>::max()) {
+        firstStreamingTableBase = findSentinelTableBaseByFirstPair(23u, 68u);
+    }
+    uint32_t streamingInfoHeader = unpackedData.size() > 0x80u ? readU32(unpackedData, 0x7C) : 0u;
+    uint32_t modelSlotLimit = 0u;
+    uint32_t textureSlotLimit = 0u;
+    uint32_t totalSlotLimit = 0u;
+    if (streamingInfoHeader != 0u && size_t(streamingInfoHeader) + 0x18u <= unpackedData.size()) {
+        modelSlotLimit = readU32(unpackedData, size_t(streamingInfoHeader) + 0x08u);
+        textureSlotLimit = readU32(unpackedData, size_t(streamingInfoHeader) + 0x0Cu);
+        totalSlotLimit = readU32(unpackedData, size_t(streamingInfoHeader) + 0x14u);
+        if (modelSlotLimit == 0u || textureSlotLimit < modelSlotLimit ||
+            totalSlotLimit < textureSlotLimit || totalSlotLimit > 0x20000u) {
+            modelSlotLimit = 0u;
+            textureSlotLimit = 0u;
+            totalSlotLimit = 0u;
+        }
+    }
+
+    auto tableEndFromGlobalSlotLimit = [&](uint32_t slotLimit) -> size_t {
+        if (firstStreamingTableBase == std::numeric_limits<size_t>::max() || slotLimit == 0u) {
+            return std::numeric_limits<size_t>::max();
+        }
+        uint64_t end = uint64_t(firstStreamingTableBase) + uint64_t(slotLimit) * 24ull;
+        if (end > unpackedData.size()) return std::numeric_limits<size_t>::max();
+        return size_t(end);
+    };
+
+    auto addNamesFromSentinelTable = [&](size_t tableBase, size_t tableEnd, const char* extension) {
         if (tableBase == std::numeric_limits<size_t>::max()) return;
         if (internalBaseNames.empty()) return;
+        if (tableEnd == std::numeric_limits<size_t>::max() || tableEnd <= tableBase) {
+            tableEnd = unpackedData.size();
+        }
 
         size_t nameIndex = 0;
         std::string expectedExtension = extension ? extension : "";
         for (size_t row = 0; nameIndex < internalBaseNames.size(); ++row) {
             size_t offset = tableBase + row * 24u;
+            if (offset + 24u > tableEnd) break;
             if (!sentinelEntryPrefixIsValid(offset)) break;
 
             uint32_t start = readU32(unpackedData, offset + 0x10);
@@ -727,10 +763,12 @@ void StorylandDtzArchive::rebuildDirMatches() {
         }
     };
 
-    addNamesFromSentinelTable(findSentinelTableBaseByFirstPair(0u, 23u), ".xtx");
-    addNamesFromSentinelTable(findSentinelTableBaseByFirstPair(23u, 44u), ".mdl");
-    addNamesFromSentinelTable(findSentinelTableBaseByFirstPair(23u, 45u), ".mdl");
-    addNamesFromSentinelTable(findSentinelTableBaseByFirstPair(23u, 68u), ".mdl");
+    size_t modelTableEnd = tableEndFromGlobalSlotLimit(modelSlotLimit);
+    size_t textureTableEnd = tableEndFromGlobalSlotLimit(textureSlotLimit);
+    addNamesFromSentinelTable(findSentinelTableBaseByFirstPair(0u, 23u), textureTableEnd, ".xtx");
+    addNamesFromSentinelTable(findSentinelTableBaseByFirstPair(23u, 44u), modelTableEnd, ".mdl");
+    addNamesFromSentinelTable(findSentinelTableBaseByFirstPair(23u, 45u), modelTableEnd, ".mdl");
+    addNamesFromSentinelTable(findSentinelTableBaseByFirstPair(23u, 68u), modelTableEnd, ".mdl");
 
     auto internalNameForPair = [&](uint32_t startSector, uint32_t sectorCount) -> std::string {
         auto found = internalNameByPair.find({startSector, sectorCount});

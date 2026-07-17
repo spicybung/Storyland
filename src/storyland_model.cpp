@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cstring>
 #include <fstream>
+#include <filesystem>
 #include <iomanip>
 #include <map>
 #include <set>
@@ -225,6 +226,23 @@ static void addField(std::vector<StorylandModelField>& fields, const std::string
     fields.push_back({group, name, offset, value, note});
 }
 
+static void addFloatField(const std::vector<uint8_t>& data, std::vector<StorylandModelField>& fields,
+                          const std::string& group, const std::string& name, uint32_t offset,
+                          const std::string& note = "") {
+    if (size_t(offset) + 4u > data.size()) return;
+    std::ostringstream fullNote;
+    fullNote << "float=" << modelReadF32(data, offset);
+    if (!note.empty()) fullNote << "; " << note;
+    addField(fields, group, name, offset, modelReadU32(data, offset), fullNote.str());
+}
+
+static void addU16Field(const std::vector<uint8_t>& data, std::vector<StorylandModelField>& fields,
+                        const std::string& group, const std::string& name, uint32_t offset,
+                        const std::string& note = "") {
+    if (size_t(offset) + 2u > data.size()) return;
+    addField(fields, group, name, offset, modelReadU16(data, offset), note);
+}
+
 static void addPointerField(const std::vector<uint8_t>& data, std::vector<StorylandModelField>& fields, const std::string& group, const std::string& name, uint32_t offset, const std::string& note) {
     uint32_t value = modelReadU32(data, offset);
     std::string fullNote = note;
@@ -301,7 +319,7 @@ void StorylandModelFile::detectModelKind() {
 
 bool StorylandModelFile::loadFromFile(const std::wstring& filePath, std::string& errorMessage) {
     path = filePath;
-    std::ifstream file(filePath, std::ios::binary);
+    std::ifstream file(std::filesystem::path(filePath), std::ios::binary);
     if (!file) {
         errorMessage = "Could not open MDL file.";
         return false;
@@ -1687,6 +1705,65 @@ static size_t alignModelOffset(size_t offset, size_t alignment) {
     return (offset + alignment - 1u) & ~(alignment - 1u);
 }
 
+struct PspNativeVertexLayout {
+    size_t weightOffset = SIZE_MAX;
+    size_t uvOffset = SIZE_MAX;
+    size_t colorOffset = SIZE_MAX;
+    size_t normalOffset = SIZE_MAX;
+    size_t positionOffset = SIZE_MAX;
+    size_t stride = 0u;
+    uint32_t numberOfWeights = 0u;
+    uint32_t positionFormat = 0u;
+};
+
+static bool buildPspNativeVertexLayout(uint32_t flags, PspNativeVertexLayout& layout) {
+    layout = {};
+
+    uint32_t uvFormat = flags & 3u;
+    uint32_t colorFormat = (flags >> 2u) & 7u;
+    uint32_t normalFormat = (flags >> 5u) & 3u;
+    uint32_t positionFormat = (flags >> 7u) & 3u;
+    uint32_t weightFormat = (flags >> 9u) & 3u;
+    uint32_t indexFormat = (flags >> 11u) & 3u;
+    uint32_t numberOfWeights = ((flags >> 14u) & 7u) + 1u;
+
+    if (uvFormat > 1u || (colorFormat != 0u && colorFormat != 5u) ||
+        normalFormat > 1u || (positionFormat != 1u && positionFormat != 2u) ||
+        weightFormat > 1u || indexFormat != 0u) {
+        return false;
+    }
+
+    size_t cursor = 0u;
+    if (weightFormat == 1u) {
+        cursor = alignModelOffset(cursor, 2u);
+        layout.weightOffset = cursor;
+        cursor += numberOfWeights;
+    }
+    if (uvFormat == 1u) {
+        cursor = alignModelOffset(cursor, 2u);
+        layout.uvOffset = cursor;
+        cursor += 2u;
+    }
+    if (colorFormat == 5u) {
+        cursor = alignModelOffset(cursor, 2u);
+        layout.colorOffset = cursor;
+        cursor += 2u;
+    }
+    if (normalFormat == 1u) {
+        cursor = alignModelOffset(cursor, 2u);
+        layout.normalOffset = cursor;
+        cursor += 3u;
+    }
+
+    cursor = alignModelOffset(cursor, 2u);
+    layout.positionOffset = cursor;
+    cursor += positionFormat == 1u ? 3u : 6u;
+    layout.stride = alignModelOffset(cursor, 2u);
+    layout.numberOfWeights = numberOfWeights;
+    layout.positionFormat = positionFormat;
+    return layout.stride > 0u;
+}
+
 static bool pspNativeGeometryHeaderLooksValid(
     const std::vector<uint8_t>& data,
     uint32_t geometryOffset,
@@ -1709,26 +1786,15 @@ static bool pspNativeGeometryHeaderLooksValid(
     if (vertexOffset < 0x48u + numStrips * 0x30u) return false;
     if (headerOffset + vertexOffset >= data.size()) return false;
 
-    uint32_t uvFormat = flags & 3u;
-    uint32_t colorFormat = (flags >> 2u) & 7u;
-    uint32_t normalFormat = (flags >> 5u) & 3u;
-    uint32_t positionFormat = (flags >> 7u) & 3u;
-    uint32_t weightFormat = (flags >> 9u) & 3u;
-    uint32_t indexFormat = (flags >> 11u) & 3u;
-
-    if (uvFormat > 1u) return false;
-    if (colorFormat != 0u && colorFormat != 5u) return false;
-    if (normalFormat > 1u) return false;
-    if (positionFormat != 1u && positionFormat != 2u) return false;
-    if (weightFormat > 1u) return false;
-    if (indexFormat != 0u) return false;
+    PspNativeVertexLayout layout;
+    if (!buildPspNativeVertexLayout(flags, layout)) return false;
 
     float sx = modelReadF32(data, headerOffset + 0x20u);
     float sy = modelReadF32(data, headerOffset + 0x24u);
     float sz = modelReadF32(data, headerOffset + 0x28u);
-    float tx = modelReadF32(data, headerOffset + 0x34u);
-    float ty = modelReadF32(data, headerOffset + 0x38u);
-    float tz = modelReadF32(data, headerOffset + 0x3Cu);
+    float tx = modelReadF32(data, headerOffset + 0x30u);
+    float ty = modelReadF32(data, headerOffset + 0x34u);
+    float tz = modelReadF32(data, headerOffset + 0x38u);
 
     return previewFiniteReasonable(sx, 1000.0f) &&
            previewFiniteReasonable(sy, 1000.0f) &&
@@ -1810,19 +1876,19 @@ static bool appendPspNativeGeometry(
         uint32_t numStrips = modelReadU32(data, headerOffset + 0x08u);
         uint32_t vertexBaseOffset = modelReadU32(data, headerOffset + 0x40u);
 
-        uint32_t uvFormat = flags & 3u;
-        uint32_t colorFormat = (flags >> 2u) & 7u;
-        uint32_t normalFormat = (flags >> 5u) & 3u;
-        uint32_t positionFormat = (flags >> 7u) & 3u;
         uint32_t weightFormat = (flags >> 9u) & 3u;
-        uint32_t numberOfWeights = ((flags >> 14u) & 7u) + 1u;
+        PspNativeVertexLayout layout;
+        if (!buildPspNativeVertexLayout(flags, layout)) {
+            rejectedMarkerCount++;
+            continue;
+        }
 
         float scaleX = modelReadF32(data, headerOffset + 0x20u);
         float scaleY = modelReadF32(data, headerOffset + 0x24u);
         float scaleZ = modelReadF32(data, headerOffset + 0x28u);
-        float posX = modelReadF32(data, headerOffset + 0x34u);
-        float posY = modelReadF32(data, headerOffset + 0x38u);
-        float posZ = modelReadF32(data, headerOffset + 0x3Cu);
+        float posX = modelReadF32(data, headerOffset + 0x30u);
+        float posY = modelReadF32(data, headerOffset + 0x34u);
+        float posZ = modelReadF32(data, headerOffset + 0x38u);
 
         for (uint32_t stripIndex = 0; stripIndex < numStrips; ++stripIndex) {
             size_t stripHeader = size_t(headerOffset) + 0x48u + size_t(stripIndex) * 0x30u;
@@ -1851,86 +1917,48 @@ static bool appendPspNativeGeometry(
             }
 
             size_t streamOffset = size_t(headerOffset) + size_t(vertexBaseOffset) + size_t(stripVertexOffset);
-            if (streamOffset >= data.size()) {
+            if (streamOffset >= data.size() || vertexCount > (data.size() - streamOffset) / layout.stride) {
                 rejectedMarkerCount++;
                 continue;
             }
 
             uint32_t baseVertex = uint32_t(points.size());
-            size_t cursor = 0;
             bool stripOk = true;
 
             for (uint32_t vertexIndex = 0; vertexIndex < vertexCount; ++vertexIndex) {
+                size_t vertexOffset = streamOffset + size_t(vertexIndex) * layout.stride;
                 uint8_t rawWeights[8] = {};
 
                 if (weightFormat == 1u) {
-                    if (streamOffset + cursor + numberOfWeights > data.size()) {
-                        stripOk = false;
-                        break;
+                    for (uint32_t weightIndex = 0; weightIndex < layout.numberOfWeights && weightIndex < 8u; ++weightIndex) {
+                        rawWeights[weightIndex] = data[vertexOffset + layout.weightOffset + weightIndex];
                     }
-                    for (uint32_t weightIndex = 0; weightIndex < numberOfWeights && weightIndex < 8u; ++weightIndex) {
-                        rawWeights[weightIndex] = data[streamOffset + cursor + weightIndex];
-                    }
-                    cursor += numberOfWeights;
                 }
 
                 float u = 0.0f;
                 float v = 0.0f;
-                if (uvFormat == 1u) {
-                    if (streamOffset + cursor + 2u > data.size()) {
-                        stripOk = false;
-                        break;
-                    }
+                if (layout.uvOffset != SIZE_MAX) {
                     float safeUvScaleX = std::isfinite(uvScaleX) && std::fabs(uvScaleX) > 0.000001f ? uvScaleX : 1.0f;
                     float safeUvScaleY = std::isfinite(uvScaleY) && std::fabs(uvScaleY) > 0.000001f ? uvScaleY : 1.0f;
-                    u = float(data[streamOffset + cursor + 0u]) / 128.0f * safeUvScaleX;
-                    v = float(data[streamOffset + cursor + 1u]) / 128.0f * safeUvScaleY;
-                    cursor += 2u;
-                }
-
-                if (colorFormat == 5u) {
-                    cursor = alignModelOffset(cursor, 2u);
-                    if (streamOffset + cursor + 2u > data.size()) {
-                        stripOk = false;
-                        break;
-                    }
-                    cursor += 2u;
-                }
-
-                if (normalFormat == 1u) {
-                    if (streamOffset + cursor + 3u > data.size()) {
-                        stripOk = false;
-                        break;
-                    }
-                    cursor += 3u;
+                    u = float(data[vertexOffset + layout.uvOffset + 0u]) / 128.0f * safeUvScaleX;
+                    v = float(data[vertexOffset + layout.uvOffset + 1u]) / 128.0f * safeUvScaleY;
                 }
 
                 StorylandModelPoint point;
-                if (positionFormat == 1u) {
-                    if (streamOffset + cursor + 3u > data.size()) {
-                        stripOk = false;
-                        break;
-                    }
-                    int8_t rawX = static_cast<int8_t>(data[streamOffset + cursor + 0u]);
-                    int8_t rawY = static_cast<int8_t>(data[streamOffset + cursor + 1u]);
-                    int8_t rawZ = static_cast<int8_t>(data[streamOffset + cursor + 2u]);
+                if (layout.positionFormat == 1u) {
+                    int8_t rawX = static_cast<int8_t>(data[vertexOffset + layout.positionOffset + 0u]);
+                    int8_t rawY = static_cast<int8_t>(data[vertexOffset + layout.positionOffset + 1u]);
+                    int8_t rawZ = static_cast<int8_t>(data[vertexOffset + layout.positionOffset + 2u]);
                     point.x = float(rawX) / 128.0f * scaleX + posX;
                     point.y = float(rawY) / 128.0f * scaleY + posY;
                     point.z = float(rawZ) / 128.0f * scaleZ + posZ;
-                    cursor += 3u;
-                } else if (positionFormat == 2u) {
-                    cursor = alignModelOffset(cursor, 2u);
-                    if (streamOffset + cursor + 6u > data.size()) {
-                        stripOk = false;
-                        break;
-                    }
-                    int16_t rawX = modelReadI16(data, streamOffset + cursor + 0u);
-                    int16_t rawY = modelReadI16(data, streamOffset + cursor + 2u);
-                    int16_t rawZ = modelReadI16(data, streamOffset + cursor + 4u);
+                } else if (layout.positionFormat == 2u) {
+                    int16_t rawX = modelReadI16(data, vertexOffset + layout.positionOffset + 0u);
+                    int16_t rawY = modelReadI16(data, vertexOffset + layout.positionOffset + 2u);
+                    int16_t rawZ = modelReadI16(data, vertexOffset + layout.positionOffset + 4u);
                     point.x = float(rawX) / 32768.0f * scaleX + posX;
                     point.y = float(rawY) / 32768.0f * scaleY + posY;
                     point.z = float(rawZ) / 32768.0f * scaleZ + posZ;
-                    cursor += 6u;
                 } else {
                     stripOk = false;
                     break;
@@ -1947,7 +1975,7 @@ static bool appendPspNativeGeometry(
                 StorylandModelSkinWeights weights;
                 if (weightFormat == 1u) {
                     std::vector<uint32_t> order;
-                    for (uint32_t weightIndex = 0; weightIndex < numberOfWeights && weightIndex < 8u; ++weightIndex) {
+                    for (uint32_t weightIndex = 0; weightIndex < layout.numberOfWeights && weightIndex < 8u; ++weightIndex) {
                         order.push_back(weightIndex);
                     }
                     std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
@@ -3318,7 +3346,7 @@ void StorylandModelFile::parse() {
     } else {
         outputLines.push_back({"Texture name hints embedded in MDL: none found."});
     }
-    outputLines.push_back({"Left pane is a named struct tree: sChunkHeader, Top-level payload, RslElementGroup/Clump, RslElement/Atomic, RslNode1/2/3, and pointer candidates."});
+    outputLines.push_back({"Left pane is a named struct tree: model-family data, Clump/Atomic, RslGeometry/RslMaterial, RslTAnim/HAnim, RslNode frames, PS2/PSP stream headers, and pointer diagnostics."});
 
     if (data.size() >= 0x28) {
         for (size_t offset = 0; offset < 0x40 && offset + 4 <= data.size(); offset += 4) {
@@ -3344,10 +3372,18 @@ void StorylandModelFile::parse() {
         uint32_t slot1 = modelReadU32(data, 0x24);
         if (looksLikeClumpAt(data, slot1)) {
             addField(fieldRows, "Resolved model family", "LoadPed candidate", 0x24, slot1, "slot1 points to RslElementGroup / Clump. Treat top-level as PedData { colModel, elementgroup }.");
+            addPointerField(data, fieldRows, "PedData @ 0x000020", "collision_model_ptr", 0x20,
+                            "PedData.colModel; optional Leeds collision model.");
+            addPointerField(data, fieldRows, "PedData @ 0x000020", "element_group_ptr", 0x24,
+                            "PedData.elementgroup; owning RslElementGroup / Clump.");
         } else if (looksLikeClumpAt(data, slot0)) {
             addField(fieldRows, "Resolved model family", "LoadElementGroup candidate", 0x20, slot0, "slot0 points directly to RslElementGroup / Clump.");
+            addPointerField(data, fieldRows, "ElementGroupModelData @ 0x000020", "element_group_ptr", 0x20,
+                            "Top-level RslElementGroup / Clump.");
         } else if (looksLikeAtomicAt(data, slot0)) {
             addField(fieldRows, "Resolved model family", "LoadSimple candidate", 0x20, slot0, "slot0 points to an RslElement / Atomic entry.");
+            addPointerField(data, fieldRows, "SimpleModelData @ 0x000020", "atomic_ptr", 0x20,
+                            "Top-level RslElement / Atomic.");
         } else {
             addField(fieldRows, "Resolved model family", "unresolved top-level layout", 0x20, slot0, "Storyland could not resolve the first payload slots to a known Clump/Atomic layout yet.");
         }
@@ -3359,6 +3395,236 @@ void StorylandModelFile::parse() {
     uint32_t node2Index = 0;
     uint32_t node3Index = 0;
     uint32_t genericAaIndex = 0;
+    std::set<uint32_t> describedGeometries;
+    std::set<uint32_t> describedHierarchies;
+    std::set<uint32_t> describedMaterials;
+
+    auto describeMaterialList = [&](uint32_t geometryOffset) {
+        if (size_t(geometryOffset) + 0x14u > data.size()) return;
+        uint32_t listPointer = modelReadU32(data, geometryOffset + 0x0Cu);
+        uint32_t materialCount = modelReadU32(data, geometryOffset + 0x10u);
+        if (!modelPointerLooksValid(data, listPointer) || materialCount == 0u || materialCount > 512u ||
+            uint64_t(listPointer) + uint64_t(materialCount) * 4ull > data.size()) return;
+
+        std::ostringstream listGroup;
+        listGroup << "RslMaterialList @ " << modelHexOffset(listPointer);
+        addField(fieldRows, listGroup.str(), "material_count", geometryOffset + 0x10u, materialCount,
+                 "Number of material pointers referenced by this RslGeometry.");
+        for (uint32_t materialIndex = 0; materialIndex < materialCount; ++materialIndex) {
+            uint32_t pointerOffset = listPointer + materialIndex * 4u;
+            uint32_t materialPointer = modelReadU32(data, pointerOffset);
+            std::ostringstream pointerName;
+            pointerName << "material_ptr[" << materialIndex << "]";
+            addPointerField(data, fieldRows, listGroup.str(), pointerName.str(), pointerOffset,
+                            "RslMaterial pointer table entry");
+            if (!modelPointerLooksValid(data, materialPointer) || size_t(materialPointer) + 0x10u > data.size() ||
+                !describedMaterials.insert(materialPointer).second) continue;
+
+            std::ostringstream materialGroup;
+            materialGroup << "RslMaterial #" << materialIndex << " @ " << modelHexOffset(materialPointer);
+            uint32_t textureNamePointer = modelReadU32(data, materialPointer + 0x00u);
+            std::string textureName = readModelCStringAt(data, textureNamePointer);
+            std::string textureNote = "Texture-name pointer";
+            if (!textureName.empty()) textureNote += "; name='" + textureName + "'";
+            addPointerField(data, fieldRows, materialGroup.str(), "texture_name_ptr", materialPointer + 0x00u, textureNote);
+            addField(fieldRows, materialGroup.str(), "rgba", materialPointer + 0x04u,
+                     modelReadU32(data, materialPointer + 0x04u), "Packed material RGBA colour.");
+            addField(fieldRows, materialGroup.str(), "surface_or_flags", materialPointer + 0x08u,
+                     modelReadU32(data, materialPointer + 0x08u), "Leeds material surface/flag field.");
+            addPointerField(data, fieldRows, materialGroup.str(), "specular_or_matfx_ptr", materialPointer + 0x0Cu,
+                            "Optional material effect/specular block.");
+        }
+    };
+
+    auto describeGeometry = [&](uint32_t geometryOffset, uint32_t atomicOffset) {
+        if (!modelPointerLooksValid(data, geometryOffset) || size_t(geometryOffset) + 0x20u > data.size() ||
+            !describedGeometries.insert(geometryOffset).second) return;
+
+        std::ostringstream geometryGroup;
+        geometryGroup << "RslGeometry @ " << modelHexOffset(geometryOffset);
+        addField(fieldRows, geometryGroup.str(), "owner_atomic", atomicOffset + 0x14u, geometryOffset,
+                 "Referenced by Atomic @ " + modelHexOffset(atomicOffset) + ".");
+        addField(fieldRows, geometryGroup.str(), "geometry_field_00", geometryOffset + 0x00u,
+                 modelReadU32(data, geometryOffset + 0x00u), "Geometry wrapper/runtime field.");
+        addField(fieldRows, geometryGroup.str(), "geometry_field_04", geometryOffset + 0x04u,
+                 modelReadU32(data, geometryOffset + 0x04u), "Geometry wrapper/runtime field.");
+        addField(fieldRows, geometryGroup.str(), "geometry_field_08", geometryOffset + 0x08u,
+                 modelReadU32(data, geometryOffset + 0x08u), "Geometry wrapper/runtime field.");
+        addPointerField(data, fieldRows, geometryGroup.str(), "material_list_ptr", geometryOffset + 0x0Cu,
+                        "Pointer to RslMaterial pointer array.");
+        addField(fieldRows, geometryGroup.str(), "material_count", geometryOffset + 0x10u,
+                 modelReadU32(data, geometryOffset + 0x10u), "Number of RslMaterial entries.");
+        describeMaterialList(geometryOffset);
+
+        uint32_t headerOffset = 0u;
+        if (pspNativeGeometryHeaderLooksValid(data, geometryOffset, headerOffset)) {
+            std::ostringstream headerGroup;
+            headerGroup << "sPspGeometry @ " << modelHexOffset(headerOffset);
+            uint32_t size = modelReadU32(data, headerOffset + 0x00u);
+            uint32_t flags = modelReadU32(data, headerOffset + 0x04u);
+            uint32_t numStrips = modelReadU32(data, headerOffset + 0x08u);
+            uint32_t numVertices = modelReadU32(data, headerOffset + 0x2Cu);
+            uint32_t vertexBufferOffset = modelReadU32(data, headerOffset + 0x40u);
+            PspNativeVertexLayout layout;
+            buildPspNativeVertexLayout(flags, layout);
+
+            addField(fieldRows, headerGroup.str(), "size", headerOffset + 0x00u, size,
+                     "Total PSP geometry header + strip descriptors + vertex data size.");
+            std::ostringstream layoutNote;
+            layoutNote << "PSP VTYPE; stride=" << layout.stride
+                       << " weights=" << (layout.weightOffset == SIZE_MAX ? -1 : int(layout.weightOffset))
+                       << " uv=" << (layout.uvOffset == SIZE_MAX ? -1 : int(layout.uvOffset))
+                       << " colour=" << (layout.colorOffset == SIZE_MAX ? -1 : int(layout.colorOffset))
+                       << " normal=" << (layout.normalOffset == SIZE_MAX ? -1 : int(layout.normalOffset))
+                       << " position=" << int(layout.positionOffset)
+                       << " weightCount=" << layout.numberOfWeights;
+            addField(fieldRows, headerGroup.str(), "vertex_type_flags", headerOffset + 0x04u, flags, layoutNote.str());
+            addField(fieldRows, headerGroup.str(), "num_strips", headerOffset + 0x08u, numStrips,
+                     "Number of sPspGeometryMesh strip descriptors.");
+            addField(fieldRows, headerGroup.str(), "unknown_0C", headerOffset + 0x0Cu,
+                     modelReadU32(data, headerOffset + 0x0Cu), "PSP geometry header field.");
+            addFloatField(data, fieldRows, headerGroup.str(), "bound.x", headerOffset + 0x10u);
+            addFloatField(data, fieldRows, headerGroup.str(), "bound.y", headerOffset + 0x14u);
+            addFloatField(data, fieldRows, headerGroup.str(), "bound.z", headerOffset + 0x18u);
+            addFloatField(data, fieldRows, headerGroup.str(), "bound.radius", headerOffset + 0x1Cu);
+            addFloatField(data, fieldRows, headerGroup.str(), "scale.x", headerOffset + 0x20u);
+            addFloatField(data, fieldRows, headerGroup.str(), "scale.y", headerOffset + 0x24u);
+            addFloatField(data, fieldRows, headerGroup.str(), "scale.z", headerOffset + 0x28u);
+            addField(fieldRows, headerGroup.str(), "num_vertices", headerOffset + 0x2Cu, numVertices,
+                     "Total vertices across all strips.");
+            addFloatField(data, fieldRows, headerGroup.str(), "translation.x", headerOffset + 0x30u);
+            addFloatField(data, fieldRows, headerGroup.str(), "translation.y", headerOffset + 0x34u);
+            addFloatField(data, fieldRows, headerGroup.str(), "translation.z", headerOffset + 0x38u);
+            addField(fieldRows, headerGroup.str(), "unknown_3C", headerOffset + 0x3Cu,
+                     modelReadU32(data, headerOffset + 0x3Cu), "PSP geometry header field.");
+            addField(fieldRows, headerGroup.str(), "vertex_buffer_offset", headerOffset + 0x40u,
+                     vertexBufferOffset, "Relative to sPspGeometry; absolute=" + modelHexOffset(headerOffset + vertexBufferOffset) + ".");
+            addFloatField(data, fieldRows, headerGroup.str(), "unknown_44", headerOffset + 0x44u);
+
+            for (uint32_t stripIndex = 0; stripIndex < numStrips; ++stripIndex) {
+                uint32_t stripOffset = headerOffset + 0x48u + stripIndex * 0x30u;
+                if (size_t(stripOffset) + 0x30u > data.size()) break;
+                std::ostringstream stripGroup;
+                stripGroup << "sPspGeometryMesh #" << stripIndex << " @ " << modelHexOffset(stripOffset);
+                uint32_t relativeOffset = modelReadU32(data, stripOffset + 0x00u);
+                uint16_t triangleCount = modelReadU16(data, stripOffset + 0x04u);
+                addField(fieldRows, stripGroup.str(), "vertex_stream_offset", stripOffset + 0x00u, relativeOffset,
+                         "Relative to vertex buffer; absolute=" + modelHexOffset(headerOffset + vertexBufferOffset + relativeOffset) + ".");
+                addU16Field(data, fieldRows, stripGroup.str(), "triangle_count", stripOffset + 0x04u,
+                            "Triangle strip stores triangle_count + 2 vertices.");
+                addU16Field(data, fieldRows, stripGroup.str(), "material_id", stripOffset + 0x06u,
+                            "Index into RslMaterialList.");
+                addFloatField(data, fieldRows, stripGroup.str(), "unknown_08", stripOffset + 0x08u);
+                addFloatField(data, fieldRows, stripGroup.str(), "uv_scale.u", stripOffset + 0x0Cu);
+                addFloatField(data, fieldRows, stripGroup.str(), "uv_scale.v", stripOffset + 0x10u);
+                addFloatField(data, fieldRows, stripGroup.str(), "bounds_or_unknown_14", stripOffset + 0x14u);
+                addFloatField(data, fieldRows, stripGroup.str(), "bounds_or_unknown_18", stripOffset + 0x18u);
+                addFloatField(data, fieldRows, stripGroup.str(), "bounds_or_unknown_1C", stripOffset + 0x1Cu);
+                addFloatField(data, fieldRows, stripGroup.str(), "bounds_or_unknown_20", stripOffset + 0x20u);
+                addFloatField(data, fieldRows, stripGroup.str(), "unknown_24", stripOffset + 0x24u);
+                std::ostringstream boneMapNote;
+                boneMapNote << "PSP skin palette indices: [";
+                for (uint32_t i = 0; i < 8u; ++i) {
+                    if (i) boneMapNote << ", ";
+                    boneMapNote << unsigned(data[stripOffset + 0x28u + i]);
+                }
+                boneMapNote << "]";
+                addField(fieldRows, stripGroup.str(), "bone_map[0..3]", stripOffset + 0x28u,
+                         modelReadU32(data, stripOffset + 0x28u), boneMapNote.str());
+                addField(fieldRows, stripGroup.str(), "bone_map[4..7]", stripOffset + 0x2Cu,
+                         modelReadU32(data, stripOffset + 0x2Cu), "Second half of the eight-entry strip bone palette.");
+            }
+        } else {
+            uint32_t globalOffset = geometryOffset + 0x20u;
+            if (size_t(globalOffset) + 0x40u <= data.size()) {
+                uint32_t packedSizeAndMaterials = modelReadU32(data, globalOffset + 0x10u);
+                uint32_t materialCount = (packedSizeAndMaterials >> 20u) & 0xFFFu;
+                uint16_t firstStripOffset = modelReadU16(data, globalOffset + 0x1Au);
+                if (materialCount > 0u && materialCount <= 512u && firstStripOffset != 0u) {
+                    std::ostringstream ps2Group;
+                    ps2Group << "sPs2GeometryGlobal @ " << modelHexOffset(globalOffset);
+                    addFloatField(data, fieldRows, ps2Group.str(), "bound.x", globalOffset + 0x00u);
+                    addFloatField(data, fieldRows, ps2Group.str(), "bound.y", globalOffset + 0x04u);
+                    addFloatField(data, fieldRows, ps2Group.str(), "bound.z", globalOffset + 0x08u);
+                    addFloatField(data, fieldRows, ps2Group.str(), "bound.radius", globalOffset + 0x0Cu);
+                    addField(fieldRows, ps2Group.str(), "packed_size_material_count", globalOffset + 0x10u,
+                             packedSizeAndMaterials, "size=" + std::to_string(packedSizeAndMaterials & 0x000FFFFFu) +
+                             "; materialCount=" + std::to_string(materialCount) + ".");
+                    addField(fieldRows, ps2Group.str(), "vertex_section_flags", globalOffset + 0x14u,
+                             modelReadU32(data, globalOffset + 0x14u), "PS2 DMA/VIF vertex-section flags.");
+                    addU16Field(data, fieldRows, ps2Group.str(), "total_vertex_count", globalOffset + 0x18u);
+                    addU16Field(data, fieldRows, ps2Group.str(), "first_tristrip_offset", globalOffset + 0x1Au,
+                                "Relative offset to first PS2 triangle-strip part.");
+                    addFloatField(data, fieldRows, ps2Group.str(), "scale.x", globalOffset + 0x28u);
+                    addFloatField(data, fieldRows, ps2Group.str(), "scale.y", globalOffset + 0x2Cu);
+                    addFloatField(data, fieldRows, ps2Group.str(), "scale.z", globalOffset + 0x30u);
+                    addFloatField(data, fieldRows, ps2Group.str(), "translation.x", globalOffset + 0x34u);
+                    addFloatField(data, fieldRows, ps2Group.str(), "translation.y", globalOffset + 0x38u);
+                    addFloatField(data, fieldRows, ps2Group.str(), "translation.z", globalOffset + 0x3Cu);
+                }
+            }
+        }
+    };
+
+    auto describeRslTAnim = [&](uint32_t hierarchyOffset, uint32_t atomicOffset) {
+        if (!modelPointerLooksValid(data, hierarchyOffset) || size_t(hierarchyOffset) + 0x38u > data.size() ||
+            modelReadU32(data, hierarchyOffset + 0x00u) != 0x00003000u ||
+            !describedHierarchies.insert(hierarchyOffset).second) return;
+        uint32_t count = modelReadU32(data, hierarchyOffset + 0x04u);
+        if (count == 0u || count > 512u) return;
+
+        std::ostringstream group;
+        group << "RslTAnim / HAnim hierarchy @ " << modelHexOffset(hierarchyOffset);
+        addField(fieldRows, group.str(), "hierarchy_tag", hierarchyOffset + 0x00u,
+                 modelReadU32(data, hierarchyOffset + 0x00u), "Expected RslTAnim tag 0x00003000.");
+        addField(fieldRows, group.str(), "node_count", hierarchyOffset + 0x04u, count,
+                 "Number of packed RslTAnim hierarchy entries.");
+        for (uint32_t relative = 0x08u; relative < 0x30u; relative += 4u) {
+            std::ostringstream name;
+            name << "hierarchy_field_" << std::uppercase << std::hex << relative;
+            addField(fieldRows, group.str(), name.str(), hierarchyOffset + relative,
+                     modelReadU32(data, hierarchyOffset + relative), "RslTAnim runtime/header field.");
+        }
+        uint32_t entriesPointer = modelReadU32(data, hierarchyOffset + 0x30u);
+        uint32_t anchorPointer = modelReadU32(data, hierarchyOffset + 0x34u);
+        if (!modelPointerLooksValid(data, entriesPointer) ||
+            uint64_t(entriesPointer) + uint64_t(count) * 8ull > data.size()) {
+            uint32_t alternateEntries = modelReadU32(data, hierarchyOffset + 0x20u);
+            uint32_t alternateAnchor = modelReadU32(data, hierarchyOffset + 0x24u);
+            if (modelPointerLooksValid(data, alternateEntries) &&
+                uint64_t(alternateEntries) + uint64_t(count) * 8ull <= data.size()) {
+                entriesPointer = alternateEntries;
+                anchorPointer = alternateAnchor;
+            }
+        }
+        addPointerField(data, fieldRows, group.str(), "entries_ptr", hierarchyOffset + 0x30u,
+                        "Packed hierarchy entry table (some variants store this at +0x20).");
+        addPointerField(data, fieldRows, group.str(), "anchor_frame_ptr", hierarchyOffset + 0x34u,
+                        "Root/anchor frame used for hierarchy traversal; owner Atomic=" + modelHexOffset(atomicOffset) + ".");
+        if (!modelPointerLooksValid(data, entriesPointer) ||
+            uint64_t(entriesPointer) + uint64_t(count) * 8ull > data.size()) return;
+
+        for (uint32_t entryIndex = 0; entryIndex < count; ++entryIndex) {
+            uint32_t entryOffset = entriesPointer + entryIndex * 8u;
+            uint32_t packed = modelReadU32(data, entryOffset + 0x00u);
+            uint32_t boneId = packed & 0xFFu;
+            uint32_t nodeIndex = (packed >> 8u) & 0xFFu;
+            uint32_t boneType = (packed >> 16u) & 0xFFu;
+            uint32_t flags = (packed >> 24u) & 0xFFu;
+            std::ostringstream entryName;
+            entryName << "entry[" << entryIndex << "].packed";
+            std::ostringstream note;
+            note << "boneId=" << boneId << "; nodeIndex=" << nodeIndex
+                 << "; boneType=" << boneType << "; flags=0x"
+                 << std::uppercase << std::hex << flags;
+            if (nodeIndex < bones.size()) note << "; decoded frame='" << bones[nodeIndex].name << "'";
+            addField(fieldRows, group.str(), entryName.str(), entryOffset, packed, note.str());
+            std::ostringstream zeroName;
+            zeroName << "entry[" << entryIndex << "].reserved";
+            addField(fieldRows, group.str(), zeroName.str(), entryOffset + 0x04u,
+                     modelReadU32(data, entryOffset + 0x04u), "Normally zero/reserved.");
+        }
+    };
 
     for (size_t offset = 0; offset + 4 <= data.size(); offset += 4) {
         uint32_t value = modelReadU32(data, offset);
@@ -3384,9 +3650,15 @@ void StorylandModelFile::parse() {
             addPointerField(data, fieldRows, group.str(), "clump_atomic_cycle_next", uint32_t(offset + 0x1C), "Clump atomic cycle next");
             addPointerField(data, fieldRows, group.str(), "clump_atomic_cycle_prev", uint32_t(offset + 0x20), "Clump atomic cycle prev");
             addField(fieldRows, group.str(), "render_callback_or_pipeline", uint32_t(offset + 0x24), modelReadU32(data, offset + 0x24), "Render callback/pipeline id field");
-            addField(fieldRows, group.str(), "ide_id_or_runtime", uint32_t(offset + 0x28), modelReadU32(data, offset + 0x28), "Ped MDLs often use FFFF or engine-filled value");
-            addPointerField(data, fieldRows, group.str(), "ped_bone_params_ptr", uint32_t(offset + 0x2C), "Ped/cutscene bone params pointer when present");
+            addU16Field(data, fieldRows, group.str(), "model_info_id", uint32_t(offset + 0x28),
+                        "Signed model-info/IDE id field; 0xFFFF commonly means unassigned.");
+            addU16Field(data, fieldRows, group.str(), "visibility_id_flags", uint32_t(offset + 0x2A),
+                        "Atomic visibility id/flag halfword.");
+            addPointerField(data, fieldRows, group.str(), "hierarchy_ptr", uint32_t(offset + 0x2C),
+                            "Pointer to RslTAnim/HAnim hierarchy header when skinned.");
             addField(fieldRows, group.str(), "unknown_0x30", uint32_t(offset + 0x30), modelReadU32(data, offset + 0x30), "Atomic trailing field");
+            describeGeometry(modelReadU32(data, offset + 0x14u), uint32_t(offset));
+            describeRslTAnim(modelReadU32(data, offset + 0x2Cu), uint32_t(offset));
         } else if (kindName == "RslNode1" || kindName == "RslNode2" || kindName == "RslNode3") {
             uint32_t index = 0;
             if (kindName == "RslNode1") index = node1Index++;
@@ -3404,6 +3676,18 @@ void StorylandModelFile::parse() {
                 addPointerField(data, fieldRows, group.str(), "next_ptr", uint32_t(offset + 0x94), "RslNode.next sibling candidate");
                 addPointerField(data, fieldRows, group.str(), "root_ptr", uint32_t(offset + 0x98), "RslNode.root candidate");
                 addField(fieldRows, group.str(), "nodeId", uint32_t(offset + 0x9C), modelReadU32(data, offset + 0x9C), "RwHAnim/RslTAnim node id or variant field");
+                if (offset + 0xACu <= data.size()) {
+                    addField(fieldRows, group.str(), "hierarchy_or_extension_0xA0", uint32_t(offset + 0xA0),
+                             modelReadU32(data, offset + 0xA0), "RslNode/HAnim extension field.");
+                    uint32_t ps2NamePointer = modelReadU32(data, offset + 0xA4u);
+                    std::string ps2Name = readModelCStringAt(data, ps2NamePointer);
+                    addPointerField(data, fieldRows, group.str(), "ps2_name_ptr", uint32_t(offset + 0xA4),
+                                    ps2Name.empty() ? "PS2 frame-name pointer candidate." : "PS2 frame name='" + ps2Name + "'.");
+                    uint32_t pspNamePointer = modelReadU32(data, offset + 0xA8u);
+                    std::string pspName = readModelCStringAt(data, pspNamePointer);
+                    addPointerField(data, fieldRows, group.str(), "psp_name_ptr", uint32_t(offset + 0xA8),
+                                    pspName.empty() ? "PSP frame-name pointer candidate." : "PSP frame name='" + pspName + "'.");
+                }
             }
         } else {
             genericAaIndex++;
