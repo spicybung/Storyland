@@ -1,0 +1,8 @@
+{
+  "name": "storyland",
+  "version-string": "1.0.0",
+  "description": "LCS/VCS Leeds-engine resource workbench",
+  "dependencies": [
+    "zlib"
+  ]
+}

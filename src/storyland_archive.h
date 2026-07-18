@@ -74,6 +74,8 @@ struct StorylandDirectTextureResource {
     int width = 0;
     int height = 0;
     int bpp = 0;
+    int32_t materialId = -1;
+    std::string source;
     std::string name;
     std::vector<uint8_t> rgba;
 };
@@ -90,6 +92,36 @@ struct StorylandWorldSector {
     float originZ = 0.0f;
 };
 
+// A concrete row from a slave WRLD/AERA Resource[] table in the IMG.  Keep
+// this separate from sGeomInstance.iplId: IPL ids identify instances while
+// resourceId identifies the model payload referenced by an instance.
+struct StorylandImgResourceRow {
+    uint32_t sectorIndex = 0;
+    uint32_t sectorX = 0;
+    uint32_t sectorY = 0;
+    uint32_t rowIndex = 0;
+    uint32_t resourceId = 0;
+    uint64_t tableOffset = 0;
+    uint64_t payloadOffset = 0;
+    uint64_t payloadSize = 0;
+    int32_t secondaryId = -1;
+    std::string layout;
+    bool usedByPlacement = false;
+    bool decodedAsMesh = false;
+};
+
+struct StorylandResourceResolution {
+    uint32_t sectorIndex = 0;
+    uint32_t sectorX = 0;
+    uint32_t sectorY = 0;
+    uint32_t resourceId = 0;
+    uint32_t placementCount = 0;
+    uint32_t candidateCount = 0;
+    uint64_t payloadOffset = 0;
+    // "same-sector", "unique linked sector", "conflict", or "missing".
+    std::string source;
+};
+
 class StorylandArchiveBrowser {
 public:
     bool loadImgFromFile(const std::wstring& imgPath, std::string& errorMessage);
@@ -100,6 +132,8 @@ public:
     const std::vector<StorylandWorldSector>& sectors() const;
     const std::vector<StorylandWorldMesh>& worldMeshes() const;
     const std::vector<StorylandDirectTextureResource>& directTextures() const;
+    const std::vector<StorylandImgResourceRow>& imgResourceRows() const;
+    const std::vector<StorylandResourceResolution>& resourceResolutions() const;
     const std::wstring& imgPath() const;
     const std::wstring& lvzPath() const;
     bool hasLvzContext() const;
@@ -128,6 +162,8 @@ private:
     std::vector<StorylandWorldSector> worldSectors;
     std::vector<StorylandWorldMesh> worldMeshCache;
     std::vector<StorylandDirectTextureResource> directTextureCache;
+    std::vector<StorylandImgResourceRow> imgResourceRowCache;
+    std::vector<StorylandResourceResolution> resourceResolutionCache;
 
     bool autoFindCompanionImgForLvz(const std::wstring& lvzPath, std::wstring& outImgPath) const;
     bool autoFindCompanionLvzForImg(const std::wstring& imgPath, std::wstring& outLvzPath) const;

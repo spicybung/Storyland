@@ -14,6 +14,7 @@
 #include <cstring>
 #include <cwctype>
 #include <cwchar>
+#include <filesystem>
 #include <iomanip>
 #include <initializer_list>
 #include <limits>
@@ -29,6 +30,7 @@
 #include "storyland_model.h"
 #include "storyland_wbl.h"
 #include "storyland_archive.h"
+#include "storyland_atomic_io.h"
 #include "storyland_anim.h"
 #include "storyland_sky.h"
 #include "wic_image.h"
@@ -150,6 +152,7 @@ typedef void (APIENTRY *PFNGLACTIVETEXTUREPROC)(GLenum texture);
 #define ID_VIEW_SKY_WEATHER_CLOUDY 1048
 #define ID_VIEW_SKY_WEATHER_RAINY 1049
 #define ID_VIEW_SKY_WEATHER_FOGGY 1050
+#define ID_FILE_EXPORT_SELECTED_RESOURCE 1051
 #define ID_TREE 2001
 #define ID_DETAILS 2002
 #define ID_PREVIEW 2003
@@ -2387,9 +2390,9 @@ static void appendDtzSectorCandidateOverview(std::wstringstream& ss) {
     ss << L"  PLR.mdl start=23 candidates: " << plrCandidates << L"\r\n";
 
     if (!gDtzArchive.companionDirPath().empty()) {
-        ss << L"  Manual reference .dir name file loaded: " << gDtzArchive.companionDirPath() << L"\r\n";
+        ss << L"  Optional beta-build .dir loaded: " << gDtzArchive.companionDirPath() << L"\r\n";
     } else {
-        ss << L"  Manual .dir name file: none loaded. GAME.DTZ is still used for the map.\r\n";
+        ss << L"  Beta-build .dir: none loaded (normal for retail LCS/VCS). GAME.DTZ supplies the retail map.\r\n";
     }
 
     size_t shown = 0;
@@ -2515,7 +2518,7 @@ static void selectDtzOverview() {
        << L"  - Offsets shown here are raw/unpacked GAME.DTZ offsets.\r\n"
        << L"  - A nonzero pointer outside the raw byte size is suspicious for this file/version.\r\n"
        << L"  - gta3PS2.img sector sizes are 2048-byte logical archive sectors, not PCSX2 raw DVD 2064-byte blocks.\r\n"
-       << L"  - GAME.DTZ is used for the runtime map. .dir loading is just a manual name check.\r\n"
+       << L"  - Retail LCS/VCS use GAME.DTZ for the runtime map; optional .dir support is only for beta-build archives.\r\n"
        << L"  - When a companion IMG is loaded, sector-count patches also insert/delete 2048-byte sector spans in the IMG when shifting is enabled.\r\n";
 
     setDetails(ss.str());
@@ -2541,7 +2544,7 @@ static void populateDtzList() {
 
     HTREEITEM overviewRoot = addTreeItem(root, L"GTAG header overview", StorylandTreeKind::DtzOverview, 0);
     addTreeItem(overviewRoot, L"Core header: signature, size, relocation table, VMT/Jenkins hash tables");
-    addTreeItem(overviewRoot, L"gta3PS2.img map: internal GAME.DTZ records; .dir is only for exact-name checks");
+    addTreeItem(overviewRoot, L"gta3PS2.img map: internal GAME.DTZ records (retail); optional .dir is beta-build only");
     addTreeItem(overviewRoot, L"World/IPL/IDE/streaming pointers: paths, IPL pools, IDE table, CStreamingInfo");
     addTreeItem(overviewRoot, L"Data blocks below are decoded from the file, not placeholder labels");
 
@@ -2643,7 +2646,7 @@ static void populateDtzList() {
         }
     } else {
         addTreeItem(imgRoot, L"No internal sector entries were decoded from GAME.DTZ. This means the current scanner did not recognize the runtime map layout for this file yet.");
-        addTreeItem(imgRoot, L"A .dir can still be loaded by hand for names, but GAME.DTZ is used for the actual map.");
+        addTreeItem(imgRoot, L"No beta-build .dir loaded; retail GAME.DTZ supplies the archive map.");
     }
 
 
@@ -3048,18 +3051,29 @@ static void populateArchiveList() {
     if (gArchiveBrowser.hasLvzContext()) addTreeItem(root, L"No .DIR: retail LVZ+IMG uses LVZ chunk headers + IMG payloads.");
     if (!gArchiveBrowser.levelSummary().empty()) addTreeItem(root, widen(gArchiveBrowser.levelSummary()));
 
-    HTREEITEM worldRoot = addTreeItem(root, L"WRLD / AREA sectors / map chunks");
-    HTREEITEM meshResourceRoot = addTreeItem(root, L"Real mesh resources parsed from sectors");
-    HTREEITEM textureIdRoot = addTreeItem(root, L"Texture IDs / material refs parsed from meshes");
-    HTREEITEM directTextureRoot = addTreeItem(root, L"Decoded direct LVZ/AREA textures");
-    HTREEITEM modelRoot = addTreeItem(root, L"Standalone MDL-DFF chunks");
-    HTREEITEM textureRoot = addTreeItem(root, L"Standalone XTX-CHK-TEX chunks");
-    HTREEITEM animationRoot = addTreeItem(root, L"Animations");
-    HTREEITEM otherRoot = addTreeItem(root, L"Other resources");
+    HTREEITEM resolutionRoot = addTreeItem(root, L"Resource resolution (placement RES -> IMG payload)");
+    HTREEITEM resolvedRoot = addTreeItem(resolutionRoot, L"Resolved exactly");
+    HTREEITEM linkedRoot = addTreeItem(resolutionRoot, L"Resolved through one linked sector");
+    HTREEITEM conflictRoot = addTreeItem(resolutionRoot, L"Conflicting RES payloads (not guessed)");
+    HTREEITEM missingRoot = addTreeItem(resolutionRoot, L"Missing / undecoded payloads");
+    HTREEITEM sectorRoot = addTreeItem(root, L"IMG sector Resource[] tables");
+    HTREEITEM meshResourceRoot = addTreeItem(root, L"Placed model resources (grouped by RES id)");
+    HTREEITEM materialRoot = addTreeItem(root, L"Materials and textures");
+    HTREEITEM textureIdRoot = addTreeItem(materialRoot, L"Material RES ids referenced by meshes");
+    HTREEITEM boundTextureRoot = addTreeItem(materialRoot, L"Bound textures from master Resource[]");
+    HTREEITEM directTextureRoot = addTreeItem(materialRoot, L"Unbound decoded textures (diagnostics)");
+    HTREEITEM rawRoot = addTreeItem(root, L"Raw chunks and standalone assets");
+    HTREEITEM worldRoot = addTreeItem(rawRoot, L"WRLD / AERA chunks");
+    HTREEITEM modelRoot = addTreeItem(rawRoot, L"Standalone MDL-DFF chunks");
+    HTREEITEM textureRoot = addTreeItem(rawRoot, L"Standalone XTX-CHK-TEX chunks");
+    HTREEITEM animationRoot = addTreeItem(rawRoot, L"Animations");
+    HTREEITEM otherRoot = addTreeItem(rawRoot, L"Other resources");
 
     const auto& entries = gArchiveBrowser.entries();
     const auto& placements = gArchiveBrowser.placements();
     const auto& sectors = gArchiveBrowser.sectors();
+    const auto& resourceRows = gArchiveBrowser.imgResourceRows();
+    const auto& resolutions = gArchiveBrowser.resourceResolutions();
 
     int worldCount = 0;
     int standaloneModelCount = 0;
@@ -3105,6 +3119,59 @@ static void populateArchiveList() {
         addTreeItem(meshResourceRoot, line.str(), StorylandTreeKind::ArchiveMeshResource, int(i));
     }
 
+    std::map<uint32_t, size_t> meshListIndex;
+    for (size_t i = 0; i < gArchiveMeshResourceIds.size(); ++i) meshListIndex[gArchiveMeshResourceIds[i]] = i;
+    uint32_t sameSectorCount = 0, linkedCount = 0, conflictCount = 0, missingCount = 0;
+    for (const auto& resolution : resolutions) {
+        std::wstringstream line;
+        line << L"sector " << resolution.sectorIndex
+             << L" [" << resolution.sectorX << L"," << resolution.sectorY << L"]"
+             << L" | RES=" << resolution.resourceId
+             << L" | placements=" << resolution.placementCount
+             << L" | source=" << widen(resolution.source);
+        if (resolution.payloadOffset != 0) line << L" | payload=" << hexWide(resolution.payloadOffset, 8);
+        if (resolution.candidateCount > 1) line << L" | candidates=" << resolution.candidateCount;
+        HTREEITEM parent = missingRoot;
+        if (resolution.source == "same-sector") { parent = resolvedRoot; sameSectorCount++; }
+        else if (resolution.source == "unique linked sector" || resolution.source == "same-row" || resolution.source == "official AERA" || resolution.source == "master LVZ" || resolution.source == "placement-fit exact RES" || resolution.source == "IMG continuation") { parent = linkedRoot; linkedCount++; }
+        else if (resolution.source == "conflict") { parent = conflictRoot; conflictCount++; }
+        else missingCount++;
+        auto listIndex = meshListIndex.find(resolution.resourceId);
+        if (listIndex != meshListIndex.end() && parent != conflictRoot && parent != missingRoot) {
+            addTreeItem(parent, line.str(), StorylandTreeKind::ArchiveMeshResource, int(listIndex->second));
+        } else {
+            addTreeItem(parent, line.str());
+        }
+    }
+
+    for (const auto& sector : sectors) {
+        uint32_t rowCount = 0, usedCount = 0, decodedCount = 0;
+        for (const auto& row : resourceRows) {
+            if (row.sectorIndex != sector.sectorIndex) continue;
+            rowCount++;
+            if (row.usedByPlacement) usedCount++;
+            if (row.decodedAsMesh) decodedCount++;
+        }
+        std::wstringstream sectorLine;
+        sectorLine << L"sector " << sector.sectorIndex
+                   << L" [" << sector.sectorX << L"," << sector.sectorY << L"]"
+                   << L" | Resource[]=" << rowCount
+                   << L" | placed=" << usedCount
+                   << L" | meshes=" << decodedCount
+                   << L" | IMG=" << hexWide(sector.imgOffset, 8);
+        HTREEITEM sectorItem = addTreeItem(sectorRoot, sectorLine.str());
+        for (const auto& row : resourceRows) {
+            if (row.sectorIndex != sector.sectorIndex || !row.usedByPlacement) continue;
+            std::wstringstream rowLine;
+            rowLine << L"row[" << row.rowIndex << L"] RES=" << row.resourceId
+                    << L" table=" << hexWide(row.tableOffset, 8)
+                    << L" payload=" << hexWide(row.payloadOffset, 8)
+                    << L" bytes=" << row.payloadSize
+                    << (row.decodedAsMesh ? L" | mesh" : L" | undecoded");
+            addTreeItem(sectorItem, rowLine.str());
+        }
+    }
+
     for (size_t i = 0; i < gArchiveTextureIds.size(); ++i) {
         uint32_t textureId = gArchiveTextureIds[i];
         uint32_t meshCount = 0;
@@ -3128,6 +3195,7 @@ static void populateArchiveList() {
     }
 
     const auto& directTextures = gArchiveBrowser.directTextures();
+    uint32_t boundTextureCount = 0;
     for (size_t i = 0; i < directTextures.size(); ++i) {
         const auto& texture = directTextures[i];
         std::wstringstream line;
@@ -3136,7 +3204,14 @@ static void populateArchiveList() {
              << L" | bpp=" << texture.bpp
              << L" | header=" << hexWide(texture.headerOffset, 6)
              << L" | data=" << hexWide(texture.dataOffset, 6);
-        addTreeItem(directTextureRoot, line.str(), StorylandTreeKind::ArchiveDirectTexture, int(i));
+        if (texture.materialId >= 0) {
+            boundTextureCount++;
+            line << L" | RES=" << texture.materialId << L" | " << widen(texture.source);
+            addTreeItem(boundTextureRoot, line.str(), StorylandTreeKind::ArchiveDirectTexture, int(i));
+        } else {
+            line << L" | " << widen(texture.source);
+            addTreeItem(directTextureRoot, line.str(), StorylandTreeKind::ArchiveDirectTexture, int(i));
+        }
     }
 
     if (gArchiveAnimationEntryIndices.empty()) {
@@ -3149,6 +3224,7 @@ static void populateArchiveList() {
             << L"Placed mesh resources: " << gArchiveMeshResourceIds.size() << L"\r\n"
             << L"Texture/material IDs: " << gArchiveTextureIds.size() << L"\r\n"
             << L"Decoded direct LVZ/AREA textures: " << gArchiveBrowser.directTextures().size() << L"\r\n"
+            << L"Textures bound to material RES ids: " << boundTextureCount << L"\r\n"
             << L"Standalone MDL chunks: " << standaloneModelCount << L"\r\n"
             << L"Standalone texture chunks: " << standaloneTextureCount << L"\r\n"
             << L"Animation chunks: " << animationCount << L"\r\n"
@@ -3156,19 +3232,19 @@ static void populateArchiveList() {
             << L"Parsed sectors: " << sectors.size() << L"\r\n"
             << L"Parsed visible placements: " << placements.size() << L"\r\n"
             << L"Parsed real mesh resources: " << gArchiveBrowser.worldMeshes().size() << L"\r\n\r\n"
-            << L"Use the Real mesh resources group to scroll through real placed meshes by resource id.\r\n"
-            << L"Use the Texture IDs / material refs group to isolate triangles by material texture id.\r\n"
-            << L"Use the Decoded direct LVZ/AREA textures group to view actual texture images decoded from LVZ/AREA chunks.\r\n"
+            << L"IMG Resource[] rows: " << resourceRows.size() << L"\r\n"
+            << L"Exact same-sector bindings: " << sameSectorCount << L"\r\n"
+            << L"Unique linked-sector bindings: " << linkedCount << L"\r\n"
+            << L"Conflicts deliberately not guessed: " << conflictCount << L"\r\n"
+            << L"Missing / undecoded bindings: " << missingCount << L"\r\n\r\n"
+            << L"Resource resolution keeps IPL instance ids separate from model RES ids and shows the exact IMG provenance.\r\n"
+            << L"Bound textures use master LVZ Resource[] indices; unbound scan results are kept under diagnostics.\r\n"
             << L"Double-click a directly openable embedded MDL/XTX/CHK/TEX/DTZ/BIN entry to inspect it as its own file.\r\n";
     setDetails(details.str());
 
     expandTreeItem(root);
+    expandTreeItem(resolutionRoot);
     expandTreeItem(meshResourceRoot);
-    expandTreeItem(textureIdRoot);
-    expandTreeItem(directTextureRoot);
-    expandTreeItem(modelRoot);
-    expandTreeItem(textureRoot);
-    expandTreeItem(animationRoot);
 
     gSelectedIndex = -1;
     gSelectedKind = StorylandTreeKind::None;
@@ -3294,7 +3370,7 @@ static void selectArchiveMeshResource(int listIndex) {
        << L"Right-click this mesh resource > Replace Selected LVZ+IMG Resource From File to replace this mesh resource in-place. If the selected file is a normal .mdl/.wrld Leeds chunk, Storyland converts its Leeds strip geometry into the existing runtime-safe sector payload slot, preserves this resource id, and does not redirect the Resource[] row.\r\n"
        << L"Right-click this mesh resource > Clone Selected Mesh Resource From Resource ID to clone another already parsed sector mesh resource, like resource 376, into this one while keeping this resource id.\r\n"
        << L"Right-click this mesh resource > Change Selected Mesh Resource ID only when you explicitly want to change the id afterwards.\r\n"
-       << L"Storyland preserves the selected resource id when replacing file data, and updates Resource[] raw pointers, WRLD sector sizes, and later LVZ IMG offsets after the swap.\r\n"
+       << L"Storyland preserves the selected resource id, Resource[] pointer wrapper, WRLD sector size, and later LVZ IMG offsets for runtime-safe mesh replacement.\r\n"
        << L"This is the useful scroll-through list for LVZ/IMG world meshes, because many Stories level resources are not standalone .mdl files.\r\n";
     setDetails(ss.str());
     InvalidateRect(gPreview, nullptr, TRUE);
@@ -3359,7 +3435,9 @@ static void selectArchiveDirectTexture(int listIndex) {
        << L"Header offset: " << hexWide(texture.headerOffset, 6) << L"\r\n"
        << L"Data offset: " << hexWide(texture.dataOffset, 6) << L"\r\n"
        << L"Format flags: " << hexWide(texture.formatFlags, 4) << L"\r\n"
-       << L"Raster flags: " << hexWide(texture.rasterFlags, 8) << L"\r\n\r\n"
+       << L"Raster flags: " << hexWide(texture.rasterFlags, 8) << L"\r\n"
+       << L"Material RES id: " << (texture.materialId >= 0 ? std::to_wstring(texture.materialId) : L"unbound") << L"\r\n"
+       << L"Provenance: " << widen(texture.source) << L"\r\n\r\n"
        << L"The OpenGL viewport is showing this decoded texture image from the LVZ stream.\r\n";
     setDetails(ss.str());
     InvalidateRect(gPreview, nullptr, TRUE);
@@ -6835,7 +6913,7 @@ static void selectDtzDirEntry(int index) {
     }
 
     if (!gDtzArchive.companionDirPath().empty()) {
-        ss << L"Manual reference .dir name file loaded: " << gDtzArchive.companionDirPath() << L"\r\n\r\n";
+        ss << L"Optional beta-build .dir loaded: " << gDtzArchive.companionDirPath() << L"\r\n\r\n";
     }
 
     if (entry.matchingRecordIndices.empty()) {
@@ -7331,7 +7409,7 @@ static void openStorylandFile(const std::wstring& path) {
 
     if (ext == L".dir") {
         if (gMode != StorylandMode::DtzArchive) {
-            MessageBoxW(gMainWindow, L"Open GAME.DTZ first. .dir loading is only for checking names; GAME.DTZ is used for the actual map.", L"Storyland", MB_ICONINFORMATION);
+            MessageBoxW(gMainWindow, L"Open GAME.DTZ first. Retail LCS/VCS use GAME.DTZ; load a .dir only for a beta-build archive that actually has one.", L"Storyland", MB_ICONINFORMATION);
             return;
         }
         if (!gDtzArchive.loadCompanionDir(path, error)) {
@@ -7407,29 +7485,7 @@ static void openStorylandFile(const std::wstring& path) {
 }
 
 static bool writeWholeFileBinary(const std::wstring& path, const std::vector<uint8_t>& bytes, std::string& error) {
-    FILE* file = nullptr;
-#ifdef _WIN32
-    if (_wfopen_s(&file, path.c_str(), L"wb") != 0 || file == nullptr) {
-        error = "Could not create extracted file.";
-        return false;
-    }
-#else
-    file = fopen(std::string(path.begin(), path.end()).c_str(), "wb");
-    if (!file) {
-        error = "Could not create extracted file.";
-        return false;
-    }
-#endif
-    if (!bytes.empty()) {
-        size_t written = fwrite(bytes.data(), 1, bytes.size(), file);
-        if (written != bytes.size()) {
-            fclose(file);
-            error = "Could not write complete extracted file.";
-            return false;
-        }
-    }
-    fclose(file);
-    return true;
+    return storylandWriteFilesTransaction({{std::filesystem::path(path), &bytes}}, error);
 }
 
 static std::wstring buildArchiveExtractRoot() {
@@ -8026,6 +8082,56 @@ static void replaceSelectedArchiveResourceFromFile() {
     setStatus(L"LVZ+IMG resource replaced in memory; use File > Export/Rebuild LVZ+IMG Pair to write it.");
 }
 
+static void exportSelectedResourceBytes() {
+    std::vector<uint8_t> bytes;
+    std::wstring suggestedName;
+    std::string error;
+
+    if (gMode == StorylandMode::ArchiveFile &&
+        gSelectedKind == StorylandTreeKind::ArchiveEntry && gSelectedIndex >= 0 &&
+        size_t(gSelectedIndex) < gArchiveBrowser.entries().size()) {
+        const StorylandArchiveEntry& entry = gArchiveBrowser.entries()[size_t(gSelectedIndex)];
+        suggestedName = widen(entry.name);
+        if (!gArchiveBrowser.extractEntryBytes(size_t(gSelectedIndex), bytes, error)) {
+            MessageBoxW(gMainWindow, widen(error).c_str(), L"Resource export failed", MB_ICONERROR);
+            return;
+        }
+    } else if (gMode == StorylandMode::ArchiveFile &&
+               gSelectedKind == StorylandTreeKind::ArchiveMeshResource && gSelectedIndex >= 0 &&
+               size_t(gSelectedIndex) < gArchiveMeshResourceIds.size()) {
+        const uint32_t resourceId = gArchiveMeshResourceIds[size_t(gSelectedIndex)];
+        suggestedName = L"resource_" + std::to_wstring(resourceId) + L".wrld";
+        if (!gArchiveBrowser.extractWorldMeshResourceBytes(resourceId, bytes, error)) {
+            MessageBoxW(gMainWindow, widen(error).c_str(), L"Mesh resource export failed", MB_ICONERROR);
+            return;
+        }
+    } else if (gMode == StorylandMode::DtzArchive &&
+               gSelectedKind == StorylandTreeKind::DtzDirEntry && gSelectedIndex >= 0 &&
+               size_t(gSelectedIndex) < gDtzArchive.dirEntries().size()) {
+        suggestedName = canonicalDtzImgResourceName(widen(gDtzArchive.dirEntries()[size_t(gSelectedIndex)].name));
+        if (!gDtzArchive.extractDirEntryBytes(size_t(gSelectedIndex), bytes, error)) {
+            MessageBoxW(gMainWindow, widen(error).c_str(), L"DTZ stream export failed", MB_ICONERROR);
+            return;
+        }
+    } else {
+        MessageBoxW(gMainWindow, L"Select an LVZ+IMG entry, placed mesh resource, or GAME.DTZ internal stream first.", L"Export Selected Resource", MB_ICONINFORMATION);
+        return;
+    }
+
+    if (suggestedName.empty()) suggestedName = L"storyland_resource.bin";
+    std::wstring outputPath = saveFileDialogWithInitial(
+        L"Leeds resource\0*.mdl;*.dff;*.wbl;*.xtx;*.chk;*.tex;*.wrld;*.area;*.anim;*.bin\0All files\0*.*\0",
+        L"bin",
+        suggestedName
+    );
+    if (outputPath.empty()) return;
+    if (!writeWholeFileBinary(outputPath, bytes, error)) {
+        MessageBoxW(gMainWindow, widen(error).c_str(), L"Resource export failed", MB_ICONERROR);
+        return;
+    }
+    setStatus(L"Exported and verified selected resource: " + outputPath + L" (" + std::to_wstring(bytes.size()) + L" bytes)");
+}
+
 
 static void exportLvzImgPair() {
     if (gMode != StorylandMode::ArchiveFile || !gArchiveBrowser.hasLvzContext() || !gArchiveBrowser.hasImgContext()) {
@@ -8064,7 +8170,7 @@ static void exportLvzImgPair() {
         return;
     }
 
-    setStatus(L"Exported LVZ+IMG pair: " + lvzPath + L" + " + imgPath);
+    setStatus(L"Exported and verified LVZ+IMG transaction: " + lvzPath + L" + " + imgPath);
 }
 
 
@@ -8096,7 +8202,7 @@ static void overwriteCurrentLvzImgPair() {
         return;
     }
 
-    setStatus(L"Overwrote current LVZ+IMG pair.");
+    setStatus(L"Overwrote and verified current LVZ+IMG pair transaction.");
 }
 
 static void exportEditedTextureArchive() {
@@ -8126,8 +8232,15 @@ static void saveCurrentAs() {
         std::wstring path = saveFileDialog(L"DTZ raw or compressed\0*.dtz;*.bin\0All files\0*.*\0", L"dtz");
         if (!path.empty()) {
             bool compress = MessageBoxW(gMainWindow, L"Save as compressed zlib DTZ?\n\nChoose No to save raw GTAG bytes. Compressed output is checked before it is written. If an IMG is loaded, it is saved beside the new GAME.DTZ.", L"Storyland DTZ Save", MB_YESNO | MB_ICONQUESTION) == IDYES;
-            if (!gDtzArchive.saveToFile(path, compress, error)) MessageBoxW(gMainWindow, widen(error).c_str(), L"Save failed", MB_ICONERROR);
-            else if (gDtzArchive.hasCompanionImg()) setStatus(L"Saved rebuilt GAME.DTZ and companion IMG.");
+            if (!gDtzArchive.saveToFile(path, compress, error)) {
+                MessageBoxW(gMainWindow, widen(error).c_str(), L"Save failed", MB_ICONERROR);
+            } else if (gDtzArchive.hasCompanionImg()) {
+                setStatus(gDtzArchive.hasCompanionDir()
+                    ? L"Saved and verified rebuilt GAME.DTZ + IMG + explicitly loaded beta-build DIR transaction."
+                    : L"Saved and verified rebuilt retail GAME.DTZ + companion IMG transaction.");
+            } else {
+                setStatus(L"Saved and verified rebuilt GAME.DTZ.");
+            }
         }
     }
 }
@@ -8208,7 +8321,7 @@ static void renameSelectedTexture() {
 
 static void openCompanionDirForCurrentDtz() {
     if (gMode != StorylandMode::DtzArchive) {
-        MessageBoxW(gMainWindow, L"Open GAME.DTZ first. .dir loading is only for checking names; GAME.DTZ is used for the actual map.", L"Storyland", MB_ICONINFORMATION);
+        MessageBoxW(gMainWindow, L"Open GAME.DTZ first. Retail LCS/VCS use GAME.DTZ; load a .dir only for a beta-build archive that actually has one.", L"Storyland", MB_ICONINFORMATION);
         return;
     }
     std::wstring path = openFileDialog(L"GTA Stories DIR\0*.dir\0All files\0*.*\0");
@@ -8219,7 +8332,7 @@ static void openCompanionDirForCurrentDtz() {
         return;
     }
     populateDtzList();
-    setStatus(L"Loaded manual .dir names: " + path);
+    setStatus(L"Loaded optional beta-build .dir: " + path);
 }
 
 static void openCompanionImgForCurrentDtz() {
@@ -8771,11 +8884,37 @@ static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
 
     size_t drawnInstances = 0;
     size_t drawnTriangles = 0;
-    const size_t triangleSafetyCap = selectedSectorIndex >= 0 || selectedResourceIndex >= 0 ? 5000000u : 1200000u;
+
+    std::map<uint32_t, const StorylandDirectTextureResource*> boundTextureByMaterial;
+    for (const auto& texture : gArchiveBrowser.directTextures()) {
+        if (texture.materialId < 0 || texture.width <= 0 || texture.height <= 0 || texture.rgba.empty()) continue;
+        boundTextureByMaterial.emplace(uint32_t(texture.materialId), &texture);
+    }
+    std::map<uint32_t, GLuint> uploadedArchiveTextures;
+    auto textureForMaterial = [&](uint32_t materialId) -> GLuint {
+        auto uploaded = uploadedArchiveTextures.find(materialId);
+        if (uploaded != uploadedArchiveTextures.end()) return uploaded->second;
+        auto found = boundTextureByMaterial.find(materialId);
+        if (found == boundTextureByMaterial.end() || found->second == nullptr) return 0;
+        const StorylandDirectTextureResource& texture = *found->second;
+        GLuint handle = 0;
+        glGenTextures(1, &handle);
+        if (handle == 0) return 0;
+        glBindTexture(GL_TEXTURE_2D, handle);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, texture.width, texture.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, texture.rgba.data());
+        uploadedArchiveTextures[materialId] = handle;
+        return handle;
+    };
 
     glEnable(GL_CULL_FACE);
     glCullFace(GL_BACK);
-    glBegin(GL_TRIANGLES);
+    bool triangleBatchOpen = false;
+    GLuint activeTexture = GLuint(-1);
+    uint32_t activeMaterial = 0xFFFFFFFEu;
     for (const auto& placement : placements) {
         if (selectedSectorIndex >= 0 && int(placement.sectorIndex) != selectedSectorIndex) continue;
         if (selectedResourceIndex >= 0 && int(placement.resourceIndex) != selectedResourceIndex) continue;
@@ -8789,11 +8928,29 @@ static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
         for (const StorylandWorldMeshTriangle& tri : mesh.triangles) {
             if (selectedTextureId >= 0 && int(tri.textureId) != selectedTextureId) continue;
             if (tri.a >= mesh.vertices.size() || tri.b >= mesh.vertices.size() || tri.c >= mesh.vertices.size()) continue;
+            uint32_t desiredMaterial = tri.textureId;
+            GLuint textureHandle = activeTexture == GLuint(-1) ? 0 : activeTexture;
+            if (desiredMaterial != activeMaterial) {
+                if (triangleBatchOpen) glEnd();
+                activeMaterial = desiredMaterial;
+                textureHandle = desiredMaterial == 0xFFFFFFFFu ? 0 : textureForMaterial(desiredMaterial);
+                activeTexture = textureHandle;
+                if (textureHandle != 0) {
+                    glEnable(GL_TEXTURE_2D);
+                    glBindTexture(GL_TEXTURE_2D, textureHandle);
+                    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+                } else {
+                    glDisable(GL_TEXTURE_2D);
+                }
+                glBegin(GL_TRIANGLES);
+                triangleBatchOpen = true;
+            }
             uint32_t seed = tri.textureId == 0xFFFFFFFFu ? placement.resourceIndex : tri.textureId;
             float r = 0.30f + float((seed * 37u + 31u) & 0x7Fu) / 255.0f;
             float g = 0.30f + float((seed * 67u + 91u) & 0x7Fu) / 255.0f;
             float b = 0.30f + float((seed * 97u + 17u) & 0x7Fu) / 255.0f;
-            glColor3f(r, g, b);
+            if (textureHandle != 0) glColor3f(1.0f, 1.0f, 1.0f);
+            else glColor3f(r, g, b);
 
             const StorylandWorldMeshVertex* verts[3] = {
                 &mesh.vertices[tri.a],
@@ -8801,6 +8958,7 @@ static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
                 &mesh.vertices[tri.c]
             };
             for (const StorylandWorldMeshVertex* vertex : verts) {
+                if (textureHandle != 0) glTexCoord2f(vertex->u, vertex->v);
                 float wx = placement.matrix[0] * vertex->x + placement.matrix[4] * vertex->y + placement.matrix[8]  * vertex->z + placement.matrix[12];
                 float wy = placement.matrix[1] * vertex->x + placement.matrix[5] * vertex->y + placement.matrix[9]  * vertex->z + placement.matrix[13];
                 float wz = placement.matrix[2] * vertex->x + placement.matrix[6] * vertex->y + placement.matrix[10] * vertex->z + placement.matrix[14];
@@ -8808,12 +8966,16 @@ static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
             }
 
             drawnTriangles++;
-            if (drawnTriangles >= triangleSafetyCap) break;
         }
-        if (drawnTriangles >= triangleSafetyCap) break;
     }
-    glEnd();
+    if (triangleBatchOpen) glEnd();
+    glDisable(GL_TEXTURE_2D);
     glDisable(GL_CULL_FACE);
+
+    for (const auto& uploaded : uploadedArchiveTextures) {
+        GLuint handle = uploaded.second;
+        if (handle != 0) glDeleteTextures(1, &handle);
+    }
 
     if (drawnTriangles == 0) {
         glPointSize(selectedSectorIndex >= 0 || selectedResourceIndex >= 0 ? 5.0f : 3.0f);
@@ -8842,7 +9004,6 @@ static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
     title += L"  |  meshResources=" + std::to_wstring(meshes.size());
     title += L"  |  instances=" + std::to_wstring(drawnInstances);
     title += L"  |  tris=" + std::to_wstring(drawnTriangles);
-    if (drawnTriangles >= triangleSafetyCap) title += L" capped";
     title += L"  |  LMB rotate, RMB pan, wheel/+/- zoom, W/S/A/D/Q/E move";
 }
 
@@ -9737,6 +9898,7 @@ static bool buildTreeContextMenu(HMENU menu) {
     if (gMode == StorylandMode::DtzArchive) {
         if (gSelectedKind == StorylandTreeKind::DtzDirEntry) {
             hasItems = addContextMenuItem(menu, ID_FILE_OPEN_EMBEDDED, L"Open selected internal IMG entry standalone...") || hasItems;
+            hasItems = addContextMenuItem(menu, ID_FILE_EXPORT_SELECTED_RESOURCE, L"Export selected internal IMG entry...") || hasItems;
             hasItems = addContextMenuItem(menu, ID_DTZ_REPLACE_SELECTED_ENTRY, L"Replace selected internal IMG entry from file...") || hasItems;
             addContextMenuSeparatorIfNeeded(menu, hasItems);
             hasItems = addContextMenuItem(menu, ID_DTZ_PATCH_SELECTED, L"Patch selected sector count...") || hasItems;
@@ -9748,9 +9910,11 @@ static bool buildTreeContextMenu(HMENU menu) {
     } else if (gMode == StorylandMode::ArchiveFile) {
         if (gSelectedKind == StorylandTreeKind::ArchiveEntry) {
             hasItems = addContextMenuItem(menu, ID_FILE_OPEN_EMBEDDED, L"Open selected embedded entry...") || hasItems;
+            hasItems = addContextMenuItem(menu, ID_FILE_EXPORT_SELECTED_RESOURCE, L"Export selected LVZ+IMG entry...") || hasItems;
             addContextMenuSeparatorIfNeeded(menu, hasItems);
             hasItems = addContextMenuItem(menu, ID_ARCHIVE_REPLACE_SELECTED_RESOURCE, L"Replace selected LVZ+IMG resource from file...") || hasItems;
         } else if (gSelectedKind == StorylandTreeKind::ArchiveMeshResource) {
+            hasItems = addContextMenuItem(menu, ID_FILE_EXPORT_SELECTED_RESOURCE, L"Export selected mesh resource...") || hasItems;
             hasItems = addContextMenuItem(menu, ID_ARCHIVE_REPLACE_SELECTED_RESOURCE, L"Replace selected mesh resource from file...") || hasItems;
             hasItems = addContextMenuItem(menu, ID_ARCHIVE_REPLACE_MESH_WITH_RESOURCE_ID, L"Clone selected mesh resource from Resource ID...") || hasItems;
             hasItems = addContextMenuItem(menu, ID_ARCHIVE_CHANGE_SELECTED_MESH_RESOURCE_ID, L"Change selected mesh resource ID...") || hasItems;
@@ -9802,6 +9966,7 @@ static void createMenuBar(HWND hwnd) {
     AppendMenuW(file, MF_STRING, ID_FILE_OPEN, L"Open...");
     AppendMenuW(file, MF_STRING, ID_FILE_SAVE_AS, L"Save As / Rebuild GAME.DTZ...");
     AppendMenuW(file, MF_STRING, ID_FILE_EXPORT_LOG, L"Export Log...");
+    AppendMenuW(file, MF_STRING, ID_FILE_EXPORT_SELECTED_RESOURCE, L"Export Selected Resource...");
     AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(file, MF_STRING, ID_ARCHIVE_EXPORT_LVZ_IMG_PAIR, L"Export/Rebuild LVZ+IMG Pair...");
     AppendMenuW(file, MF_STRING, ID_ARCHIVE_OVERWRITE_LVZ_IMG_PAIR, L"Overwrite Current LVZ+IMG Pair...");
@@ -9934,6 +10099,7 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             break;
         case ID_FILE_SAVE_AS: saveCurrentAs(); break;
         case ID_FILE_EXPORT_LOG: exportCurrentLog(); break;
+        case ID_FILE_EXPORT_SELECTED_RESOURCE: exportSelectedResourceBytes(); break;
         case ID_FILE_EXPORT_TEXTURE: exportSelectedTexture(); break;
         case ID_FILE_REPLACE_TEXTURE: replaceSelectedTexture(); break;
         case ID_FILE_RENAME_TEXTURE: renameSelectedTexture(); break;

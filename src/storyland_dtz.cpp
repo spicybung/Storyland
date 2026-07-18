@@ -1,4 +1,5 @@
 #include "storyland_dtz.h"
+#include "storyland_atomic_io.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -127,54 +128,8 @@ static bool readWholeFile(const std::wstring& filePath, std::vector<uint8_t>& by
     return true;
 }
 
-static bool writeWholeFileDirect(const std::wstring& filePath, const std::vector<uint8_t>& bytes, std::string& errorMessage) {
-    std::ofstream file(std::filesystem::path(filePath), std::ios::binary);
-    if (!file) {
-        errorMessage = "Could not create output file.";
-        return false;
-    }
-    if (!bytes.empty()) file.write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
-    file.flush();
-    if (!file) {
-        errorMessage = "Could not write complete output file.";
-        return false;
-    }
-    return true;
-}
-
-static bool replaceFileWithTempFile(const std::filesystem::path& tempPath, const std::filesystem::path& finalPath, std::string& errorMessage) {
-    std::error_code errorCode;
-    std::filesystem::remove(finalPath, errorCode);
-    errorCode.clear();
-    std::filesystem::rename(tempPath, finalPath, errorCode);
-    if (errorCode) {
-        errorMessage = "Could not replace output file after writing temp file: " + errorCode.message();
-        std::error_code cleanupError;
-        std::filesystem::remove(tempPath, cleanupError);
-        return false;
-    }
-    return true;
-}
-
 static bool writeWholeFile(const std::wstring& filePath, const std::vector<uint8_t>& bytes, std::string& errorMessage) {
-    if (filePath.empty()) {
-        errorMessage = "Output path is empty.";
-        return false;
-    }
-
-    std::filesystem::path finalPath(filePath);
-    std::filesystem::path tempPath = finalPath;
-    tempPath += L".storyland_tmp";
-
-    std::error_code cleanupError;
-    std::filesystem::remove(tempPath, cleanupError);
-
-    if (!writeWholeFileDirect(tempPath.wstring(), bytes, errorMessage)) {
-        std::filesystem::remove(tempPath, cleanupError);
-        return false;
-    }
-
-    return replaceFileWithTempFile(tempPath, finalPath, errorMessage);
+    return storylandWriteFilesTransaction({{std::filesystem::path(filePath), &bytes}}, errorMessage);
 }
 
 static std::wstring asciiWide(const std::string& text) {
@@ -1045,10 +1000,43 @@ bool StorylandDtzArchive::saveToFile(const std::wstring& filePath, bool compress
         if (!validateDeflatedDtzRoundTrip(unpackedData, outputBytes, errorMessage)) return false;
     }
 
-    if (!writeWholeFile(filePath, outputBytes, errorMessage)) return false;
+    std::vector<StorylandOutputFile> outputs;
+    outputs.push_back({std::filesystem::path(filePath), &outputBytes});
 
+    std::filesystem::path savedDtz(filePath);
+    std::filesystem::path outputDirectory = savedDtz.parent_path();
+    if (!imgRawData.empty() && !imgPath.empty()) {
+        for (const StorylandDtzDirEntry& entry : dirMap) {
+            const uint64_t endByte = (uint64_t(entry.startSector) + uint64_t(entry.sectorCount)) * 2048ull;
+            if (endByte > uint64_t(imgRawData.size())) {
+                errorMessage = "Not saving: an internal DTZ stream range extends past the rebuilt companion IMG.";
+                return false;
+            }
+        }
+        std::filesystem::path imgOutput = outputDirectory / std::filesystem::path(imgPath).filename();
+        outputs.push_back({imgOutput, &imgRawData});
+    }
 
-    return writePatchedCompanionImg(filePath, errorMessage);
+    // Retail LCS/VCS do not use a .dir.  Only preserve/write this optional
+    // companion when a beta-build DIR was explicitly loaded with the archive.
+    std::vector<uint8_t> patchedBetaDir;
+    if (!externalDirMap.empty() && !dirRawData.empty() && !dirPath.empty()) {
+        patchedBetaDir = dirRawData;
+        for (const StorylandDtzDirEntry& entry : externalDirMap) {
+            const size_t offset = size_t(entry.dirIndex) * 32u;
+            if (offset + 8 > patchedBetaDir.size()) continue;
+            writeU32(patchedBetaDir, offset + 0, entry.startSector);
+            writeU32(patchedBetaDir, offset + 4, entry.sectorCount);
+        }
+        std::filesystem::path dirOutput = outputDirectory / std::filesystem::path(dirPath).filename();
+        outputs.push_back({dirOutput, &patchedBetaDir});
+    }
+
+    if (!storylandWriteFilesTransaction(outputs, errorMessage)) {
+        errorMessage = "DTZ rebuild transaction failed; existing outputs were restored.\r\n" + errorMessage;
+        return false;
+    }
+    return true;
 }
 
 bool StorylandDtzArchive::parse(std::string& errorMessage) {
