@@ -2035,7 +2035,8 @@ static bool appendExactLeedsStripGeometry(
     uint32_t& stripCount,
     uint32_t& rejectedMarkerCount,
     uint32_t& partCount,
-    bool& usedHeaderTransform
+    bool& usedHeaderTransform,
+    bool& usedPspNativeSkinPalette
 ) {
     points.clear();
     triangles.clear();
@@ -2046,12 +2047,14 @@ static bool appendExactLeedsStripGeometry(
     rejectedMarkerCount = 0;
     partCount = 0;
     usedHeaderTransform = false;
+    usedPspNativeSkinPalette = false;
 
     if (data.size() >= 4 && data[0] == 'M' && data[1] == 'G' && data[2] == 0 && data[3] == 0) {
         return appendMgVehicleRawPreviewGeometry(data, points, triangles, texcoords, skinWeights, materialTextureNames, stripCount, rejectedMarkerCount, partCount, usedHeaderTransform);
     }
 
     if (appendPspNativeGeometry(data, points, triangles, texcoords, skinWeights, materialTextureNames, stripCount, rejectedMarkerCount, partCount, usedHeaderTransform)) {
+        usedPspNativeSkinPalette = true;
         return true;
     }
 
@@ -2145,12 +2148,13 @@ void StorylandModelFile::collectPreviewPoints() {
     texcoords.clear();
     skinWeights.clear();
     materialTextureNames.clear();
+    previewUsesPspNativeSkinPalette = false;
 
     uint32_t stripCount = 0;
     uint32_t rejectedMarkerCount = 0;
     uint32_t partCount = 0;
     bool usedHeaderTransform = false;
-    if (appendExactLeedsStripGeometry(data, points, triangles, texcoords, skinWeights, materialTextureNames, stripCount, rejectedMarkerCount, partCount, usedHeaderTransform)) {
+    if (appendExactLeedsStripGeometry(data, points, triangles, texcoords, skinWeights, materialTextureNames, stripCount, rejectedMarkerCount, partCount, usedHeaderTransform, previewUsesPspNativeSkinPalette)) {
         std::ostringstream line;
         line << "Preview: " << points.size() << " vertices, " << triangles.size()
              << " triangles, strips=" << stripCount << ", parts=" << partCount;
@@ -2734,6 +2738,21 @@ void StorylandModelFile::collectArmatureBones() {
         }
 
         for (auto& bone : bones) {
+            // Retail PSP RslNode link fields are not the PS2 frame-parent
+            // pointers.  Reading them as such can reverse whole chains and, in
+            // plr.mdl, creates a false r_calf <-> r_foot cycle.  PSP PEDs carry
+            // a complete RslTAnim direct-id/name hierarchy, so use that
+            // authoritative relationship for the decoded armature.
+            if (previewUsesPspNativeSkinPalette) {
+                std::string parentName = canonicalPedParentName(bone.name);
+                auto canonicalParentIt = canonicalNameToBone.find(parentName);
+                if (canonicalParentIt != canonicalNameToBone.end() && canonicalParentIt->second != bone.index) {
+                    bone.parentIndex = canonicalParentIt->second;
+                    bone.parentOffset = bones[canonicalParentIt->second].offset;
+                }
+                continue;
+            }
+
             // Retail LCS/PS2 PED frames carry the real parent link in the RslNode
             // frame header.  Do not override that with the generic common-bone
             // table.  Several LCS peds attach thighs under spine and clavicles
@@ -3297,6 +3316,45 @@ void StorylandModelFile::parse() {
     collectTextureNameHints();
     collectPreviewPoints();
     collectArmatureBones();
+
+    // PSP strips store a small per-strip skin palette.  Each vertex weight selects
+    // a palette slot and the strip's bone_map resolves that slot to the RslTAnim
+    // direct bone id; it is not an index into our decoded bones vector.  Resolve
+    // those ids once the hierarchy is available so rendering and validation use
+    // the same canonical vector indices while retaining the raw id for analysis.
+    if (previewUsesPspNativeSkinPalette && !bones.empty()) {
+        std::map<uint32_t, uint32_t> byDirectBoneId;
+        std::map<uint32_t, uint32_t> byHierarchyNodeId;
+        for (uint32_t boneIndex = 0; boneIndex < bones.size(); ++boneIndex) {
+            const StorylandModelBone& bone = bones[boneIndex];
+            if (bone.boneId != 0xFFFFFFFFu && bone.boneId != 0xFFu)
+                byDirectBoneId.emplace(bone.boneId, boneIndex);
+            if (bone.nodeId != 0xFFFFFFFFu && bone.nodeId != 0xFFu)
+                byHierarchyNodeId.emplace(bone.nodeId, boneIndex);
+        }
+
+        for (StorylandModelSkinWeights& weights : skinWeights) {
+            const uint32_t count = std::min<uint32_t>(weights.influenceCount, 4u);
+            for (uint32_t influenceIndex = 0; influenceIndex < count; ++influenceIndex) {
+                StorylandModelSkinInfluence& influence = weights.influences[influenceIndex];
+                const uint32_t paletteBoneId = influence.rawMatrixIndex;
+                auto direct = byDirectBoneId.find(paletteBoneId);
+                if (direct != byDirectBoneId.end()) {
+                    influence.boneIndex = direct->second;
+                    continue;
+                }
+                auto node = byHierarchyNodeId.find(paletteBoneId);
+                if (node != byHierarchyNodeId.end()) {
+                    influence.boneIndex = node->second;
+                    continue;
+                }
+                // Some retail PSP models use the hierarchy row itself in the
+                // palette.  Keep that well-defined variant as a final fallback.
+                influence.boneIndex = paletteBoneId < bones.size()
+                    ? paletteBoneId : 0xFFFFFFFFu;
+            }
+        }
+    }
 
     std::ostringstream ss;
     ss << "MDL size: " << data.size() << " bytes / " << ((data.size() + 2047) / 2048) << " IMG sectors";

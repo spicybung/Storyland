@@ -116,6 +116,7 @@ private:
     std::vector<std::string> textureHints;
     std::vector<StorylandModelField> fieldRows;
     StorylandModelKind kind = StorylandModelKind::Unknown;
+    bool previewUsesPspNativeSkinPalette = false;
 
     void parse();
     void collectPreviewPoints();

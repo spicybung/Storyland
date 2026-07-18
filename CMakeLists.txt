@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 if(POLICY CMP0091)
     cmake_policy(SET CMP0091 NEW)
 endif()
-project(Storyland LANGUAGES CXX RC)
+project(Storyland VERSION 1.0.3 LANGUAGES CXX RC)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -55,13 +55,15 @@ add_executable(Storyland WIN32
     src/storyland_atomic_io.h
     src/storyland_dma_validator.cpp
     src/storyland_dma_validator.h
+    src/storyland_psp_validator.cpp
+    src/storyland_psp_validator.h
     src/storyland_model_validator.cpp
     src/storyland_model_validator.h
     "${STORYLAND_RESOURCE_FILE}"
 )
 
 target_include_directories(Storyland PRIVATE src)
-target_link_libraries(Storyland PRIVATE ZLIB::ZLIB windowscodecs ole32 comctl32 comdlg32 shell32 opengl32 gdi32 dwmapi)
+target_link_libraries(Storyland PRIVATE ZLIB::ZLIB windowscodecs ole32 comctl32 comdlg32 shell32 advapi32 opengl32 gdi32 dwmapi)
 
 
 add_custom_command(TARGET Storyland POST_BUILD

@@ -32,6 +32,7 @@
 #include "storyland_archive.h"
 #include "storyland_atomic_io.h"
 #include "storyland_dma_validator.h"
+#include "storyland_psp_validator.h"
 #include "storyland_model_validator.h"
 #include "storyland_anim.h"
 #include "storyland_sky.h"
@@ -44,6 +45,8 @@
 #pragma comment(lib, "Opengl32.lib")
 #pragma comment(lib, "Gdi32.lib")
 #pragma comment(lib, "Dwmapi.lib")
+#pragma comment(lib, "Shell32.lib")
+#pragma comment(lib, "Advapi32.lib")
 
 
 #ifndef GL_VERTEX_SHADER
@@ -156,10 +159,17 @@ typedef void (APIENTRY *PFNGLACTIVETEXTUREPROC)(GLenum texture);
 #define ID_VIEW_SKY_WEATHER_FOGGY 1050
 #define ID_FILE_EXPORT_SELECTED_RESOURCE 1051
 #define ID_FILE_DMA_TLB_PREFLIGHT 1052
+#define ID_VIEW_BACKGROUND_LIGHT 1053
+#define ID_VIEW_BACKGROUND_DARK 1054
+#define ID_FILE_QUIT 1055
+#define ID_FILE_RECENT_CLEAR 1056
+#define ID_HELP_WIKI 1057
+#define ID_FILE_RECENT_BASE 3000
 #define ID_TREE 2001
 #define ID_DETAILS 2002
 #define ID_PREVIEW 2003
 #define ID_STATUS 2004
+#define ID_MENU_STRIP 2005
 
 static HINSTANCE gInstance = nullptr;
 static HWND gMainWindow = nullptr;
@@ -167,6 +177,119 @@ static HWND gTree = nullptr;
 static HWND gDetails = nullptr;
 static HWND gPreview = nullptr;
 static HWND gStatus = nullptr;
+static HWND gMenuStrip = nullptr;
+static HMENU gMainMenu = nullptr;
+static HMENU gFileMenu = nullptr;
+static HMENU gViewMenu = nullptr;
+static HMENU gSkyMenu = nullptr;
+static HMENU gHelpMenu = nullptr;
+static HMENU gTexturePreviewMenu = nullptr;
+static HMENU gRecentMenu = nullptr;
+static HMENU gOpenGlMenu = nullptr;
+static HMENU gBackgroundMenu = nullptr;
+static bool gEyeFriendlyPaneBackground = true;
+static HBRUSH gPaneBackgroundBrush = nullptr;
+static HBRUSH gMenuBackgroundBrush = nullptr;
+static std::wstring gStatusText;
+static std::vector<std::wstring> gRecentFiles;
+
+static COLORREF storylandPaneBackgroundColor() {
+    return gEyeFriendlyPaneBackground ? RGB(35, 36, 42) : GetSysColor(COLOR_WINDOW);
+}
+
+static COLORREF storylandFrameBackgroundColor() {
+    return gEyeFriendlyPaneBackground ? RGB(14, 15, 19) : GetSysColor(COLOR_BTNFACE);
+}
+
+static COLORREF storylandPaneTextColor() {
+    return gEyeFriendlyPaneBackground ? RGB(232, 234, 239) : GetSysColor(COLOR_WINDOWTEXT);
+}
+
+static void applyStorylandNativeMenuTheme(HWND mainWindow) {
+    // Windows does not expose menu-bar colors through WM_CTLCOLOR. Use its
+    // guarded dark-mode hooks when available, while retaining our brush fallback.
+    static HMODULE uxTheme = LoadLibraryW(L"uxtheme.dll");
+    if (!uxTheme) return;
+    using SetPreferredAppModeProc = int (WINAPI*)(int);
+    using AllowDarkModeForWindowProc = BOOL (WINAPI*)(HWND, BOOL);
+    using FlushMenuThemesProc = void (WINAPI*)();
+    using SetWindowThemeProc = HRESULT (WINAPI*)(HWND, LPCWSTR, LPCWSTR);
+    static auto setPreferredAppMode = reinterpret_cast<SetPreferredAppModeProc>(
+        GetProcAddress(uxTheme, MAKEINTRESOURCEA(135)));
+    static auto allowDarkModeForWindow = reinterpret_cast<AllowDarkModeForWindowProc>(
+        GetProcAddress(uxTheme, MAKEINTRESOURCEA(133)));
+    static auto flushMenuThemes = reinterpret_cast<FlushMenuThemesProc>(
+        GetProcAddress(uxTheme, MAKEINTRESOURCEA(136)));
+    static auto setWindowTheme = reinterpret_cast<SetWindowThemeProc>(
+        GetProcAddress(uxTheme, "SetWindowTheme"));
+    if (setPreferredAppMode) setPreferredAppMode(gEyeFriendlyPaneBackground ? 1 : 3);
+    if (mainWindow && allowDarkModeForWindow) allowDarkModeForWindow(mainWindow, gEyeFriendlyPaneBackground);
+    if (setWindowTheme) {
+        const wchar_t* theme = gEyeFriendlyPaneBackground ? L"DarkMode_Explorer" : nullptr;
+        const HWND themedWindows[] = {mainWindow, gTree, gDetails, gStatus};
+        for (HWND window : themedWindows) {
+            if (window) setWindowTheme(window, theme, nullptr);
+        }
+    }
+    if (flushMenuThemes) flushMenuThemes();
+}
+
+static void setStorylandClientEdge(HWND window, bool enabled) {
+    if (!window) return;
+    LONG_PTR extendedStyle = GetWindowLongPtrW(window, GWL_EXSTYLE);
+    LONG_PTR updatedStyle = enabled
+        ? (extendedStyle | WS_EX_CLIENTEDGE)
+        : (extendedStyle & ~LONG_PTR(WS_EX_CLIENTEDGE));
+    if (updatedStyle == extendedStyle) return;
+    SetWindowLongPtrW(window, GWL_EXSTYLE, updatedStyle);
+    SetWindowPos(window, nullptr, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+}
+
+static void applyStorylandPaneBackground(HWND mainWindow) {
+    if (gPaneBackgroundBrush) {
+        DeleteObject(gPaneBackgroundBrush);
+        gPaneBackgroundBrush = nullptr;
+    }
+    const COLORREF paneColor = storylandPaneBackgroundColor();
+    gPaneBackgroundBrush = CreateSolidBrush(paneColor);
+    applyStorylandNativeMenuTheme(mainWindow);
+    // The themed WS_EX_CLIENTEDGE bevel is always pale. Remove it in Dark mode
+    // so the deliberately darker four-pixel pane gutters become the separators.
+    setStorylandClientEdge(gTree, !gEyeFriendlyPaneBackground);
+    setStorylandClientEdge(gPreview, !gEyeFriendlyPaneBackground);
+    setStorylandClientEdge(gDetails, !gEyeFriendlyPaneBackground);
+    if (gTree) {
+        TreeView_SetBkColor(gTree, paneColor);
+        TreeView_SetTextColor(gTree, storylandPaneTextColor());
+        TreeView_SetLineColor(gTree, gEyeFriendlyPaneBackground ? RGB(70, 73, 83) : GetSysColor(COLOR_GRAYTEXT));
+        InvalidateRect(gTree, nullptr, TRUE);
+    }
+    if (gDetails) InvalidateRect(gDetails, nullptr, TRUE);
+    if (gStatus) {
+        SendMessageW(gStatus, SB_SETBKCOLOR, 0,
+            gEyeFriendlyPaneBackground ? LPARAM(RGB(25, 26, 31)) : LPARAM(CLR_DEFAULT));
+        InvalidateRect(gStatus, nullptr, TRUE);
+    }
+    if (mainWindow) {
+        if (gMenuBackgroundBrush) {
+            DeleteObject(gMenuBackgroundBrush);
+            gMenuBackgroundBrush = nullptr;
+        }
+        MENUINFO menuInfo{};
+        menuInfo.cbSize = sizeof(menuInfo);
+        menuInfo.fMask = MIM_BACKGROUND | MIM_APPLYTOSUBMENUS;
+        if (gEyeFriendlyPaneBackground) {
+            gMenuBackgroundBrush = CreateSolidBrush(RGB(25, 26, 31));
+            menuInfo.hbrBack = gMenuBackgroundBrush;
+        } else {
+            menuInfo.hbrBack = GetSysColorBrush(COLOR_MENU);
+        }
+        if (gMainMenu) SetMenuInfo(gMainMenu, &menuInfo);
+        if (gMenuStrip) InvalidateRect(gMenuStrip, nullptr, TRUE);
+        InvalidateRect(mainWindow, nullptr, TRUE);
+    }
+}
 
 enum class StorylandTitleTint { Default, LCS, VCS, CTW };
 static StorylandTitleTint gTitleTint = StorylandTitleTint::Default;
@@ -650,6 +773,83 @@ static bool fileExists(const std::wstring& path) {
     return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
 }
 
+static constexpr size_t STORYLAND_MAX_RECENT_FILES = 8;
+
+static std::wstring escapeMenuLabel(std::wstring label) {
+    size_t position = 0;
+    while ((position = label.find(L'&', position)) != std::wstring::npos) {
+        label.insert(position, 1, L'&');
+        position += 2;
+    }
+    return label;
+}
+
+static void saveRecentFiles() {
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Reigns Studios\\Storyland", 0, nullptr,
+                        0, KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) return;
+    for (size_t index = 0; index < STORYLAND_MAX_RECENT_FILES; ++index) {
+        std::wstring valueName = L"Recent" + std::to_wstring(index);
+        if (index < gRecentFiles.size()) {
+            const std::wstring& path = gRecentFiles[index];
+            RegSetValueExW(key, valueName.c_str(), 0, REG_SZ,
+                reinterpret_cast<const BYTE*>(path.c_str()), DWORD((path.size() + 1) * sizeof(wchar_t)));
+        } else {
+            RegDeleteValueW(key, valueName.c_str());
+        }
+    }
+    RegCloseKey(key);
+}
+
+static void rebuildRecentMenu() {
+    if (!gRecentMenu) return;
+    while (GetMenuItemCount(gRecentMenu) > 0) DeleteMenu(gRecentMenu, 0, MF_BYPOSITION);
+    if (gRecentFiles.empty()) {
+        AppendMenuW(gRecentMenu, MF_STRING | MF_GRAYED, ID_FILE_RECENT_BASE, L"(Empty)");
+        return;
+    }
+    for (size_t index = 0; index < gRecentFiles.size(); ++index) {
+        std::filesystem::path path(gRecentFiles[index]);
+        std::wstring label = L"&" + std::to_wstring(index + 1) + L"  " +
+            escapeMenuLabel(path.filename().wstring()) + L"  -  " + escapeMenuLabel(path.parent_path().wstring());
+        AppendMenuW(gRecentMenu, MF_STRING, ID_FILE_RECENT_BASE + UINT(index), label.c_str());
+    }
+    AppendMenuW(gRecentMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(gRecentMenu, MF_STRING, ID_FILE_RECENT_CLEAR, L"Clear list");
+}
+
+static void loadRecentFiles() {
+    gRecentFiles.clear();
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Reigns Studios\\Storyland", 0,
+                      KEY_QUERY_VALUE, &key) != ERROR_SUCCESS) return;
+    for (size_t index = 0; index < STORYLAND_MAX_RECENT_FILES; ++index) {
+        wchar_t path[32768] = {};
+        DWORD type = 0;
+        DWORD bytes = sizeof(path);
+        std::wstring valueName = L"Recent" + std::to_wstring(index);
+        if (RegQueryValueExW(key, valueName.c_str(), nullptr, &type,
+                            reinterpret_cast<BYTE*>(path), &bytes) == ERROR_SUCCESS &&
+            type == REG_SZ && path[0] && fileExists(path)) {
+            std::wstring candidate(path);
+            if (std::find(gRecentFiles.begin(), gRecentFiles.end(), candidate) == gRecentFiles.end())
+                gRecentFiles.push_back(std::move(candidate));
+        }
+    }
+    RegCloseKey(key);
+    saveRecentFiles();
+}
+
+static void addRecentFile(const std::wstring& path) {
+    if (path.empty() || !fileExists(path)) return;
+    gRecentFiles.erase(std::remove_if(gRecentFiles.begin(), gRecentFiles.end(),
+        [&](const std::wstring& existing) { return _wcsicmp(existing.c_str(), path.c_str()) == 0; }), gRecentFiles.end());
+    gRecentFiles.insert(gRecentFiles.begin(), path);
+    if (gRecentFiles.size() > STORYLAND_MAX_RECENT_FILES) gRecentFiles.resize(STORYLAND_MAX_RECENT_FILES);
+    saveRecentFiles();
+    rebuildRecentMenu();
+}
+
 static void openStorylandFile(const std::wstring& path);
 static bool writeWholeFileBinary(const std::wstring& path, const std::vector<uint8_t>& bytes, std::string& error);
 static std::wstring buildDtzPreviewExtractRoot();
@@ -740,7 +940,25 @@ static std::wstring hexWide(uint32_t value, int width = 8) {
 }
 
 static void setStatus(const std::wstring& text) {
-    SendMessageW(gStatus, SB_SETTEXTW, 0, reinterpret_cast<LPARAM>(text.c_str()));
+    gStatusText = text;
+    SendMessageW(gStatus, SB_SETTEXTW,
+        gEyeFriendlyPaneBackground ? SBT_OWNERDRAW : 0,
+        reinterpret_cast<LPARAM>(gStatusText.c_str()));
+}
+
+static std::wstring buildModelStatusLine() {
+    std::wstringstream status;
+    status << L"MDL | " << widen(gModelFile.modelKindName())
+           << L" | " << gModelFile.armatureBones().size() << L" bones";
+    if (gModelTextureLoaded && !gModelTexturePath.empty()) {
+        status << L" | " << std::filesystem::path(gModelTexturePath).filename().wstring()
+               << L" | " << gModelTextureRegions.size() << L" textures"
+               << L" | atlas " << gModelTextureImage.width << L"x" << gModelTextureImage.height;
+    } else {
+        status << L" | no textures";
+    }
+    if (gModelAnimLoaded) status << L" | ANIM";
+    return status.str();
 }
 
 static void setDetails(const std::wstring& text) {
@@ -2824,11 +3042,7 @@ static void populateModelList() {
     if (structuresRoot) expandTreeItem(structuresRoot);
     if (headerStructuresRoot) expandTreeItem(headerStructuresRoot);
     if (hierarchyStructuresRoot) expandTreeItem(hierarchyStructuresRoot);
-    if (gModelAnimLoaded) {
-        setStatus(L"MDL loaded as " + widen(gModelFile.modelKindName()) + L"; attached ANIM: " + gModelAnimStatus);
-    } else {
-        setStatus(L"MDL loaded as " + widen(gModelFile.modelKindName()) + L"; armature bones=" + std::to_wstring(gModelFile.armatureBones().size()) + L"; left pane is a struct tree, right pane shows preview/details");
-    }
+    setStatus(buildModelStatusLine());
 }
 
 
@@ -7284,6 +7498,11 @@ static void openStorylandFile(const std::wstring& path) {
     if (path.empty()) return;
     std::wstring ext = getExtensionLower(path);
     std::string error;
+    if (ext == L".anim" || ext == L".chk" || ext == L".xtx" || ext == L".tex" ||
+        ext == L".img" || ext == L".lvz" || ext == L".wbl" || ext == L".dir" ||
+        ext == L".dtz" || ext == L".bin" || ext == L".mdl" || ext == L".dff") {
+        addRecentFile(path);
+    }
 
     if (ext == L".anim") {
         if (!gAnimFile.loadFromFile(path, error)) {
@@ -7475,11 +7694,7 @@ static void openStorylandFile(const std::wstring& path) {
         StorylandTitleTint modelTint = titleTintFromPath(path);
         if (modelTint == StorylandTitleTint::Default && !gModelTexturePath.empty()) modelTint = titleTintFromPath(gModelTexturePath);
         applyStorylandTitleTint(modelTint);
-        if (gModelAnimLoaded) {
-            setStatus(L"MDL loaded as " + widen(gModelFile.modelKindName()) + L"; " + textureStatus + L"; attached ANIM: " + gModelAnimStatus);
-        } else {
-            setStatus(L"MDL loaded as " + widen(gModelFile.modelKindName()) + L"; " + textureStatus);
-        }
+        setStatus(buildModelStatusLine());
         InvalidateRect(gPreview, nullptr, FALSE);
         return;
     }
@@ -8135,6 +8350,14 @@ static void exportSelectedResourceBytes() {
     setStatus(L"Exported and verified selected resource: " + outputPath + L" (" + std::to_wstring(bytes.size()) + L" bytes)");
 }
 
+static bool loadedModelUsesPspGeometry() {
+    for (const StorylandModelField& field : gModelFile.fields()) {
+        if (field.group.rfind("sPspGeometry @", 0) == 0 ||
+            field.group.rfind("sPspGeometryMesh #", 0) == 0) return true;
+    }
+    return false;
+}
+
 static void runSelectedDmaTlbPreflight() {
     std::vector<uint8_t> bytes;
     std::string label;
@@ -8145,7 +8368,7 @@ static void runSelectedDmaTlbPreflight() {
         loadedModel = true;
         label = "loaded model: " + narrow(gModelFile.sourcePath());
         if (!readBinaryFileForUi(gModelFile.sourcePath(), bytes, error)) {
-            MessageBoxW(gMainWindow, widen(error).c_str(), L"DMA/TLB preflight failed", MB_ICONERROR);
+            MessageBoxW(gMainWindow, widen(error).c_str(), L"DMA/VIF Test", MB_ICONERROR);
             return;
         }
     } else if (gMode == StorylandMode::ArchiveFile &&
@@ -8154,7 +8377,7 @@ static void runSelectedDmaTlbPreflight() {
         const uint32_t resourceId = gArchiveMeshResourceIds[size_t(gSelectedIndex)];
         label = "LVZ/IMG mesh resource " + std::to_string(resourceId);
         if (!gArchiveBrowser.extractWorldMeshResourceBytes(resourceId, bytes, error)) {
-            MessageBoxW(gMainWindow, widen(error).c_str(), L"DMA/TLB preflight failed", MB_ICONERROR);
+            MessageBoxW(gMainWindow, widen(error).c_str(), L"DMA/VIF Test", MB_ICONERROR);
             return;
         }
     } else if (gMode == StorylandMode::ArchiveFile &&
@@ -8162,7 +8385,7 @@ static void runSelectedDmaTlbPreflight() {
                size_t(gSelectedIndex) < gArchiveBrowser.entries().size()) {
         label = "LVZ/IMG entry: " + gArchiveBrowser.entries()[size_t(gSelectedIndex)].name;
         if (!gArchiveBrowser.extractEntryBytes(size_t(gSelectedIndex), bytes, error)) {
-            MessageBoxW(gMainWindow, widen(error).c_str(), L"DMA/TLB preflight failed", MB_ICONERROR);
+            MessageBoxW(gMainWindow, widen(error).c_str(), L"DMA/VIF Test", MB_ICONERROR);
             return;
         }
     } else if (gMode == StorylandMode::DtzArchive &&
@@ -8170,42 +8393,48 @@ static void runSelectedDmaTlbPreflight() {
                size_t(gSelectedIndex) < gDtzArchive.dirEntries().size()) {
         label = "GAME.DTZ IMG stream: " + gDtzArchive.dirEntries()[size_t(gSelectedIndex)].name;
         if (!gDtzArchive.extractDirEntryBytes(size_t(gSelectedIndex), bytes, error)) {
-            MessageBoxW(gMainWindow, widen(error).c_str(), L"DMA/TLB preflight failed", MB_ICONERROR);
+            MessageBoxW(gMainWindow, widen(error).c_str(), L"DMA/VIF Test", MB_ICONERROR);
             return;
         }
     } else {
         MessageBoxW(
             gMainWindow,
             L"Open an MDL, or select an LVZ/IMG entry, placed mesh resource, or GAME.DTZ internal model stream first.",
-            L"PS2 Resource Preflight",
+            L"DMA/VIF Test",
             MB_ICONINFORMATION
         );
         return;
     }
 
-    const StorylandDmaTlbReport dmaReport = storylandValidatePs2DmaTlb(bytes, label);
-    bool overallSafe = dmaReport.safe();
+    bool overallSafe = true;
     std::string details;
+    const bool pspModel = loadedModel && loadedModelUsesPspGeometry();
     if (loadedModel) {
         const StorylandModelIntegrityReport modelReport = storylandValidateModelIntegrity(gModelFile, bytes, label);
-        overallSafe = overallSafe && modelReport.safe();
-        details = modelReport.text() + "\r\n" + dmaReport.text();
+        overallSafe = modelReport.safe();
+        details = modelReport.text() + "\r\n";
+    }
+    if (pspModel) {
+        const StorylandPspDmaReport pspReport = storylandValidatePspDmaGe(gModelFile, bytes, label);
+        overallSafe = overallSafe && pspReport.safe();
+        details += pspReport.text();
+        setStatus(overallSafe ? L"DMA/VIF | PSP GE streams OK" : L"DMA/VIF | PSP stream fault");
     } else {
-        details = dmaReport.text();
+        const StorylandDmaTlbReport dmaReport = storylandValidatePs2DmaTlb(bytes, label);
+        overallSafe = overallSafe && dmaReport.safe();
+        details += dmaReport.text();
+        setStatus(overallSafe
+            ? (dmaReport.dmaTags == 0 ? L"DMA/VIF | PS2 limited" : L"DMA/VIF | PS2 OK")
+            : L"DMA/VIF | PS2 fault");
     }
     setDetails(widen(details));
-    setStatus(overallSafe
-        ? (dmaReport.dmaTags == 0
-            ? L"Model structure passed; DMA result is limited until its GAME.DTZ/IMG allocation is checked."
-            : L"Model structure and file-resident DMA/TLB preflight passed.")
-        : L"Preflight failed; inspect the structural and DMA/TLB issues in the details panel.");
     if (!overallSafe) {
         MessageBoxW(
             gMainWindow,
             loadedModel
-                ? L"The model has structural/skinning corruption or a definite DMA/TLB hazard. See the details panel for the exact reason."
-                : L"Definite DMA/TLB hazards were found. The resource was not modified. See the details panel for exact file offsets and addresses.",
-            L"Storyland Preflight Failed",
+                ? L"Model or stream test failed. Check the details panel."
+                : L"DMA/VIF test failed. Check the details panel.",
+            L"DMA/VIF Test Failed",
             MB_ICONERROR
         );
     }
@@ -8365,7 +8594,7 @@ static void replaceSelectedTexture() {
     populateTextureList();
     int nextIndex = std::min<int>(gSelectedIndex, int(gTextureArchive.textures().size()) - 1);
     if (nextIndex >= 0) selectTexture(nextIndex);
-    setStatus(L"Texture replaced/resized in memory; use File > Export Edited Texture Archive to write .chk/.xtx/.tex");
+    setStatus(L"Texture changed | right-click > Export edited texture archive");
 }
 
 static void renameSelectedTexture() {
@@ -8395,7 +8624,7 @@ static void renameSelectedTexture() {
     populateTextureList();
     int nextIndex = std::min<int>(gSelectedIndex, int(gTextureArchive.textures().size()) - 1);
     if (nextIndex >= 0) selectTexture(nextIndex);
-    setStatus(L"Texture renamed in memory; use File > Export Edited Texture Archive to write .chk/.xtx/.tex");
+    setStatus(L"Texture renamed | right-click > Export edited texture archive");
 }
 
 static void openCompanionDirForCurrentDtz() {
@@ -8438,7 +8667,7 @@ static void openCompanionImgForCurrentDtz() {
 static void showAboutDialog() {
     MessageBoxW(
         gMainWindow,
-        L"Storyland\r\n\r\nauthor: spicybung\r\nhttps://github.com/spicybung/BLeeds\r\nReigns Studios\r\n\r\nAn analyzer, editor, and viewer for Grand Theft Auto Stories file formats.\r\n\r\nhttps://github.com/spicybung/BLeeds/wiki",
+        L"Storyland 1.0.3\r\n\r\nauthor: spicybung\r\nhttps://github.com/spicybung/BLeeds\r\nReigns Studios\r\n\r\nAn analyzer, editor, and viewer for Grand Theft Auto Stories file formats.",
         L"About Storyland",
         MB_OK | MB_ICONINFORMATION
     );
@@ -9793,7 +10022,11 @@ static LRESULT CALLBACK previewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         else if (gMode == StorylandMode::AnimFile) drawAnimPreviewOpenGl(hwnd, dc, rc);
         else if (gMode == StorylandMode::DtzArchive && gDtzEmbeddedPreviewKind == DtzEmbeddedPreviewKind::TextureArchive) drawTexturePreview(dc, rc);
         else if (gMode == StorylandMode::DtzArchive && gDtzEmbeddedPreviewKind == DtzEmbeddedPreviewKind::ModelFile) drawModelPreviewOpenGl(hwnd, dc, rc);
-        else FillRect(dc, &rc, reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1));
+        else {
+            HBRUSH emptyPreviewBrush = CreateSolidBrush(RGB(181, 221, 242));
+            FillRect(dc, &rc, emptyPreviewBrush);
+            DeleteObject(emptyPreviewBrush);
+        }
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -9870,6 +10103,7 @@ static void layoutChildren(HWND hwnd) {
     RECT rc;
     GetClientRect(hwnd, &rc);
 
+    const int menuHeight = 28;
     const int statusHeight = 22;
     const int clientWidth = static_cast<int>(rc.right - rc.left);
     const int clientHeight = static_cast<int>(rc.bottom - rc.top);
@@ -9884,20 +10118,21 @@ static void layoutChildren(HWND hwnd) {
         statusHeight,
         TRUE
     );
+    MoveWindow(gMenuStrip, 0, 0, clientWidth, menuHeight, TRUE);
 
     const int leftW = std::max<int>(300, clientWidth / 3);
     const int rightW = clientWidth - leftW;
-    const int topH = clientHeight - statusHeight;
+    const int topH = clientHeight - statusHeight - menuHeight;
     const int previewH = std::max<int>(180, topH / 2);
     const int rightX = leftW + 4;
     const int rightClientW = std::max<int>(0, rightW - 4);
 
-    MoveWindow(gTree, 0, 0, leftW, topH, TRUE);
+    MoveWindow(gTree, 0, menuHeight, leftW, topH, TRUE);
 
     MoveWindow(
         gPreview,
         rightX,
-        0,
+        menuHeight,
         rightClientW,
         previewH,
         TRUE
@@ -9906,7 +10141,7 @@ static void layoutChildren(HWND hwnd) {
     MoveWindow(
         gDetails,
         rightX,
-        previewH + 4,
+        menuHeight + previewH + 4,
         rightClientW,
         topH - previewH - 4,
         TRUE
@@ -9987,7 +10222,7 @@ static bool buildTreeContextMenu(HMENU menu) {
         if (gSelectedKind == StorylandTreeKind::DtzDirEntry) {
             hasItems = addContextMenuItem(menu, ID_FILE_OPEN_EMBEDDED, L"Open selected internal IMG entry standalone...") || hasItems;
             hasItems = addContextMenuItem(menu, ID_FILE_EXPORT_SELECTED_RESOURCE, L"Export selected internal IMG entry...") || hasItems;
-            hasItems = addContextMenuItem(menu, ID_FILE_DMA_TLB_PREFLIGHT, L"Run PS2 DMA/TLB preflight...") || hasItems;
+            hasItems = addContextMenuItem(menu, ID_FILE_DMA_TLB_PREFLIGHT, L"Run DMA/VIF Test...") || hasItems;
             hasItems = addContextMenuItem(menu, ID_DTZ_REPLACE_SELECTED_ENTRY, L"Replace selected internal IMG entry from file...") || hasItems;
             addContextMenuSeparatorIfNeeded(menu, hasItems);
             hasItems = addContextMenuItem(menu, ID_DTZ_PATCH_SELECTED, L"Patch selected sector count...") || hasItems;
@@ -10000,23 +10235,25 @@ static bool buildTreeContextMenu(HMENU menu) {
         if (gSelectedKind == StorylandTreeKind::ArchiveEntry) {
             hasItems = addContextMenuItem(menu, ID_FILE_OPEN_EMBEDDED, L"Open selected embedded entry...") || hasItems;
             hasItems = addContextMenuItem(menu, ID_FILE_EXPORT_SELECTED_RESOURCE, L"Export selected LVZ+IMG entry...") || hasItems;
-            hasItems = addContextMenuItem(menu, ID_FILE_DMA_TLB_PREFLIGHT, L"Run PS2 DMA/TLB preflight...") || hasItems;
+            hasItems = addContextMenuItem(menu, ID_FILE_DMA_TLB_PREFLIGHT, L"Run DMA/VIF Test...") || hasItems;
             addContextMenuSeparatorIfNeeded(menu, hasItems);
             hasItems = addContextMenuItem(menu, ID_ARCHIVE_REPLACE_SELECTED_RESOURCE, L"Replace selected LVZ+IMG resource from file...") || hasItems;
         } else if (gSelectedKind == StorylandTreeKind::ArchiveMeshResource) {
             hasItems = addContextMenuItem(menu, ID_FILE_EXPORT_SELECTED_RESOURCE, L"Export selected mesh resource...") || hasItems;
-            hasItems = addContextMenuItem(menu, ID_FILE_DMA_TLB_PREFLIGHT, L"Run PS2 DMA/TLB preflight...") || hasItems;
+            hasItems = addContextMenuItem(menu, ID_FILE_DMA_TLB_PREFLIGHT, L"Run DMA/VIF Test...") || hasItems;
             hasItems = addContextMenuItem(menu, ID_ARCHIVE_REPLACE_SELECTED_RESOURCE, L"Replace selected mesh resource from file...") || hasItems;
             hasItems = addContextMenuItem(menu, ID_ARCHIVE_REPLACE_MESH_WITH_RESOURCE_ID, L"Clone selected mesh resource from Resource ID...") || hasItems;
             hasItems = addContextMenuItem(menu, ID_ARCHIVE_CHANGE_SELECTED_MESH_RESOURCE_ID, L"Change selected mesh resource ID...") || hasItems;
         }
     } else if (gMode == StorylandMode::ModelFile) {
-        hasItems = addContextMenuItem(menu, ID_FILE_DMA_TLB_PREFLIGHT, L"Run MDL structure + PS2 DMA/TLB preflight...") || hasItems;
+        hasItems = addContextMenuItem(menu, ID_FILE_DMA_TLB_PREFLIGHT, L"Run DMA/VIF Test...") || hasItems;
     } else if (gMode == StorylandMode::TextureArchive) {
         if (gSelectedKind == StorylandTreeKind::Texture && gSelectedIndex >= 0) {
             hasItems = addContextMenuItem(menu, ID_FILE_EXPORT_TEXTURE, L"Export selected texture PNG...") || hasItems;
             hasItems = addContextMenuItem(menu, ID_FILE_REPLACE_TEXTURE, L"Replace selected texture...") || hasItems;
             hasItems = addContextMenuItem(menu, ID_FILE_RENAME_TEXTURE, L"Rename selected texture...") || hasItems;
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            hasItems = addContextMenuItem(menu, ID_FILE_EXPORT_TEXTURE_ARCHIVE, L"Export edited texture archive...") || hasItems;
         }
     }
 
@@ -10052,51 +10289,153 @@ static void showTreeContextMenu(HWND hwnd, LPARAM lParam) {
     DestroyMenu(menu);
 }
 
+static int gMenuStripHover = -1;
+
+static RECT storylandTopMenuRect(int index, int height) {
+    static const int widths[] = {50, 54, 50};
+    int left = 0;
+    for (int i = 0; i < index; ++i) left += widths[i];
+    return RECT{left, 0, left + widths[index], height};
+}
+
+static int storylandTopMenuAt(POINT point, int height) {
+    if (point.y < 0 || point.y >= height) return -1;
+    for (int index = 0; index < 3; ++index) {
+        RECT item = storylandTopMenuRect(index, height);
+        if (point.x >= item.left && point.x < item.right) return index;
+    }
+    return -1;
+}
+
+static void openStorylandTopMenu(HWND strip, int index) {
+    const HMENU menus[] = {gFileMenu, gViewMenu, gHelpMenu};
+    if (index < 0 || index >= 3 || !menus[index]) return;
+    RECT client{};
+    GetClientRect(strip, &client);
+    RECT item = storylandTopMenuRect(index, client.bottom);
+    POINT popup{item.left, client.bottom};
+    ClientToScreen(strip, &popup);
+    gMenuStripHover = index;
+    InvalidateRect(strip, nullptr, FALSE);
+    SetForegroundWindow(gMainWindow);
+    TrackPopupMenuEx(menus[index], TPM_LEFTALIGN | TPM_TOPALIGN | TPM_LEFTBUTTON,
+        popup.x, popup.y, gMainWindow, nullptr);
+    PostMessageW(gMainWindow, WM_NULL, 0, 0);
+    gMenuStripHover = -1;
+    InvalidateRect(strip, nullptr, FALSE);
+}
+
+static LRESULT CALLBACK storylandMenuStripProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    if (message == WM_ERASEBKGND) return 1;
+    if (message == WM_PAINT) {
+        PAINTSTRUCT paint{};
+        HDC dc = BeginPaint(hwnd, &paint);
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        COLORREF background = gEyeFriendlyPaneBackground ? RGB(25, 26, 31) : GetSysColor(COLOR_MENU);
+        COLORREF hover = gEyeFriendlyPaneBackground ? RGB(47, 49, 57) : GetSysColor(COLOR_MENUHILIGHT);
+        COLORREF text = gEyeFriendlyPaneBackground ? RGB(238, 239, 243) : GetSysColor(COLOR_MENUTEXT);
+        HBRUSH backgroundBrush = CreateSolidBrush(background);
+        FillRect(dc, &client, backgroundBrush);
+        DeleteObject(backgroundBrush);
+        HFONT font = reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+        HGDIOBJ oldFont = SelectObject(dc, font);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, text);
+        static const wchar_t* labels[] = {L"File", L"View", L"Help"};
+        for (int index = 0; index < 3; ++index) {
+            RECT item = storylandTopMenuRect(index, client.bottom);
+            if (index == gMenuStripHover) {
+                HBRUSH hoverBrush = CreateSolidBrush(hover);
+                FillRect(dc, &item, hoverBrush);
+                DeleteObject(hoverBrush);
+            }
+            DrawTextW(dc, labels[index], -1, &item,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
+        SelectObject(dc, oldFont);
+        EndPaint(hwnd, &paint);
+        return 0;
+    }
+    if (message == WM_MOUSEMOVE) {
+        POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        int hover = storylandTopMenuAt(point, client.bottom);
+        if (hover != gMenuStripHover) {
+            gMenuStripHover = hover;
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, hwnd, 0};
+        TrackMouseEvent(&tracking);
+        return 0;
+    }
+    if (message == WM_MOUSELEAVE) {
+        gMenuStripHover = -1;
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    }
+    if (message == WM_LBUTTONDOWN) {
+        POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        openStorylandTopMenu(hwnd, storylandTopMenuAt(point, client.bottom));
+        return 0;
+    }
+    return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
 static void createMenuBar(HWND hwnd) {
-    HMENU menu = CreateMenu();
+    gMainMenu = CreateMenu();
 
-    HMENU file = CreatePopupMenu();
-    AppendMenuW(file, MF_STRING, ID_FILE_OPEN, L"Open...");
-    AppendMenuW(file, MF_STRING, ID_FILE_SAVE_AS, L"Save As / Rebuild GAME.DTZ...");
-    AppendMenuW(file, MF_STRING, ID_FILE_EXPORT_LOG, L"Export Log...");
-    AppendMenuW(file, MF_STRING, ID_FILE_EXPORT_SELECTED_RESOURCE, L"Export Selected Resource...");
-    AppendMenuW(file, MF_STRING, ID_FILE_DMA_TLB_PREFLIGHT, L"Run PS2 Resource Preflight...");
-    AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(file, MF_STRING, ID_ARCHIVE_EXPORT_LVZ_IMG_PAIR, L"Export/Rebuild LVZ+IMG Pair...");
-    AppendMenuW(file, MF_STRING, ID_ARCHIVE_OVERWRITE_LVZ_IMG_PAIR, L"Overwrite Current LVZ+IMG Pair...");
-    AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(file, MF_STRING, ID_FILE_EXPORT_TEXTURE, L"Export Selected Texture PNG...");
-    AppendMenuW(file, MF_STRING, ID_FILE_REPLACE_TEXTURE, L"Replace Selected Texture...");
-    AppendMenuW(file, MF_STRING, ID_FILE_RENAME_TEXTURE, L"Rename Selected Texture...");
-    AppendMenuW(file, MF_STRING, ID_FILE_EXPORT_TEXTURE_ARCHIVE, L"Export Edited Texture Archive...");
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(file), L"File");
+    gFileMenu = CreatePopupMenu();
+    AppendMenuW(gFileMenu, MF_STRING, ID_FILE_OPEN, L"Open...");
+    gRecentMenu = CreatePopupMenu();
+    rebuildRecentMenu();
+    AppendMenuW(gFileMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(gRecentMenu), L"Open recent");
+    AppendMenuW(gFileMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(gFileMenu, MF_STRING, ID_FILE_SAVE_AS, L"Save As / Rebuild GAME.DTZ...");
+    AppendMenuW(gFileMenu, MF_STRING, ID_FILE_EXPORT_LOG, L"Export Log...");
+    AppendMenuW(gFileMenu, MF_STRING, ID_FILE_DMA_TLB_PREFLIGHT, L"Run DMA/VIF Test...");
+    AppendMenuW(gFileMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(gFileMenu, MF_STRING, ID_ARCHIVE_EXPORT_LVZ_IMG_PAIR, L"Export/Rebuild LVZ+IMG Pair...");
+    AppendMenuW(gFileMenu, MF_STRING, ID_ARCHIVE_OVERWRITE_LVZ_IMG_PAIR, L"Overwrite Current LVZ+IMG Pair...");
+    AppendMenuW(gFileMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(gFileMenu, MF_STRING, ID_FILE_QUIT, L"Quit");
+    AppendMenuW(gMainMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(gFileMenu), L"File");
 
-    HMENU view = CreatePopupMenu();
-    AppendMenuW(view, MF_STRING, ID_VIEW_FLIP_TEXTURE_PREVIEW_V, L"Flip texture archive preview V");
-    CheckMenuItem(view, ID_VIEW_FLIP_TEXTURE_PREVIEW_V, MF_BYCOMMAND | (gTexturePreviewFlipV ? MF_CHECKED : MF_UNCHECKED));
-    AppendMenuW(view, MF_STRING, ID_VIEW_FLIP_MODEL_TEXTURE_V, L"Flip MDL texture V");
-    CheckMenuItem(view, ID_VIEW_FLIP_MODEL_TEXTURE_V, MF_BYCOMMAND | (gModelFlipTextureV ? MF_CHECKED : MF_UNCHECKED));
+    gViewMenu = CreatePopupMenu();
+    HMENU view = gViewMenu;
+    gTexturePreviewMenu = CreatePopupMenu();
+    AppendMenuW(gTexturePreviewMenu, MF_STRING, ID_VIEW_FLIP_TEXTURE_PREVIEW_V, L"Flip archive texture V");
+    CheckMenuItem(gTexturePreviewMenu, ID_VIEW_FLIP_TEXTURE_PREVIEW_V, MF_BYCOMMAND | (gTexturePreviewFlipV ? MF_CHECKED : MF_UNCHECKED));
+    AppendMenuW(gTexturePreviewMenu, MF_STRING, ID_VIEW_FLIP_MODEL_TEXTURE_V, L"Flip MDL texture V");
+    CheckMenuItem(gTexturePreviewMenu, ID_VIEW_FLIP_MODEL_TEXTURE_V, MF_BYCOMMAND | (gModelFlipTextureV ? MF_CHECKED : MF_UNCHECKED));
+    AppendMenuW(view, MF_POPUP, reinterpret_cast<UINT_PTR>(gTexturePreviewMenu), L"Texture preview");
     AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(view, MF_STRING, ID_VIEW_RENDER_STORIES, L"OpenGL render: Stories shader");
-    AppendMenuW(view, MF_STRING, ID_VIEW_RENDER_TEXTURED, L"OpenGL render: texture");
-    AppendMenuW(view, MF_STRING, ID_VIEW_RENDER_SOLID, L"OpenGL render: solid");
-    AppendMenuW(view, MF_STRING, ID_VIEW_RENDER_WIREFRAME, L"OpenGL render: wireframe");
+    gOpenGlMenu = CreatePopupMenu();
+    AppendMenuW(gOpenGlMenu, MF_STRING, ID_VIEW_RENDER_STORIES, L"Stories shader");
+    AppendMenuW(gOpenGlMenu, MF_STRING, ID_VIEW_RENDER_TEXTURED, L"Textured");
+    AppendMenuW(gOpenGlMenu, MF_STRING, ID_VIEW_RENDER_SOLID, L"Solid");
+    AppendMenuW(gOpenGlMenu, MF_STRING, ID_VIEW_RENDER_WIREFRAME, L"Wireframe");
     UINT checkedRender = ID_VIEW_RENDER_STORIES;
     if (gOpenGlRenderMode == StorylandOpenGlRenderMode::Textured) checkedRender = ID_VIEW_RENDER_TEXTURED;
     else if (gOpenGlRenderMode == StorylandOpenGlRenderMode::Solid) checkedRender = ID_VIEW_RENDER_SOLID;
     else if (gOpenGlRenderMode == StorylandOpenGlRenderMode::Wireframe) checkedRender = ID_VIEW_RENDER_WIREFRAME;
-    CheckMenuRadioItem(view, ID_VIEW_RENDER_STORIES, ID_VIEW_RENDER_WIREFRAME, checkedRender, MF_BYCOMMAND);
-    AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(view, MF_STRING, ID_VIEW_SHOW_GRID, L"Show OpenGL grid");
-    CheckMenuItem(view, ID_VIEW_SHOW_GRID, MF_BYCOMMAND | (gOpenGlShowGrid ? MF_CHECKED : MF_UNCHECKED));
-    AppendMenuW(view, MF_STRING, ID_VIEW_SHOW_BONES, L"Show bones");
-    CheckMenuItem(view, ID_VIEW_SHOW_BONES, MF_BYCOMMAND | (gOpenGlShowBones ? MF_CHECKED : MF_UNCHECKED));
-    AppendMenuW(view, MF_STRING, ID_VIEW_SHOW_BOUNDS, L"Show bounds");
-    CheckMenuItem(view, ID_VIEW_SHOW_BOUNDS, MF_BYCOMMAND | (gOpenGlShowBounds ? MF_CHECKED : MF_UNCHECKED));
-    AppendMenuW(view, MF_STRING, ID_VIEW_SHOW_VIEWCUBE, L"Show viewport cube");
-    CheckMenuItem(view, ID_VIEW_SHOW_VIEWCUBE, MF_BYCOMMAND | (gOpenGlShowViewCube ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuRadioItem(gOpenGlMenu, ID_VIEW_RENDER_STORIES, ID_VIEW_RENDER_WIREFRAME, checkedRender, MF_BYCOMMAND);
+    AppendMenuW(gOpenGlMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(gOpenGlMenu, MF_STRING, ID_VIEW_SHOW_GRID, L"Show grid");
+    CheckMenuItem(gOpenGlMenu, ID_VIEW_SHOW_GRID, MF_BYCOMMAND | (gOpenGlShowGrid ? MF_CHECKED : MF_UNCHECKED));
+    AppendMenuW(gOpenGlMenu, MF_STRING, ID_VIEW_SHOW_BONES, L"Show bones");
+    CheckMenuItem(gOpenGlMenu, ID_VIEW_SHOW_BONES, MF_BYCOMMAND | (gOpenGlShowBones ? MF_CHECKED : MF_UNCHECKED));
+    AppendMenuW(gOpenGlMenu, MF_STRING, ID_VIEW_SHOW_BOUNDS, L"Show bounds");
+    CheckMenuItem(gOpenGlMenu, ID_VIEW_SHOW_BOUNDS, MF_BYCOMMAND | (gOpenGlShowBounds ? MF_CHECKED : MF_UNCHECKED));
+    AppendMenuW(gOpenGlMenu, MF_STRING, ID_VIEW_SHOW_VIEWCUBE, L"Show viewport cube");
+    CheckMenuItem(gOpenGlMenu, ID_VIEW_SHOW_VIEWCUBE, MF_BYCOMMAND | (gOpenGlShowViewCube ? MF_CHECKED : MF_UNCHECKED));
+    AppendMenuW(view, MF_POPUP, reinterpret_cast<UINT_PTR>(gOpenGlMenu), L"OpenGL preview");
 
-    HMENU sky = CreatePopupMenu();
+    gSkyMenu = CreatePopupMenu();
+    HMENU sky = gSkyMenu;
     AppendMenuW(sky, MF_STRING, ID_VIEW_SHOW_SKY, L"Show Stories sky");
     CheckMenuItem(sky, ID_VIEW_SHOW_SKY, MF_BYCOMMAND | (gStoriesSky.isEnabled() ? MF_CHECKED : MF_UNCHECKED));
     AppendMenuW(sky, MF_SEPARATOR, 0, nullptr);
@@ -10118,19 +10457,35 @@ static void createMenuBar(HWND hwnd) {
     CheckMenuRadioItem(sky, ID_VIEW_SKY_WEATHER_SUNNY, ID_VIEW_SKY_WEATHER_FOGGY,
                        ID_VIEW_SKY_WEATHER_SUNNY, MF_BYCOMMAND);
     AppendMenuW(view, MF_POPUP, reinterpret_cast<UINT_PTR>(sky), L"Stories sky");
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(view), L"View");
+    AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
+    gBackgroundMenu = CreatePopupMenu();
+    AppendMenuW(gBackgroundMenu, MF_STRING, ID_VIEW_BACKGROUND_LIGHT, L"Light");
+    AppendMenuW(gBackgroundMenu, MF_STRING, ID_VIEW_BACKGROUND_DARK, L"Dark");
+    CheckMenuRadioItem(gBackgroundMenu, ID_VIEW_BACKGROUND_LIGHT, ID_VIEW_BACKGROUND_DARK,
+                       gEyeFriendlyPaneBackground ? ID_VIEW_BACKGROUND_DARK : ID_VIEW_BACKGROUND_LIGHT,
+                       MF_BYCOMMAND);
+    AppendMenuW(view, MF_POPUP, reinterpret_cast<UINT_PTR>(gBackgroundMenu), L"Background");
+    AppendMenuW(gMainMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(view), L"View");
 
-    HMENU help = CreatePopupMenu();
-    AppendMenuW(help, MF_STRING, ID_HELP_ABOUT, L"About Storyland...");
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(help), L"Help");
-
-    SetMenu(hwnd, menu);
+    gHelpMenu = CreatePopupMenu();
+    AppendMenuW(gHelpMenu, MF_STRING, ID_HELP_ABOUT, L"About Storyland...");
+    AppendMenuW(gHelpMenu, MF_STRING, ID_HELP_WIKI, L"Wiki");
+    AppendMenuW(gMainMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(gHelpMenu), L"Help");
 }
 
 static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE: {
         createMenuBar(hwnd);
+        WNDCLASSW menuStripClass{};
+        menuStripClass.lpfnWndProc = storylandMenuStripProc;
+        menuStripClass.hInstance = gInstance;
+        menuStripClass.lpszClassName = L"StorylandMenuStripClass";
+        menuStripClass.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
+        RegisterClassW(&menuStripClass);
+        gMenuStrip = CreateWindowExW(0, menuStripClass.lpszClassName, nullptr,
+            WS_CHILD | WS_VISIBLE, 0, 0, 100, 28, hwnd,
+            reinterpret_cast<HMENU>(ID_MENU_STRIP), gInstance, nullptr);
         gTree = CreateWindowExW(WS_EX_CLIENTEDGE, WC_TREEVIEWW, nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP | TVS_HASLINES | TVS_LINESATROOT | TVS_HASBUTTONS | TVS_SHOWSELALWAYS | WS_VSCROLL | WS_HSCROLL, 0, 0, 100, 100, hwnd, reinterpret_cast<HMENU>(ID_TREE), gInstance, nullptr);
         WNDCLASSW previewClass = {};
         previewClass.lpfnWndProc = previewProc;
@@ -10143,6 +10498,7 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         initializeOpenGlPreview(gPreview);
         gDetails = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", nullptr, WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, 0, 0, 100, 100, hwnd, reinterpret_cast<HMENU>(ID_DETAILS), gInstance, nullptr);
         gStatus = CreateWindowExW(0, STATUSCLASSNAMEW, nullptr, WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(ID_STATUS), gInstance, nullptr);
+        applyStorylandPaneBackground(hwnd);
         gStoriesSkyLastTick = GetTickCount();
         SetTimer(hwnd, 2, 33, nullptr);
         setStatus(L"Open .chk/.xtx/.tex textures, .mdl/.wbl models, .anim files, or GAME.DTZ");
@@ -10151,6 +10507,46 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
     case WM_SIZE:
         layoutChildren(hwnd);
         return 0;
+
+    case WM_ERASEBKGND: {
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        HBRUSH brush = CreateSolidBrush(storylandFrameBackgroundColor());
+        FillRect(reinterpret_cast<HDC>(wParam), &client, brush);
+        DeleteObject(brush);
+        return 1;
+    }
+
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORSTATIC:
+        if (reinterpret_cast<HWND>(lParam) == gDetails) {
+            HDC dc = reinterpret_cast<HDC>(wParam);
+            SetTextColor(dc, storylandPaneTextColor());
+            SetBkColor(dc, storylandPaneBackgroundColor());
+            return reinterpret_cast<LRESULT>(gPaneBackgroundBrush);
+        }
+        break;
+
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT* draw = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
+        if (draw && draw->CtlID == ID_STATUS) {
+            HBRUSH brush = CreateSolidBrush(gEyeFriendlyPaneBackground
+                ? RGB(25, 26, 31) : GetSysColor(COLOR_BTNFACE));
+            FillRect(draw->hDC, &draw->rcItem, brush);
+            DeleteObject(brush);
+            SetBkMode(draw->hDC, TRANSPARENT);
+            SetTextColor(draw->hDC, storylandPaneTextColor());
+            HFONT font = reinterpret_cast<HFONT>(SendMessageW(gStatus, WM_GETFONT, 0, 0));
+            HGDIOBJ oldFont = font ? SelectObject(draw->hDC, font) : nullptr;
+            RECT textRect = draw->rcItem;
+            textRect.left += 4;
+            DrawTextW(draw->hDC, gStatusText.c_str(), int(gStatusText.size()), &textRect,
+                DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+            if (oldFont) SelectObject(draw->hDC, oldFont);
+            return TRUE;
+        }
+        break;
+    }
 
     case WM_TIMER:
         if (wParam == 1 && advanceAnimationPlaybackFrame()) {
@@ -10179,8 +10575,27 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         applyStorylandTitleTint(gTitleTint);
         return 0;
 
+    case WM_SYSCHAR:
+        switch (towlower(wchar_t(wParam))) {
+        case L'f': openStorylandTopMenu(gMenuStrip, 0); return 0;
+        case L'v': openStorylandTopMenu(gMenuStrip, 1); return 0;
+        case L'h': openStorylandTopMenu(gMenuStrip, 2); return 0;
+        default: break;
+        }
+        break;
+
     case WM_COMMAND: {
-        switch (LOWORD(wParam)) {
+        const UINT commandId = LOWORD(wParam);
+        if (commandId >= ID_FILE_RECENT_BASE &&
+            commandId < ID_FILE_RECENT_BASE + STORYLAND_MAX_RECENT_FILES) {
+            const size_t recentIndex = size_t(commandId - ID_FILE_RECENT_BASE);
+            if (recentIndex < gRecentFiles.size()) {
+                const std::wstring recentPath = gRecentFiles[recentIndex];
+                openStorylandFile(recentPath);
+            }
+            return 0;
+        }
+        switch (commandId) {
         case ID_FILE_OPEN: {
             std::wstring path = openFileDialog(L"Storyland files\0*.dtz;*.bin;*.img;*.lvz;*.area;*.wbl;*.mdl;*.dff;*.anim;*.chk;*.xtx;*.tex\0All files\0*.*\0");
             openStorylandFile(path);
@@ -10190,6 +10605,14 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             if (gMode == StorylandMode::ArchiveFile && gSelectedKind == StorylandTreeKind::ArchiveEntry && gSelectedIndex >= 0) openSelectedArchiveEntry();
             else if (gMode == StorylandMode::DtzArchive && gSelectedKind == StorylandTreeKind::DtzDirEntry && gSelectedIndex >= 0) openSelectedDtzDirEntryStandalone();
             else MessageBoxW(gMainWindow, L"Select an embedded archive entry or GAME.DTZ internal IMG entry first.", L"Storyland", MB_ICONINFORMATION);
+            break;
+        case ID_FILE_RECENT_CLEAR:
+            gRecentFiles.clear();
+            saveRecentFiles();
+            rebuildRecentMenu();
+            break;
+        case ID_FILE_QUIT:
+            SendMessageW(hwnd, WM_CLOSE, 0, 0);
             break;
         case ID_FILE_SAVE_AS: saveCurrentAs(); break;
         case ID_FILE_EXPORT_LOG: exportCurrentLog(); break;
@@ -10205,67 +10628,83 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         case ID_ARCHIVE_CHANGE_SELECTED_MESH_RESOURCE_ID: changeSelectedMeshResourceId(); break;
         case ID_ARCHIVE_EXPORT_LVZ_IMG_PAIR: exportLvzImgPair(); break;
         case ID_ARCHIVE_OVERWRITE_LVZ_IMG_PAIR: overwriteCurrentLvzImgPair(); break;
+        case ID_VIEW_BACKGROUND_LIGHT:
+            gEyeFriendlyPaneBackground = false;
+            CheckMenuRadioItem(gBackgroundMenu, ID_VIEW_BACKGROUND_LIGHT, ID_VIEW_BACKGROUND_DARK,
+                               ID_VIEW_BACKGROUND_LIGHT, MF_BYCOMMAND);
+            applyStorylandPaneBackground(hwnd);
+            applyStorylandTitleTint(gTitleTint);
+            setStatus(gStatusText);
+            break;
+        case ID_VIEW_BACKGROUND_DARK:
+            gEyeFriendlyPaneBackground = true;
+            CheckMenuRadioItem(gBackgroundMenu, ID_VIEW_BACKGROUND_LIGHT, ID_VIEW_BACKGROUND_DARK,
+                               ID_VIEW_BACKGROUND_DARK, MF_BYCOMMAND);
+            applyStorylandPaneBackground(hwnd);
+            applyStorylandTitleTint(gTitleTint);
+            setStatus(gStatusText);
+            break;
         case ID_VIEW_FLIP_TEXTURE_PREVIEW_V:
             gTexturePreviewFlipV = !gTexturePreviewFlipV;
-            CheckMenuItem(GetMenu(hwnd), ID_VIEW_FLIP_TEXTURE_PREVIEW_V, MF_BYCOMMAND | (gTexturePreviewFlipV ? MF_CHECKED : MF_UNCHECKED));
+            CheckMenuItem(gTexturePreviewMenu, ID_VIEW_FLIP_TEXTURE_PREVIEW_V, MF_BYCOMMAND | (gTexturePreviewFlipV ? MF_CHECKED : MF_UNCHECKED));
             InvalidateRect(gPreview, nullptr, FALSE);
             break;
         case ID_VIEW_FLIP_MODEL_TEXTURE_V:
             gModelFlipTextureV = !gModelFlipTextureV;
-            CheckMenuItem(GetMenu(hwnd), ID_VIEW_FLIP_MODEL_TEXTURE_V, MF_BYCOMMAND | (gModelFlipTextureV ? MF_CHECKED : MF_UNCHECKED));
+            CheckMenuItem(gTexturePreviewMenu, ID_VIEW_FLIP_MODEL_TEXTURE_V, MF_BYCOMMAND | (gModelFlipTextureV ? MF_CHECKED : MF_UNCHECKED));
             InvalidateRect(gPreview, nullptr, FALSE);
             break;
         case ID_VIEW_RENDER_STORIES:
             setOpenGlRenderMode(StorylandOpenGlRenderMode::Stories);
-            CheckMenuRadioItem(GetMenu(hwnd), ID_VIEW_RENDER_STORIES, ID_VIEW_RENDER_WIREFRAME, ID_VIEW_RENDER_STORIES, MF_BYCOMMAND);
+            CheckMenuRadioItem(gOpenGlMenu, ID_VIEW_RENDER_STORIES, ID_VIEW_RENDER_WIREFRAME, ID_VIEW_RENDER_STORIES, MF_BYCOMMAND);
             break;
         case ID_VIEW_RENDER_TEXTURED:
             setOpenGlRenderMode(StorylandOpenGlRenderMode::Textured);
-            CheckMenuRadioItem(GetMenu(hwnd), ID_VIEW_RENDER_STORIES, ID_VIEW_RENDER_WIREFRAME, ID_VIEW_RENDER_TEXTURED, MF_BYCOMMAND);
+            CheckMenuRadioItem(gOpenGlMenu, ID_VIEW_RENDER_STORIES, ID_VIEW_RENDER_WIREFRAME, ID_VIEW_RENDER_TEXTURED, MF_BYCOMMAND);
             break;
         case ID_VIEW_RENDER_SOLID:
             setOpenGlRenderMode(StorylandOpenGlRenderMode::Solid);
-            CheckMenuRadioItem(GetMenu(hwnd), ID_VIEW_RENDER_STORIES, ID_VIEW_RENDER_WIREFRAME, ID_VIEW_RENDER_SOLID, MF_BYCOMMAND);
+            CheckMenuRadioItem(gOpenGlMenu, ID_VIEW_RENDER_STORIES, ID_VIEW_RENDER_WIREFRAME, ID_VIEW_RENDER_SOLID, MF_BYCOMMAND);
             break;
         case ID_VIEW_RENDER_WIREFRAME:
             setOpenGlRenderMode(StorylandOpenGlRenderMode::Wireframe);
-            CheckMenuRadioItem(GetMenu(hwnd), ID_VIEW_RENDER_STORIES, ID_VIEW_RENDER_WIREFRAME, ID_VIEW_RENDER_WIREFRAME, MF_BYCOMMAND);
+            CheckMenuRadioItem(gOpenGlMenu, ID_VIEW_RENDER_STORIES, ID_VIEW_RENDER_WIREFRAME, ID_VIEW_RENDER_WIREFRAME, MF_BYCOMMAND);
             break;
         case ID_VIEW_SHOW_GRID:
             gOpenGlShowGrid = !gOpenGlShowGrid;
-            CheckMenuItem(GetMenu(hwnd), ID_VIEW_SHOW_GRID, MF_BYCOMMAND | (gOpenGlShowGrid ? MF_CHECKED : MF_UNCHECKED));
+            CheckMenuItem(gOpenGlMenu, ID_VIEW_SHOW_GRID, MF_BYCOMMAND | (gOpenGlShowGrid ? MF_CHECKED : MF_UNCHECKED));
             InvalidateRect(gPreview, nullptr, FALSE);
             break;
         case ID_VIEW_SHOW_BONES:
             gOpenGlShowBones = !gOpenGlShowBones;
-            CheckMenuItem(GetMenu(hwnd), ID_VIEW_SHOW_BONES, MF_BYCOMMAND | (gOpenGlShowBones ? MF_CHECKED : MF_UNCHECKED));
+            CheckMenuItem(gOpenGlMenu, ID_VIEW_SHOW_BONES, MF_BYCOMMAND | (gOpenGlShowBones ? MF_CHECKED : MF_UNCHECKED));
             InvalidateRect(gPreview, nullptr, FALSE);
             break;
         case ID_VIEW_SHOW_BOUNDS:
             gOpenGlShowBounds = !gOpenGlShowBounds;
-            CheckMenuItem(GetMenu(hwnd), ID_VIEW_SHOW_BOUNDS, MF_BYCOMMAND | (gOpenGlShowBounds ? MF_CHECKED : MF_UNCHECKED));
+            CheckMenuItem(gOpenGlMenu, ID_VIEW_SHOW_BOUNDS, MF_BYCOMMAND | (gOpenGlShowBounds ? MF_CHECKED : MF_UNCHECKED));
             InvalidateRect(gPreview, nullptr, FALSE);
             break;
         case ID_VIEW_SHOW_VIEWCUBE:
             gOpenGlShowViewCube = !gOpenGlShowViewCube;
-            CheckMenuItem(GetMenu(hwnd), ID_VIEW_SHOW_VIEWCUBE, MF_BYCOMMAND | (gOpenGlShowViewCube ? MF_CHECKED : MF_UNCHECKED));
+            CheckMenuItem(gOpenGlMenu, ID_VIEW_SHOW_VIEWCUBE, MF_BYCOMMAND | (gOpenGlShowViewCube ? MF_CHECKED : MF_UNCHECKED));
             InvalidateRect(gPreview, nullptr, FALSE);
             break;
         case ID_VIEW_SHOW_SKY:
             gStoriesSky.setEnabled(!gStoriesSky.isEnabled());
-            CheckMenuItem(GetMenu(hwnd), ID_VIEW_SHOW_SKY, MF_BYCOMMAND |
+            CheckMenuItem(gSkyMenu, ID_VIEW_SHOW_SKY, MF_BYCOMMAND |
                           (gStoriesSky.isEnabled() ? MF_CHECKED : MF_UNCHECKED));
             InvalidateRect(gPreview, nullptr, FALSE);
             break;
         case ID_VIEW_SKY_LCS:
             gStoriesSky.setGame(StorylandSkyGame::Lcs);
-            CheckMenuRadioItem(GetMenu(hwnd), ID_VIEW_SKY_LCS, ID_VIEW_SKY_VCS,
+            CheckMenuRadioItem(gSkyMenu, ID_VIEW_SKY_LCS, ID_VIEW_SKY_VCS,
                                ID_VIEW_SKY_LCS, MF_BYCOMMAND);
             InvalidateRect(gPreview, nullptr, FALSE);
             break;
         case ID_VIEW_SKY_VCS:
             gStoriesSky.setGame(StorylandSkyGame::Vcs);
-            CheckMenuRadioItem(GetMenu(hwnd), ID_VIEW_SKY_LCS, ID_VIEW_SKY_VCS,
+            CheckMenuRadioItem(gSkyMenu, ID_VIEW_SKY_LCS, ID_VIEW_SKY_VCS,
                                ID_VIEW_SKY_VCS, MF_BYCOMMAND);
             InvalidateRect(gPreview, nullptr, FALSE);
             break;
@@ -10287,25 +10726,25 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             break;
         case ID_VIEW_SKY_WEATHER_SUNNY:
             gStoriesSky.setWeather(StorylandSkyWeather::Sunny);
-            CheckMenuRadioItem(GetMenu(hwnd), ID_VIEW_SKY_WEATHER_SUNNY,
+            CheckMenuRadioItem(gSkyMenu, ID_VIEW_SKY_WEATHER_SUNNY,
                                ID_VIEW_SKY_WEATHER_FOGGY, ID_VIEW_SKY_WEATHER_SUNNY, MF_BYCOMMAND);
             InvalidateRect(gPreview, nullptr, FALSE);
             break;
         case ID_VIEW_SKY_WEATHER_CLOUDY:
             gStoriesSky.setWeather(StorylandSkyWeather::Cloudy);
-            CheckMenuRadioItem(GetMenu(hwnd), ID_VIEW_SKY_WEATHER_SUNNY,
+            CheckMenuRadioItem(gSkyMenu, ID_VIEW_SKY_WEATHER_SUNNY,
                                ID_VIEW_SKY_WEATHER_FOGGY, ID_VIEW_SKY_WEATHER_CLOUDY, MF_BYCOMMAND);
             InvalidateRect(gPreview, nullptr, FALSE);
             break;
         case ID_VIEW_SKY_WEATHER_RAINY:
             gStoriesSky.setWeather(StorylandSkyWeather::Rainy);
-            CheckMenuRadioItem(GetMenu(hwnd), ID_VIEW_SKY_WEATHER_SUNNY,
+            CheckMenuRadioItem(gSkyMenu, ID_VIEW_SKY_WEATHER_SUNNY,
                                ID_VIEW_SKY_WEATHER_FOGGY, ID_VIEW_SKY_WEATHER_RAINY, MF_BYCOMMAND);
             InvalidateRect(gPreview, nullptr, FALSE);
             break;
         case ID_VIEW_SKY_WEATHER_FOGGY:
             gStoriesSky.setWeather(StorylandSkyWeather::Foggy);
-            CheckMenuRadioItem(GetMenu(hwnd), ID_VIEW_SKY_WEATHER_SUNNY,
+            CheckMenuRadioItem(gSkyMenu, ID_VIEW_SKY_WEATHER_SUNNY,
                                ID_VIEW_SKY_WEATHER_FOGGY, ID_VIEW_SKY_WEATHER_FOGGY, MF_BYCOMMAND);
             InvalidateRect(gPreview, nullptr, FALSE);
             break;
@@ -10313,6 +10752,9 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         case ID_DTZ_PATCH_DATA_FIELD: patchSelectedDtzDataField(); break;
         case ID_DTZ_PATCH_PLR_23: patchPlrPair23(); break;
         case ID_HELP_ABOUT: showAboutDialog(); break;
+        case ID_HELP_WIKI:
+            ShellExecuteW(hwnd, L"open", L"https://github.com/spicybung/BLeeds/wiki", nullptr, nullptr, SW_SHOWNORMAL);
+            break;
         }
         return 0;
     }
@@ -10340,6 +10782,26 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         KillTimer(hwnd, 2);
         deleteTextureBitmap();
         destroyOpenGlPreview();
+        if (gPaneBackgroundBrush) {
+            DeleteObject(gPaneBackgroundBrush);
+            gPaneBackgroundBrush = nullptr;
+        }
+        if (gMenuBackgroundBrush) {
+            DeleteObject(gMenuBackgroundBrush);
+            gMenuBackgroundBrush = nullptr;
+        }
+        if (gMainMenu) {
+            DestroyMenu(gMainMenu);
+            gMainMenu = nullptr;
+            gFileMenu = nullptr;
+            gViewMenu = nullptr;
+            gSkyMenu = nullptr;
+            gHelpMenu = nullptr;
+            gTexturePreviewMenu = nullptr;
+            gRecentMenu = nullptr;
+            gOpenGlMenu = nullptr;
+            gBackgroundMenu = nullptr;
+        }
         PostQuitMessage(0);
         return 0;
     }
@@ -10370,6 +10832,26 @@ static std::vector<StorylandSplashDrop> gSplashDrops;
 static int gSplashTick = 0;
 static int gSplashCell = 16;
 static bool gSplashSkipRequested = false;
+
+static float splashPaletteProgress(float phase = 0.0f) {
+    float value = std::clamp((float(gSplashTick) - 5.0f) / 40.0f + phase, 0.0f, 1.0f);
+    return value * value * (3.0f - 2.0f * value);
+}
+
+static COLORREF splashBlend(COLORREF blue, COLORREF pink, float amount) {
+    auto channel = [&](BYTE a, BYTE b) {
+        return BYTE(std::clamp(int(std::lround(float(a) + (float(b) - float(a)) * amount)), 0, 255));
+    };
+    return RGB(channel(GetRValue(blue), GetRValue(pink)),
+               channel(GetGValue(blue), GetGValue(pink)),
+               channel(GetBValue(blue), GetBValue(pink)));
+}
+
+static COLORREF splashScale(COLORREF colour, float scale) {
+    return RGB(BYTE(std::clamp(int(GetRValue(colour) * scale), 0, 255)),
+               BYTE(std::clamp(int(GetGValue(colour) * scale), 0, 255)),
+               BYTE(std::clamp(int(GetBValue(colour) * scale), 0, 255)));
+}
 
 static uint32_t splashHash(uint32_t value) {
     value ^= value >> 16;
@@ -10407,6 +10889,11 @@ static void drawSplashMatrixRain(HDC dc, const RECT& client) {
 
     for (size_t column = 0; column < gSplashDrops.size(); ++column) {
         const StorylandSplashDrop& drop = gSplashDrops[column];
+        const float columnPhase = gSplashDrops.size() > 1
+            ? (float(column) / float(gSplashDrops.size() - 1u) - 0.5f) * 0.34f : 0.0f;
+        const float palette = splashPaletteProgress(columnPhase);
+        const COLORREF bright = splashBlend(RGB(214, 238, 255), RGB(255, 211, 237), palette);
+        const COLORREF body = splashBlend(RGB(30, 132, 255), RGB(255, 116, 196), palette);
         int x = int(column) * gSplashCell;
         for (int trailIndex = drop.trail; trailIndex >= 0; --trailIndex) {
             int y = int(drop.headY) - trailIndex * gSplashCell;
@@ -10414,10 +10901,10 @@ static void drawSplashMatrixRain(HDC dc, const RECT& client) {
             uint32_t random = splashHash(drop.seed ^ uint32_t(gSplashTick * 37 - trailIndex * 101));
             wchar_t glyph = glyphs[random % glyphCount];
             if (trailIndex == 0) {
-                SetTextColor(dc, RGB(214, 238, 255));
+                SetTextColor(dc, bright);
             } else {
                 int strength = 28 + (drop.trail - trailIndex) * 155 / std::max(1, drop.trail);
-                SetTextColor(dc, RGB(8, 42 + strength / 3, 72 + strength));
+                SetTextColor(dc, splashScale(body, float(strength) / 210.0f));
             }
             TextOutW(dc, x, y, &glyph, 1);
         }
@@ -10459,13 +10946,16 @@ static void drawReignsStudiosLogo(HDC dc, const RECT& client) {
     HGDIOBJ oldFont = SelectObject(dc, logoFont);
     RECT logo{18, std::max(50, int(client.bottom) / 2 - 116), client.right - 18, client.bottom - 120};
     int reveal = std::clamp((gSplashTick - 5) * 19, 0, 255);
+    const float palette = splashPaletteProgress();
+    const COLORREF logoColour = splashBlend(RGB(48, 152, 255), RGB(255, 128, 204), palette);
+    const COLORREF logoShadow = splashBlend(RGB(0, 32, 96), RGB(78, 20, 88), palette);
 
     RECT shadow = logo;
     OffsetRect(&shadow, 2, 2);
-    SetTextColor(dc, RGB(0, reveal / 8, reveal / 3));
+    SetTextColor(dc, splashScale(logoShadow, float(reveal) / 255.0f));
     DrawTextW(dc, reignsStudiosBlockLogo(), -1, &shadow,
               DT_CENTER | DT_TOP | DT_NOPREFIX | DT_NOCLIP);
-    SetTextColor(dc, RGB(reveal / 5, reveal / 2, reveal));
+    SetTextColor(dc, splashScale(logoColour, float(reveal) / 255.0f));
     DrawTextW(dc, reignsStudiosBlockLogo(), -1, &logo,
               DT_CENTER | DT_TOP | DT_NOPREFIX | DT_NOCLIP);
 
@@ -10475,13 +10965,13 @@ static void drawReignsStudiosLogo(HDC dc, const RECT& client) {
         if (icon) DrawIconEx(dc, client.right / 2 - 122, lowerY + 15, icon, 46, 46, 0, nullptr, DI_NORMAL);
 
         SelectObject(dc, labelFont);
-        SetTextColor(dc, RGB(120, 194, 255));
+        SetTextColor(dc, splashBlend(RGB(120, 194, 255), RGB(255, 151, 214), palette));
         RECT presents{0, lowerY, client.right, lowerY + 26};
         DrawTextW(dc, L"REIGNS STUDIOS PRESENTS", -1, &presents,
                   DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 
         SelectObject(dc, storylandFont);
-        SetTextColor(dc, RGB(226, 241, 255));
+        SetTextColor(dc, splashBlend(RGB(226, 241, 255), RGB(255, 211, 235), palette));
         RECT storyland{0, lowerY + 24, client.right, client.bottom - 18};
         DrawTextW(dc, L"STORYLAND", -1, &storyland,
                   DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
@@ -10535,14 +11025,16 @@ static LRESULT CALLBACK storylandSplashProc(HWND hwnd, UINT message, WPARAM wPar
         HDC memoryDc = CreateCompatibleDC(dc);
         HBITMAP frame = CreateCompatibleBitmap(dc, width, height);
         HGDIOBJ oldBitmap = SelectObject(memoryDc, frame);
-        HBRUSH background = CreateSolidBrush(RGB(0, 4, 14));
+        const float palette = splashPaletteProgress();
+        HBRUSH background = CreateSolidBrush(splashBlend(RGB(0, 4, 14), RGB(12, 4, 22), palette));
         FillRect(memoryDc, &client, background);
         DeleteObject(background);
 
         drawSplashMatrixRain(memoryDc, client);
         drawReignsStudiosLogo(memoryDc, client);
 
-        HPEN border = CreatePen(PS_SOLID, 2, RGB(32, 112, 224));
+        HPEN border = CreatePen(PS_SOLID, 2,
+            splashBlend(RGB(32, 112, 224), RGB(255, 128, 204), palette));
         HGDIOBJ oldPen = SelectObject(memoryDc, border);
         HGDIOBJ oldBrush = SelectObject(memoryDc, GetStockObject(NULL_BRUSH));
         RoundRect(memoryDc, 1, 1, client.right - 1, client.bottom - 1, 24, 24);
@@ -10662,10 +11154,13 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR commandLine, int sh
     INITCOMMONCONTROLSEX icc = { sizeof(INITCOMMONCONTROLSEX), ICC_BAR_CLASSES | ICC_STANDARD_CLASSES | ICC_TREEVIEW_CLASSES };
     InitCommonControlsEx(&icc);
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    loadRecentFiles();
 
     ULONGLONG splashStartedAt = 0;
     HWND splash = createStorylandSplash(hInstance, splashStartedAt);
     loadEmbeddedVcsTimecycle();
+    // Establish the default Dark menu theme before Windows creates the menu bar.
+    applyStorylandNativeMenuTheme(nullptr);
 
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(WNDCLASSEXW);
