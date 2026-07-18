@@ -8,6 +8,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    add_compile_options(/utf-8)
 endif()
 
 if(WIN32 AND DEFINED VCPKG_TARGET_TRIPLET AND NOT VCPKG_TARGET_TRIPLET MATCHES "-static$")
@@ -52,6 +53,10 @@ add_executable(Storyland WIN32
     src/storyland_wbl.cpp
     src/storyland_sky.cpp
     src/storyland_atomic_io.h
+    src/storyland_dma_validator.cpp
+    src/storyland_dma_validator.h
+    src/storyland_model_validator.cpp
+    src/storyland_model_validator.h
     "${STORYLAND_RESOURCE_FILE}"
 )
 

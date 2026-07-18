@@ -31,6 +31,8 @@
 #include "storyland_wbl.h"
 #include "storyland_archive.h"
 #include "storyland_atomic_io.h"
+#include "storyland_dma_validator.h"
+#include "storyland_model_validator.h"
 #include "storyland_anim.h"
 #include "storyland_sky.h"
 #include "wic_image.h"
@@ -153,6 +155,7 @@ typedef void (APIENTRY *PFNGLACTIVETEXTUREPROC)(GLenum texture);
 #define ID_VIEW_SKY_WEATHER_RAINY 1049
 #define ID_VIEW_SKY_WEATHER_FOGGY 1050
 #define ID_FILE_EXPORT_SELECTED_RESOURCE 1051
+#define ID_FILE_DMA_TLB_PREFLIGHT 1052
 #define ID_TREE 2001
 #define ID_DETAILS 2002
 #define ID_PREVIEW 2003
@@ -8132,6 +8135,82 @@ static void exportSelectedResourceBytes() {
     setStatus(L"Exported and verified selected resource: " + outputPath + L" (" + std::to_wstring(bytes.size()) + L" bytes)");
 }
 
+static void runSelectedDmaTlbPreflight() {
+    std::vector<uint8_t> bytes;
+    std::string label;
+    std::string error;
+    bool loadedModel = false;
+
+    if (gMode == StorylandMode::ModelFile && !gModelFile.sourcePath().empty()) {
+        loadedModel = true;
+        label = "loaded model: " + narrow(gModelFile.sourcePath());
+        if (!readBinaryFileForUi(gModelFile.sourcePath(), bytes, error)) {
+            MessageBoxW(gMainWindow, widen(error).c_str(), L"DMA/TLB preflight failed", MB_ICONERROR);
+            return;
+        }
+    } else if (gMode == StorylandMode::ArchiveFile &&
+               gSelectedKind == StorylandTreeKind::ArchiveMeshResource && gSelectedIndex >= 0 &&
+               size_t(gSelectedIndex) < gArchiveMeshResourceIds.size()) {
+        const uint32_t resourceId = gArchiveMeshResourceIds[size_t(gSelectedIndex)];
+        label = "LVZ/IMG mesh resource " + std::to_string(resourceId);
+        if (!gArchiveBrowser.extractWorldMeshResourceBytes(resourceId, bytes, error)) {
+            MessageBoxW(gMainWindow, widen(error).c_str(), L"DMA/TLB preflight failed", MB_ICONERROR);
+            return;
+        }
+    } else if (gMode == StorylandMode::ArchiveFile &&
+               gSelectedKind == StorylandTreeKind::ArchiveEntry && gSelectedIndex >= 0 &&
+               size_t(gSelectedIndex) < gArchiveBrowser.entries().size()) {
+        label = "LVZ/IMG entry: " + gArchiveBrowser.entries()[size_t(gSelectedIndex)].name;
+        if (!gArchiveBrowser.extractEntryBytes(size_t(gSelectedIndex), bytes, error)) {
+            MessageBoxW(gMainWindow, widen(error).c_str(), L"DMA/TLB preflight failed", MB_ICONERROR);
+            return;
+        }
+    } else if (gMode == StorylandMode::DtzArchive &&
+               gSelectedKind == StorylandTreeKind::DtzDirEntry && gSelectedIndex >= 0 &&
+               size_t(gSelectedIndex) < gDtzArchive.dirEntries().size()) {
+        label = "GAME.DTZ IMG stream: " + gDtzArchive.dirEntries()[size_t(gSelectedIndex)].name;
+        if (!gDtzArchive.extractDirEntryBytes(size_t(gSelectedIndex), bytes, error)) {
+            MessageBoxW(gMainWindow, widen(error).c_str(), L"DMA/TLB preflight failed", MB_ICONERROR);
+            return;
+        }
+    } else {
+        MessageBoxW(
+            gMainWindow,
+            L"Open an MDL, or select an LVZ/IMG entry, placed mesh resource, or GAME.DTZ internal model stream first.",
+            L"PS2 Resource Preflight",
+            MB_ICONINFORMATION
+        );
+        return;
+    }
+
+    const StorylandDmaTlbReport dmaReport = storylandValidatePs2DmaTlb(bytes, label);
+    bool overallSafe = dmaReport.safe();
+    std::string details;
+    if (loadedModel) {
+        const StorylandModelIntegrityReport modelReport = storylandValidateModelIntegrity(gModelFile, bytes, label);
+        overallSafe = overallSafe && modelReport.safe();
+        details = modelReport.text() + "\r\n" + dmaReport.text();
+    } else {
+        details = dmaReport.text();
+    }
+    setDetails(widen(details));
+    setStatus(overallSafe
+        ? (dmaReport.dmaTags == 0
+            ? L"Model structure passed; DMA result is limited until its GAME.DTZ/IMG allocation is checked."
+            : L"Model structure and file-resident DMA/TLB preflight passed.")
+        : L"Preflight failed; inspect the structural and DMA/TLB issues in the details panel.");
+    if (!overallSafe) {
+        MessageBoxW(
+            gMainWindow,
+            loadedModel
+                ? L"The model has structural/skinning corruption or a definite DMA/TLB hazard. See the details panel for the exact reason."
+                : L"Definite DMA/TLB hazards were found. The resource was not modified. See the details panel for exact file offsets and addresses.",
+            L"Storyland Preflight Failed",
+            MB_ICONERROR
+        );
+    }
+}
+
 
 static void exportLvzImgPair() {
     if (gMode != StorylandMode::ArchiveFile || !gArchiveBrowser.hasLvzContext() || !gArchiveBrowser.hasImgContext()) {
@@ -8359,7 +8438,7 @@ static void openCompanionImgForCurrentDtz() {
 static void showAboutDialog() {
     MessageBoxW(
         gMainWindow,
-        L"Storyland\r\n\r\nauthor: spicybung\r\nhttps://github.com/spicybung\r\n\r\nAn analyzer, editor, and viewer for Grand Theft Auto Stories file formats.",
+        L"Storyland\r\n\r\nauthor: spicybung\r\nhttps://github.com/spicybung/BLeeds\r\nReigns Studios\r\n\r\nAn analyzer, editor, and viewer for Grand Theft Auto Stories file formats.\r\n\r\nhttps://github.com/spicybung/BLeeds/wiki",
         L"About Storyland",
         MB_OK | MB_ICONINFORMATION
     );
@@ -9081,24 +9160,34 @@ static void drawOpenGlViewCube(HWND hwnd, int width, int height) {
     RECT cubeRc = viewCubeRect(hwnd);
     int cubeW = std::max<int>(1, int(cubeRc.right - cubeRc.left));
     int cubeH = std::max<int>(1, int(cubeRc.bottom - cubeRc.top));
-    int cubeBottom = height - cubeRc.bottom;
+    float cubeCenterX = float(cubeRc.left + cubeRc.right) * 0.5f;
+    float cubeCenterY = float(height) - float(cubeRc.top + cubeRc.bottom) * 0.5f;
+    float cubeScale = float(std::min(cubeW, cubeH)) * 0.78f;
 
     stopStoriesShaderProgram();
     setupFixedPipelineStoriesLighting(false);
 
-    glViewport(cubeRc.left, cubeBottom, cubeW, cubeH);
-    glEnable(GL_SCISSOR_TEST);
-    glScissor(cubeRc.left, cubeBottom, cubeW, cubeH);
-    glClearColor(0.145f, 0.150f, 0.158f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    // Draw directly into the full scene framebuffer.  Clearing depth cannot
+    // alter a single colour pixel, so the orientation cube has no backing tile
+    // on any driver/pixel format.
+    glViewport(0, 0, width, height);
     glDisable(GL_SCISSOR_TEST);
+    glDepthMask(GL_TRUE);
+    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+    glClear(GL_DEPTH_BUFFER_BIT);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
-    glOrtho(-1.15, 1.15, -1.15, 1.15, -4.0, 4.0);
+    glOrtho(0.0, double(width), 0.0, double(height), -4.0, 4.0);
 
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
+    glTranslatef(cubeCenterX, cubeCenterY, 0.0f);
+    // X/Y are expressed in overlay pixels; Z must remain in the small
+    // orthographic depth range or the cube faces are clipped into a hollow,
+    // distorted outline.
+    glScalef(cubeScale, cubeScale, 1.0f);
     glMultModelQuat(gModelViewRotation);
 
     glDisable(GL_TEXTURE_2D);
@@ -9137,7 +9226,6 @@ static void drawOpenGlViewCube(HWND hwnd, int width, int height) {
     glColor3f(0.25f, 0.52f, 1.0f); glVertex3f(0,0,0.95f);
     glEnd();
 
-    glViewport(0, 0, width, height);
 }
 
 static void drawOpenGlViewCubeLabels(HWND hwnd, HDC dc) {
@@ -9899,6 +9987,7 @@ static bool buildTreeContextMenu(HMENU menu) {
         if (gSelectedKind == StorylandTreeKind::DtzDirEntry) {
             hasItems = addContextMenuItem(menu, ID_FILE_OPEN_EMBEDDED, L"Open selected internal IMG entry standalone...") || hasItems;
             hasItems = addContextMenuItem(menu, ID_FILE_EXPORT_SELECTED_RESOURCE, L"Export selected internal IMG entry...") || hasItems;
+            hasItems = addContextMenuItem(menu, ID_FILE_DMA_TLB_PREFLIGHT, L"Run PS2 DMA/TLB preflight...") || hasItems;
             hasItems = addContextMenuItem(menu, ID_DTZ_REPLACE_SELECTED_ENTRY, L"Replace selected internal IMG entry from file...") || hasItems;
             addContextMenuSeparatorIfNeeded(menu, hasItems);
             hasItems = addContextMenuItem(menu, ID_DTZ_PATCH_SELECTED, L"Patch selected sector count...") || hasItems;
@@ -9911,14 +10000,18 @@ static bool buildTreeContextMenu(HMENU menu) {
         if (gSelectedKind == StorylandTreeKind::ArchiveEntry) {
             hasItems = addContextMenuItem(menu, ID_FILE_OPEN_EMBEDDED, L"Open selected embedded entry...") || hasItems;
             hasItems = addContextMenuItem(menu, ID_FILE_EXPORT_SELECTED_RESOURCE, L"Export selected LVZ+IMG entry...") || hasItems;
+            hasItems = addContextMenuItem(menu, ID_FILE_DMA_TLB_PREFLIGHT, L"Run PS2 DMA/TLB preflight...") || hasItems;
             addContextMenuSeparatorIfNeeded(menu, hasItems);
             hasItems = addContextMenuItem(menu, ID_ARCHIVE_REPLACE_SELECTED_RESOURCE, L"Replace selected LVZ+IMG resource from file...") || hasItems;
         } else if (gSelectedKind == StorylandTreeKind::ArchiveMeshResource) {
             hasItems = addContextMenuItem(menu, ID_FILE_EXPORT_SELECTED_RESOURCE, L"Export selected mesh resource...") || hasItems;
+            hasItems = addContextMenuItem(menu, ID_FILE_DMA_TLB_PREFLIGHT, L"Run PS2 DMA/TLB preflight...") || hasItems;
             hasItems = addContextMenuItem(menu, ID_ARCHIVE_REPLACE_SELECTED_RESOURCE, L"Replace selected mesh resource from file...") || hasItems;
             hasItems = addContextMenuItem(menu, ID_ARCHIVE_REPLACE_MESH_WITH_RESOURCE_ID, L"Clone selected mesh resource from Resource ID...") || hasItems;
             hasItems = addContextMenuItem(menu, ID_ARCHIVE_CHANGE_SELECTED_MESH_RESOURCE_ID, L"Change selected mesh resource ID...") || hasItems;
         }
+    } else if (gMode == StorylandMode::ModelFile) {
+        hasItems = addContextMenuItem(menu, ID_FILE_DMA_TLB_PREFLIGHT, L"Run MDL structure + PS2 DMA/TLB preflight...") || hasItems;
     } else if (gMode == StorylandMode::TextureArchive) {
         if (gSelectedKind == StorylandTreeKind::Texture && gSelectedIndex >= 0) {
             hasItems = addContextMenuItem(menu, ID_FILE_EXPORT_TEXTURE, L"Export selected texture PNG...") || hasItems;
@@ -9967,6 +10060,7 @@ static void createMenuBar(HWND hwnd) {
     AppendMenuW(file, MF_STRING, ID_FILE_SAVE_AS, L"Save As / Rebuild GAME.DTZ...");
     AppendMenuW(file, MF_STRING, ID_FILE_EXPORT_LOG, L"Export Log...");
     AppendMenuW(file, MF_STRING, ID_FILE_EXPORT_SELECTED_RESOURCE, L"Export Selected Resource...");
+    AppendMenuW(file, MF_STRING, ID_FILE_DMA_TLB_PREFLIGHT, L"Run PS2 Resource Preflight...");
     AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(file, MF_STRING, ID_ARCHIVE_EXPORT_LVZ_IMG_PAIR, L"Export/Rebuild LVZ+IMG Pair...");
     AppendMenuW(file, MF_STRING, ID_ARCHIVE_OVERWRITE_LVZ_IMG_PAIR, L"Overwrite Current LVZ+IMG Pair...");
@@ -10100,6 +10194,7 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         case ID_FILE_SAVE_AS: saveCurrentAs(); break;
         case ID_FILE_EXPORT_LOG: exportCurrentLog(); break;
         case ID_FILE_EXPORT_SELECTED_RESOURCE: exportSelectedResourceBytes(); break;
+        case ID_FILE_DMA_TLB_PREFLIGHT: runSelectedDmaTlbPreflight(); break;
         case ID_FILE_EXPORT_TEXTURE: exportSelectedTexture(); break;
         case ID_FILE_REPLACE_TEXTURE: replaceSelectedTexture(); break;
         case ID_FILE_RENAME_TEXTURE: renameSelectedTexture(); break;
@@ -10258,10 +10353,281 @@ static HICON loadStorylandIcon(HINSTANCE instance, int width, int height) {
         IMAGE_ICON,
         width,
         height,
-        LR_DEFAULTCOLOR
+        LR_DEFAULTCOLOR | LR_SHARED
     ));
     if (icon) return icon;
     return LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
+}
+
+struct StorylandSplashDrop {
+    float headY = 0.0f;
+    float speed = 7.0f;
+    int trail = 10;
+    uint32_t seed = 0;
+};
+
+static std::vector<StorylandSplashDrop> gSplashDrops;
+static int gSplashTick = 0;
+static int gSplashCell = 16;
+static bool gSplashSkipRequested = false;
+
+static uint32_t splashHash(uint32_t value) {
+    value ^= value >> 16;
+    value *= 0x7FEB352Du;
+    value ^= value >> 15;
+    value *= 0x846CA68Bu;
+    value ^= value >> 16;
+    return value;
+}
+
+static void resetSplashDrops(int width, int height) {
+    int columns = std::max(1, (width + gSplashCell - 1) / gSplashCell);
+    gSplashDrops.resize(size_t(columns));
+    for (int column = 0; column < columns; ++column) {
+        uint32_t random = splashHash(0x52454947u + uint32_t(column) * 0x9E3779B9u);
+        StorylandSplashDrop& drop = gSplashDrops[size_t(column)];
+        drop.seed = random;
+        drop.headY = -float(random % uint32_t(std::max(1, height + 320)));
+        drop.speed = 5.0f + float((random >> 9) % 9u);
+        drop.trail = 7 + int((random >> 17) % 15u);
+    }
+}
+
+static void drawSplashMatrixRain(HDC dc, const RECT& client) {
+    static const wchar_t glyphs[] =
+        L"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ<>[]{}+=*#:/\\|"
+        L"ｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅﾆﾇﾈﾉﾊﾋﾌﾍﾎﾏﾐﾑﾒﾓ";
+    constexpr size_t glyphCount = (sizeof(glyphs) / sizeof(glyphs[0])) - 1u;
+
+    HFONT rainFont = CreateFontW(-15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, NONANTIALIASED_QUALITY,
+        FIXED_PITCH | FF_MODERN, L"Consolas");
+    HGDIOBJ oldFont = SelectObject(dc, rainFont);
+    SetBkMode(dc, TRANSPARENT);
+
+    for (size_t column = 0; column < gSplashDrops.size(); ++column) {
+        const StorylandSplashDrop& drop = gSplashDrops[column];
+        int x = int(column) * gSplashCell;
+        for (int trailIndex = drop.trail; trailIndex >= 0; --trailIndex) {
+            int y = int(drop.headY) - trailIndex * gSplashCell;
+            if (y < -gSplashCell || y >= client.bottom) continue;
+            uint32_t random = splashHash(drop.seed ^ uint32_t(gSplashTick * 37 - trailIndex * 101));
+            wchar_t glyph = glyphs[random % glyphCount];
+            if (trailIndex == 0) {
+                SetTextColor(dc, RGB(214, 238, 255));
+            } else {
+                int strength = 28 + (drop.trail - trailIndex) * 155 / std::max(1, drop.trail);
+                SetTextColor(dc, RGB(8, 42 + strength / 3, 72 + strength));
+            }
+            TextOutW(dc, x, y, &glyph, 1);
+        }
+    }
+
+    SelectObject(dc, oldFont);
+    DeleteObject(rainFont);
+}
+
+static const wchar_t* reignsStudiosBlockLogo() {
+    return
+        L" ▄▄▄▄▄▄▄       ▄▄▄▄  ▄▄▄     ▄▄▄▄▄    ▄▄▄   ▄▄▄    ▄▄▄▄▄▄▄        ▄▄▄▄▄▄▄  ▄▄▄▄▄▄▄▄▄  ▄▄▄   ▄▄▄ ▄▄▄▄▄▄▄     ▄▄▄     ▄▄▄       ▄▄▄▄▄▄▄\r\n"
+        L"▐███▓▓▓▓▀▄  ▄██████▌▐███▌ ▄███████▌  ▐███▄ ▐███▌ ▄████████▌     ▄████████▌▐█████████▌▐███▌ ▐███▌▐████████▄ ▐███▌ ▄███████▄  ▄████████▌\r\n"
+        L"▐░░░▌ ▐░░▐ ▐░░░█▀   ▐░░░▌▐░░░█▀      ▐░░░░▌▐░░░▌▐░░░▌ ▐░░░▌    ▐░░░▌ ▐░░░▌   ▐░░░▌   ▐░░░▌ ▐░░░▌▐░░░▌ ▐░░░▌▐░░░▌▐░░░▌ ▐░░░▌▐░░░▌ ▐░░░▌\r\n"
+        L"▐▒▒▒▌  ▒▒▐ ▐▒▒▒▌    ▐▒▒▒▌▐▒▒▒▌       ▐▒▒▒▌▌▐▒▒▒▌▐▒▒▒▌ ▐▒▒▒▌    ▐▒▒▒▌ ▐▒▒▒▌   ▐▒▒▒▌   ▐▒▒▒▌ ▐▒▒▒▌▐▒▒▒▌ ▐▒▒▒▌▐▒▒▒▌▐▒▒▒▌ ▐▒▒▒▌▐▒▒▒▌ ▐▒▒▒▌\r\n"
+        L"▐▓▓▓▌ ▐▓▓▌ ▐▓▓▓▓▓▓  ▐▓▓▓▌▐▓▓▓▌██████▌▐▓▓▓▌▐▐▓▓▓▌▐▓▓▓▌  ▀▀▀     ▐▓▓▓▌  ▀▀▀    ▐▓▓▓▌   ▐▓▓▓▌ ▐▓▓▓▌▐▓▓▓▌ ▐▓▓▓▌▐▓▓▓▌▐▓▓▓▌ ▐▓▓▓▌▐▓▓▓▌  ▀▀▀\r\n"
+        L"▐███▌ ███  ▐████▀▀  ▐███▌▐███▌ ▐███▌ ▐███▌▐▌███▌ ▀███████▄      ▀███████▄    ▐███▌   ▐███▌ ▐███▌▐███▌ ▐███▌▐███▌▐███▌ ▐███▌ ▀███████▄\r\n"
+        L"▐░░░▌▐░░▌  ▐░░░▌    ▐░░░▌▐░░░▌ ▐░░░▌ ▐░░░▌ ▌░░░▌ ▄▄▄  ▐░░░▌     ▄▄▄  ▐░░░▌   ▐░░░▌   ▐░░░▌ ▐░░░▌▐░░░▌ ▐░░░▌▐░░░▌▐░░░▌ ▐░░░▌ ▄▄▄  ▐░░░▌\r\n"
+        L"▐▒▒▒▌▓▒█   ▐▒▒▒▌    ▐▒▒▒▌▐▒▒▒▌ ▐▒▒▒▌ ▐▒▒▒▌ ▐▒▒▒▌▐▒▒▒▌ ▐▒▒▒▌    ▐▒▒▒▌ ▐▒▒▒▌   ▐▒▒▒▌   ▐▒▒▒▌ ▐▒▒▒▌▐▒▒▒▌ ▐▒▒▒▌▐▒▒▒▌▐▒▒▒▌ ▐▒▒▒▌▐▒▒▒▌ ▐▒▒▒▌\r\n"
+        L"▐▓▓▓▌▐▓▓█▄ ▐▓▓▓▓▄▄▄ ▐▓▓▓▌▐▓▓▓▓▄▓▓▓▓▓▌▐▓▓▓▌ ▐▓▓▓▌▐▓▓▓▌ ▐▓▓▓▌    ▐▓▓▓▌ ▐▓▓▓▌   ▐▓▓▓▌    ▌▓▓▓▄▓▓▓▐ ▐▓▓▓▌ ▐▓▓▓▌▐▓▓▓▌▐▓▓▓▌ ▐▓▓▓▌▐▓▓▓▌ ▐▓▓▓▌\r\n"
+        L"▐███▌ ▀███▌ ▀▄█████▌▐███▌ ▀▄████████▌▐███▌ ▐███▌▐████████▀     ▐████████▀    ▐███▌    ▀▄█████▄▀ ▐████████▀ ▐███▌ ▀███████▀ ▐████████▀";
+}
+
+static void drawReignsStudiosLogo(HDC dc, const RECT& client) {
+    int width = client.right - client.left;
+    int logoWidth = width < 1100 ? 5 : 6;
+    int logoHeight = width < 1100 ? 10 : 12;
+    HFONT logoFont = CreateFontW(-logoHeight, logoWidth, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, NONANTIALIASED_QUALITY,
+        FIXED_PITCH | FF_MODERN, L"Consolas");
+    HFONT labelFont = CreateFontW(-18, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+    HFONT storylandFont = CreateFontW(-38, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+
+    SetBkMode(dc, TRANSPARENT);
+    HGDIOBJ oldFont = SelectObject(dc, logoFont);
+    RECT logo{18, std::max(50, int(client.bottom) / 2 - 116), client.right - 18, client.bottom - 120};
+    int reveal = std::clamp((gSplashTick - 5) * 19, 0, 255);
+
+    RECT shadow = logo;
+    OffsetRect(&shadow, 2, 2);
+    SetTextColor(dc, RGB(0, reveal / 8, reveal / 3));
+    DrawTextW(dc, reignsStudiosBlockLogo(), -1, &shadow,
+              DT_CENTER | DT_TOP | DT_NOPREFIX | DT_NOCLIP);
+    SetTextColor(dc, RGB(reveal / 5, reveal / 2, reveal));
+    DrawTextW(dc, reignsStudiosBlockLogo(), -1, &logo,
+              DT_CENTER | DT_TOP | DT_NOPREFIX | DT_NOCLIP);
+
+    if (gSplashTick >= 17) {
+        int lowerY = client.bottom - 103;
+        HICON icon = loadStorylandIcon(gInstance, 46, 46);
+        if (icon) DrawIconEx(dc, client.right / 2 - 122, lowerY + 15, icon, 46, 46, 0, nullptr, DI_NORMAL);
+
+        SelectObject(dc, labelFont);
+        SetTextColor(dc, RGB(120, 194, 255));
+        RECT presents{0, lowerY, client.right, lowerY + 26};
+        DrawTextW(dc, L"REIGNS STUDIOS PRESENTS", -1, &presents,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+        SelectObject(dc, storylandFont);
+        SetTextColor(dc, RGB(226, 241, 255));
+        RECT storyland{0, lowerY + 24, client.right, client.bottom - 18};
+        DrawTextW(dc, L"STORYLAND", -1, &storyland,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    }
+
+    SelectObject(dc, oldFont);
+    DeleteObject(logoFont);
+    DeleteObject(labelFont);
+    DeleteObject(storylandFont);
+}
+
+static LRESULT CALLBACK storylandSplashProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    if (message == WM_ERASEBKGND) return 1;
+    if (message == WM_CREATE) {
+        gSplashTick = 0;
+        gSplashSkipRequested = false;
+        SetTimer(hwnd, 1, 40, nullptr);
+        return 0;
+    }
+    if (message == WM_SIZE) {
+        resetSplashDrops(LOWORD(lParam), HIWORD(lParam));
+        return 0;
+    }
+    if (message == WM_TIMER && wParam == 1) {
+        gSplashTick++;
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        for (StorylandSplashDrop& drop : gSplashDrops) {
+            drop.headY += drop.speed;
+            if (drop.headY - float(drop.trail * gSplashCell) > float(client.bottom)) {
+                uint32_t random = splashHash(drop.seed ^ uint32_t(gSplashTick * 0x9E37));
+                drop.headY = -float(40u + random % 360u);
+                drop.speed = 5.0f + float((random >> 8) % 9u);
+                drop.trail = 7 + int((random >> 18) % 15u);
+            }
+        }
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    }
+    if (message == WM_LBUTTONDOWN || message == WM_KEYDOWN) {
+        gSplashSkipRequested = true;
+        return 0;
+    }
+    if (message == WM_PAINT) {
+        PAINTSTRUCT paint{};
+        HDC dc = BeginPaint(hwnd, &paint);
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        int width = std::max<LONG>(1, client.right - client.left);
+        int height = std::max<LONG>(1, client.bottom - client.top);
+        HDC memoryDc = CreateCompatibleDC(dc);
+        HBITMAP frame = CreateCompatibleBitmap(dc, width, height);
+        HGDIOBJ oldBitmap = SelectObject(memoryDc, frame);
+        HBRUSH background = CreateSolidBrush(RGB(0, 4, 14));
+        FillRect(memoryDc, &client, background);
+        DeleteObject(background);
+
+        drawSplashMatrixRain(memoryDc, client);
+        drawReignsStudiosLogo(memoryDc, client);
+
+        HPEN border = CreatePen(PS_SOLID, 2, RGB(32, 112, 224));
+        HGDIOBJ oldPen = SelectObject(memoryDc, border);
+        HGDIOBJ oldBrush = SelectObject(memoryDc, GetStockObject(NULL_BRUSH));
+        RoundRect(memoryDc, 1, 1, client.right - 1, client.bottom - 1, 24, 24);
+        SelectObject(memoryDc, oldBrush);
+        SelectObject(memoryDc, oldPen);
+        DeleteObject(border);
+
+        BitBlt(dc, 0, 0, width, height, memoryDc, 0, 0, SRCCOPY);
+        SelectObject(memoryDc, oldBitmap);
+        DeleteObject(frame);
+        DeleteDC(memoryDc);
+        EndPaint(hwnd, &paint);
+        return 0;
+    }
+    if (message == WM_DESTROY) {
+        KillTimer(hwnd, 1);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
+static void pumpSplashMessages(HWND splash) {
+    MSG message{};
+    while (PeekMessageW(&message, splash, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
+}
+
+static HWND createStorylandSplash(HINSTANCE instance, ULONGLONG& startedAt) {
+    WNDCLASSEXW splashClass{};
+    splashClass.cbSize = sizeof(splashClass);
+    splashClass.style = CS_DROPSHADOW;
+    splashClass.lpfnWndProc = storylandSplashProc;
+    splashClass.hInstance = instance;
+    splashClass.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512)); // IDC_ARROW
+    splashClass.lpszClassName = L"StorylandSplashWindow";
+    RegisterClassExW(&splashClass);
+
+    RECT workArea{};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
+    int availableWidth = std::max<LONG>(640, workArea.right - workArea.left);
+    int availableHeight = std::max<LONG>(420, workArea.bottom - workArea.top);
+    int width = std::min(1320, availableWidth - 64);
+    int height = std::min(600, availableHeight - 64);
+    int x = workArea.left + (availableWidth - width) / 2;
+    int y = workArea.top + (availableHeight - height) / 2;
+    HWND splash = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED,
+        splashClass.lpszClassName,
+        L"Storyland",
+        WS_POPUP,
+        x, y, width, height,
+        nullptr, nullptr, instance, nullptr
+    );
+    if (!splash) return nullptr;
+
+    SetWindowRgn(splash, CreateRoundRectRgn(0, 0, width + 1, height + 1, 26, 26), TRUE);
+    SetLayeredWindowAttributes(splash, 0, 0, LWA_ALPHA);
+    ShowWindow(splash, SW_SHOW);
+    SetForegroundWindow(splash);
+    SetFocus(splash);
+    UpdateWindow(splash);
+    for (BYTE alpha = 0; alpha < 238; alpha = BYTE(alpha + 17)) {
+        SetLayeredWindowAttributes(splash, 0, alpha, LWA_ALPHA);
+        pumpSplashMessages(splash);
+        Sleep(8);
+    }
+    SetLayeredWindowAttributes(splash, 0, 255, LWA_ALPHA);
+    startedAt = GetTickCount64();
+    return splash;
+}
+
+static void finishStorylandSplash(HWND splash, ULONGLONG startedAt) {
+    if (!splash) return;
+    while (!gSplashSkipRequested && GetTickCount64() - startedAt < 1900u) {
+        pumpSplashMessages(splash);
+        Sleep(10);
+    }
+    for (int alpha = 255; alpha >= 0; alpha -= 17) {
+        SetLayeredWindowAttributes(splash, 0, BYTE(alpha), LWA_ALPHA);
+        pumpSplashMessages(splash);
+        Sleep(8);
+    }
+    DestroyWindow(splash);
 }
 
 static void loadEmbeddedVcsTimecycle() {
@@ -10293,10 +10659,13 @@ static void loadEmbeddedVcsTimecycle() {
 
 int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR commandLine, int showCommand) {
     gInstance = hInstance;
-    loadEmbeddedVcsTimecycle();
     INITCOMMONCONTROLSEX icc = { sizeof(INITCOMMONCONTROLSEX), ICC_BAR_CLASSES | ICC_STANDARD_CLASSES | ICC_TREEVIEW_CLASSES };
     InitCommonControlsEx(&icc);
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
+    ULONGLONG splashStartedAt = 0;
+    HWND splash = createStorylandSplash(hInstance, splashStartedAt);
+    loadEmbeddedVcsTimecycle();
 
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(WNDCLASSEXW);
@@ -10318,6 +10687,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR commandLine, int sh
     if (storylandLargeIcon) SendMessageW(gMainWindow, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(storylandLargeIcon));
     if (storylandSmallIcon) SendMessageW(gMainWindow, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(storylandSmallIcon));
 
+    finishStorylandSplash(splash, splashStartedAt);
     ShowWindow(gMainWindow, showCommand);
     UpdateWindow(gMainWindow);
 

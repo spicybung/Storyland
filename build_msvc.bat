@@ -5,6 +5,8 @@ cd /d "%~dp0"
 set "BUILD_LOG=%~dp0build.log"
 set "BUILD_DIR=build-portable"
 set "STORYLAND_EXE=%~dp0%BUILD_DIR%\Release\Storyland.exe"
+set "DIST_DIR=%~dp0Release"
+set "DIST_EXE=%DIST_DIR%\Storyland.exe"
 > "%BUILD_LOG%" echo Storyland build started %DATE% %TIME%
 
 set "VCPKG_TOOLCHAIN="
@@ -28,7 +30,7 @@ cmake --fresh -S . -B "%BUILD_DIR%" -A x64 "-DCMAKE_TOOLCHAIN_FILE=%VCPKG_TOOLCH
 if errorlevel 1 goto configure_failed
 
 echo Building Storyland...
-cmake --build "%BUILD_DIR%" --config Release >> "%BUILD_LOG%" 2>&1
+cmake --build "%BUILD_DIR%" --config Release --clean-first >> "%BUILD_LOG%" 2>&1
 if errorlevel 1 goto build_failed
 
 if not exist "%STORYLAND_EXE%" goto missing_exe
@@ -38,10 +40,14 @@ dumpbin /DEPENDENTS "%STORYLAND_EXE%" >> "%BUILD_LOG%" 2>&1
 dumpbin /DEPENDENTS "%STORYLAND_EXE%" | findstr /I /C:"zlib1.dll" /C:"zlibd1.dll" /C:"MSVCP140.dll" /C:"VCRUNTIME140.dll" /C:"VCRUNTIME140_1.dll" >nul
 if not errorlevel 1 goto dependency_failed
 
+if not exist "%DIST_DIR%" mkdir "%DIST_DIR%"
+copy /Y "%STORYLAND_EXE%" "%DIST_EXE%" >> "%BUILD_LOG%" 2>&1
+if errorlevel 1 goto copy_failed
+
 type "%BUILD_LOG%"
 echo.
 echo Build succeeded.
-echo Executable: %BUILD_DIR%\Release\Storyland.exe
+echo Executable: Release\Storyland.exe
 echo Storyland.exe contains its shaders and zlib; no shaders folder or zlib1.dll is required.
 echo.
 pause
@@ -99,3 +105,13 @@ echo Do not distribute this executable. See the dependency list in build.log.
 echo.
 pause
 exit /b 5
+
+:copy_failed
+type "%BUILD_LOG%"
+echo.
+echo Storyland built successfully, but the portable executable could not be copied to:
+echo %DIST_EXE%
+echo Close Storyland.exe if it is currently running, then build again.
+echo.
+pause
+exit /b 7

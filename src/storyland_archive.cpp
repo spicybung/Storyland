@@ -1,5 +1,6 @@
 #include "storyland_archive.h"
 #include "storyland_atomic_io.h"
+#include "storyland_dma_validator.h"
 
 #include <algorithm>
 #include <array>
@@ -3515,6 +3516,17 @@ bool StorylandArchiveBrowser::replaceWorldMeshResourceBytes(uint32_t resourceId,
         }
     }
 
+    const StorylandDmaTlbReport dmaPreflight = storylandValidatePs2DmaTlb(
+        replacementPayload,
+        "replacement mesh resource " + std::to_string(resourceId)
+    );
+    if (!dmaPreflight.safe()) {
+        errorMessage =
+            "Replacement failed the PS2 DMA/TLB preflight and was not applied.\r\n\r\n" +
+            dmaPreflight.text();
+        return false;
+    }
+
     std::vector<StorylandSectorResourceSpan> spans;
 
     for (const StorylandWorldSector& sector : worldSectors) {
@@ -3680,6 +3692,9 @@ bool StorylandArchiveBrowser::replaceWorldMeshResourceBytes(uint32_t resourceId,
         "WRLD sector chunk sizes changed: no\r\n"
         "Parsed replacement mesh variants after rebuild: " + std::to_string(parsedAfter) + "\r\n"
         "Parsed replacement triangles after rebuild: " + std::to_string(trianglesAfter) + "\r\n"
+        "DMA/TLB preflight: PASS; tags=" + std::to_string(dmaPreflight.dmaTags) +
+        " VIF_streams=" + std::to_string(dmaPreflight.vifStreams) +
+        " warnings=" + std::to_string(dmaPreflight.warnings) + "\r\n"
         "This path avoids the TLB bug where the game read the first material row dword as a pointer.\r\n"
         "Use File > Export/Rebuild LVZ+IMG Pair to write the edited files.";
 
