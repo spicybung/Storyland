@@ -3308,10 +3308,411 @@ void StorylandModelFile::collectTextureNameHints() {
     }
 }
 
+struct MobileLcsRwMatrix {
+    float m[16] = {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 1.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 1.0f
+    };
+};
+
+static bool mobileRwHeaderValid(const std::vector<uint8_t>& bytes, size_t offset, size_t limit,
+                                uint32_t expectedType = 0xFFFFFFFFu, uint32_t expectedVersion = 0xFFFFFFFFu) {
+    if (limit > bytes.size() || offset + 12u > limit) return false;
+    uint32_t type = modelReadU32(bytes, offset + 0u);
+    uint32_t size = modelReadU32(bytes, offset + 4u);
+    uint32_t version = modelReadU32(bytes, offset + 8u);
+    if (expectedType != 0xFFFFFFFFu && type != expectedType) return false;
+    if (expectedVersion != 0xFFFFFFFFu && version != expectedVersion) return false;
+    return size <= limit - offset - 12u;
+}
+
+static std::string mobileRwString(const std::vector<uint8_t>& bytes, size_t offset, size_t size) {
+    std::string value;
+    size_t end = std::min(bytes.size(), offset + size);
+    for (size_t cursor = offset; cursor < end && value.size() < 127u; ++cursor) {
+        unsigned char ch = bytes[cursor];
+        if (ch == 0u) break;
+        if (ch < 32u || ch >= 127u) return std::string();
+        value.push_back(char(ch));
+    }
+    return value;
+}
+
+static MobileLcsRwMatrix multiplyMobileRwMatrices(const MobileLcsRwMatrix& a, const MobileLcsRwMatrix& b) {
+    MobileLcsRwMatrix result;
+    for (int column = 0; column < 4; ++column) {
+        for (int row = 0; row < 4; ++row) {
+            result.m[column * 4 + row] =
+                a.m[0 * 4 + row] * b.m[column * 4 + 0] +
+                a.m[1 * 4 + row] * b.m[column * 4 + 1] +
+                a.m[2 * 4 + row] * b.m[column * 4 + 2] +
+                a.m[3 * 4 + row] * b.m[column * 4 + 3];
+        }
+    }
+    return result;
+}
+
+static StorylandModelPoint transformMobileRwPoint(const MobileLcsRwMatrix& matrix, const StorylandModelPoint& point) {
+    return StorylandModelPoint{
+        matrix.m[0] * point.x + matrix.m[4] * point.y + matrix.m[8] * point.z + matrix.m[12],
+        matrix.m[1] * point.x + matrix.m[5] * point.y + matrix.m[9] * point.z + matrix.m[13],
+        matrix.m[2] * point.x + matrix.m[6] * point.y + matrix.m[10] * point.z + matrix.m[14]
+    };
+}
+
+static bool mobileLcsDffSignature(const std::vector<uint8_t>& bytes, bool* outHasF00dGeometry = nullptr) {
+    if (outHasF00dGeometry != nullptr) *outHasF00dGeometry = false;
+    if (!mobileRwHeaderValid(bytes, 0u, bytes.size(), 0x10u, 0x00000310u)) return false;
+    size_t declaredEnd = 12u + size_t(modelReadU32(bytes, 4u));
+    if (declaredEnd > bytes.size() || declaredEnd < 64u) return false;
+    size_t clumpEnd = declaredEnd;
+    size_t firstChild = 12u;
+    if (!mobileRwHeaderValid(bytes, firstChild, clumpEnd, 0x01u, 0x00000310u)) return false;
+    if (modelReadU32(bytes, firstChild + 4u) != 4u) return false;
+    uint32_t declaredAtomicCount = modelReadU32(bytes, firstChild + 12u);
+    size_t frameList = firstChild + 12u + 4u;
+    if (!mobileRwHeaderValid(bytes, frameList, clumpEnd, 0x0Eu, 0x00000310u)) return false;
+
+    bool foundF00dGeometry = false;
+    bool foundAnyGeometry = false;
+    bool foundAtomic = false;
+    bool foundFrameName = false;
+    for (size_t offset = 0u; offset + 12u <= clumpEnd; ++offset) {
+        uint32_t type = modelReadU32(bytes, offset);
+        uint32_t size = modelReadU32(bytes, offset + 4u);
+        uint32_t version = modelReadU32(bytes, offset + 8u);
+        if (offset + 12u + size > clumpEnd) continue;
+        if (type == 0x0Fu) {
+            foundAnyGeometry = true;
+            if (version == 0x0000F00Du && size >= 0x100u) foundF00dGeometry = true;
+        }
+        if (type == 0x14u && version == 0x00000310u) foundAtomic = true;
+        if (type == 0x0253F2FEu && version == 0x00000310u && size > 0u && size <= 128u) foundFrameName = true;
+    }
+
+    if (!foundFrameName) return false;
+    if (foundF00dGeometry) {
+        if (outHasF00dGeometry != nullptr) *outHasF00dGeometry = true;
+        return true;
+    }
+
+    // Mobile LCS also stores a small number of named, frame-only DFF clumps
+    // such as spray/ship prop anchors. They have no atomics and no Geometry
+    // chunk at all. Accept that exact no-geometry case, but reject any clump
+    // containing a non-F00D desktop Geometry variant.
+    return declaredAtomicCount == 0u && !foundAtomic && !foundAnyGeometry;
+}
+
+static std::vector<std::string> mobileRwMaterialNames(const std::vector<uint8_t>& bytes, size_t materialListOffset, size_t geometryEnd) {
+    std::vector<std::string> names;
+    if (!mobileRwHeaderValid(bytes, materialListOffset, geometryEnd, 0x08u, 0x00000310u)) return names;
+    size_t materialListEnd = materialListOffset + 12u + size_t(modelReadU32(bytes, materialListOffset + 4u));
+    size_t cursor = materialListOffset + 12u;
+    if (mobileRwHeaderValid(bytes, cursor, materialListEnd, 0x01u, 0x00000310u)) {
+        uint32_t count = modelReadU32(bytes, cursor + 12u);
+        if (count <= 256u) names.resize(count);
+        cursor += 12u + size_t(modelReadU32(bytes, cursor + 4u));
+    }
+
+    size_t materialIndex = 0u;
+    while (cursor + 12u <= materialListEnd) {
+        if (!mobileRwHeaderValid(bytes, cursor, materialListEnd)) break;
+        uint32_t type = modelReadU32(bytes, cursor);
+        size_t chunkEnd = cursor + 12u + size_t(modelReadU32(bytes, cursor + 4u));
+        if (type == 0x07u) {
+            std::string textureName;
+            for (size_t probe = cursor + 12u; probe + 12u <= chunkEnd; ++probe) {
+                if (modelReadU32(bytes, probe) != 0x02u || modelReadU32(bytes, probe + 8u) != 0x00000310u) continue;
+                uint32_t stringSize = modelReadU32(bytes, probe + 4u);
+                if (stringSize == 0u || stringSize > 128u || probe + 12u + stringSize > chunkEnd) continue;
+                std::string candidate = mobileRwString(bytes, probe + 12u, stringSize);
+                if (!candidate.empty()) { textureName = modelLowerAscii(candidate); break; }
+            }
+            if (materialIndex >= names.size()) names.resize(materialIndex + 1u);
+            names[materialIndex++] = textureName;
+        }
+        cursor = chunkEnd;
+    }
+    return names;
+}
+
+static void appendRenderWare2dfxLights(
+    const std::vector<uint8_t>& bytes,
+    size_t rangeStart,
+    size_t rangeEnd,
+    const MobileLcsRwMatrix* ownerMatrix,
+    std::vector<StorylandModelLight2dfx>& output
+) {
+    const uint32_t pluginId = 0x0253F2F8u;
+    rangeStart = std::min(rangeStart, bytes.size());
+    rangeEnd = std::min(rangeEnd, bytes.size());
+    if (rangeStart >= rangeEnd) return;
+
+    for (size_t offset = rangeStart; offset + 16u <= rangeEnd; ++offset) {
+        if (modelReadU32(bytes, offset) != pluginId) continue;
+        uint32_t pluginSize = modelReadU32(bytes, offset + 4u);
+        uint32_t version = modelReadU32(bytes, offset + 8u);
+        if (version != 0x00000310u || pluginSize < 4u || pluginSize > 0x100000u || offset + 12u + pluginSize > rangeEnd) continue;
+
+        size_t cursor = offset + 12u;
+        size_t end = cursor + pluginSize;
+        uint32_t effectCount = modelReadU32(bytes, cursor);
+        cursor += 4u;
+        if (effectCount > 65536u) continue;
+
+        for (uint32_t effectIndex = 0u; effectIndex < effectCount && cursor + 20u <= end; ++effectIndex) {
+            StorylandModelPoint location{
+                modelReadF32(bytes, cursor + 0u),
+                modelReadF32(bytes, cursor + 4u),
+                modelReadF32(bytes, cursor + 8u)
+            };
+            uint32_t effectType = modelReadU32(bytes, cursor + 12u);
+            uint32_t effectSize = modelReadU32(bytes, cursor + 16u);
+            cursor += 20u;
+            if (effectSize > end - cursor) break;
+
+            if (effectType == 0u && effectSize >= 76u &&
+                std::isfinite(location.x) && std::isfinite(location.y) && std::isfinite(location.z)) {
+                StorylandModelLight2dfx light;
+                light.position = ownerMatrix ? transformMobileRwPoint(*ownerMatrix, location) : location;
+                light.red = bytes[cursor + 0u];
+                light.green = bytes[cursor + 1u];
+                light.blue = bytes[cursor + 2u];
+                light.alpha = bytes[cursor + 3u];
+                light.coronaFarClip = modelReadF32(bytes, cursor + 4u);
+                light.pointLightRange = modelReadF32(bytes, cursor + 8u);
+                light.coronaSize = modelReadF32(bytes, cursor + 12u);
+                light.shadowSize = modelReadF32(bytes, cursor + 16u);
+                light.coronaShowMode = bytes[cursor + 20u];
+                light.coronaEnableReflection = bytes[cursor + 21u];
+                light.coronaFlareType = bytes[cursor + 22u];
+                light.shadowColorMultiplier = bytes[cursor + 23u];
+                light.flags1 = bytes[cursor + 24u];
+                light.coronaTextureName = mobileRwString(bytes, cursor + 25u, 24u);
+                light.shadowTextureName = mobileRwString(bytes, cursor + 49u, 24u);
+                light.flags2 = bytes[cursor + 74u];
+                if (effectSize >= 80u) {
+                    light.lookDirectionX = static_cast<int8_t>(bytes[cursor + 75u]);
+                    light.lookDirectionY = static_cast<int8_t>(bytes[cursor + 76u]);
+                    light.lookDirectionZ = static_cast<int8_t>(bytes[cursor + 77u]);
+                    light.hasLookDirection = true;
+                }
+                if (!std::isfinite(light.coronaSize) || light.coronaSize <= 0.0f) light.coronaSize = 1.0f;
+                if (!std::isfinite(light.pointLightRange) || light.pointLightRange < 0.0f) light.pointLightRange = 0.0f;
+                if (!std::isfinite(light.coronaFarClip) || light.coronaFarClip < 0.0f) light.coronaFarClip = 0.0f;
+                output.push_back(std::move(light));
+            }
+            cursor += effectSize;
+        }
+    }
+}
+
+void StorylandModelFile::collectRenderWare2dfxLights() {
+    lights2dfx.clear();
+    appendRenderWare2dfxLights(data, 0u, data.size(), nullptr, lights2dfx);
+}
+
+bool StorylandModelFile::parseMobileLcsDff() {
+    bool hasF00dGeometry = false;
+    if (!mobileLcsDffSignature(data, &hasF00dGeometry)) return false;
+    mobileLcsDff = true;
+    points.clear();
+    triangles.clear();
+    texcoords.clear();
+    skinWeights.clear();
+    bones.clear();
+    materialTextureNames.clear();
+    textureHints.clear();
+    fieldRows.clear();
+    outputLines.clear();
+    previewUsesPspNativeSkinPalette = false;
+    lights2dfx.clear();
+
+    // Mobile LCS IMG allocations can contain native packet/extension tail data
+    // beyond the top-level Clump's declared size. The sector allocation or the
+    // standalone file length is authoritative for preview decoding.
+    const size_t clumpEnd = data.size();
+    const size_t frameListOffset = 28u;
+    size_t frameStructOffset = frameListOffset + 12u;
+    uint32_t frameCount = 0u;
+    std::vector<MobileLcsRwMatrix> localMatrices;
+    std::vector<MobileLcsRwMatrix> worldMatrices;
+    std::vector<int32_t> parents;
+    std::vector<std::string> frameNames;
+
+    if (mobileRwHeaderValid(data, frameStructOffset, clumpEnd, 0x01u, 0x00000310u)) {
+        size_t frameStructSize = modelReadU32(data, frameStructOffset + 4u);
+        size_t framePayload = frameStructOffset + 12u;
+        frameCount = modelReadU32(data, framePayload);
+        if (frameCount <= 65536u && frameStructSize >= 4u + size_t(frameCount) * 56u) {
+            localMatrices.resize(frameCount);
+            worldMatrices.resize(frameCount);
+            parents.resize(frameCount, -1);
+            frameNames.resize(frameCount);
+            for (uint32_t frameIndex = 0u; frameIndex < frameCount; ++frameIndex) {
+                size_t row = framePayload + 4u + size_t(frameIndex) * 56u;
+                MobileLcsRwMatrix matrix;
+                matrix.m[0] = modelReadF32(data, row + 0u);  matrix.m[1] = modelReadF32(data, row + 4u);  matrix.m[2] = modelReadF32(data, row + 8u);  matrix.m[3] = 0.0f;
+                matrix.m[4] = modelReadF32(data, row + 12u); matrix.m[5] = modelReadF32(data, row + 16u); matrix.m[6] = modelReadF32(data, row + 20u); matrix.m[7] = 0.0f;
+                matrix.m[8] = modelReadF32(data, row + 24u); matrix.m[9] = modelReadF32(data, row + 28u); matrix.m[10] = modelReadF32(data, row + 32u); matrix.m[11] = 0.0f;
+                matrix.m[12] = modelReadF32(data, row + 36u); matrix.m[13] = modelReadF32(data, row + 40u); matrix.m[14] = modelReadF32(data, row + 44u); matrix.m[15] = 1.0f;
+                localMatrices[frameIndex] = matrix;
+                parents[frameIndex] = int32_t(modelReadU32(data, row + 48u));
+            }
+
+            size_t extensionCursor = frameStructOffset + 12u + frameStructSize;
+            for (uint32_t frameIndex = 0u; frameIndex < frameCount && extensionCursor + 12u <= clumpEnd; ++frameIndex) {
+                if (!mobileRwHeaderValid(data, extensionCursor, clumpEnd, 0x03u, 0x00000310u)) break;
+                size_t extensionEnd = extensionCursor + 12u + size_t(modelReadU32(data, extensionCursor + 4u));
+                for (size_t probe = extensionCursor + 12u; probe + 12u <= extensionEnd; ++probe) {
+                    if (modelReadU32(data, probe) != 0x0253F2FEu || modelReadU32(data, probe + 8u) != 0x00000310u) continue;
+                    uint32_t nameSize = modelReadU32(data, probe + 4u);
+                    if (nameSize > 0u && nameSize <= 128u && probe + 12u + nameSize <= extensionEnd) frameNames[frameIndex] = mobileRwString(data, probe + 12u, nameSize);
+                    break;
+                }
+                extensionCursor = extensionEnd;
+            }
+
+            std::vector<uint8_t> composed(frameCount, 0u);
+            std::function<void(uint32_t)> compose = [&](uint32_t frameIndex) {
+                if (frameIndex >= frameCount || composed[frameIndex] == 2u) return;
+                if (composed[frameIndex] == 1u) { worldMatrices[frameIndex] = localMatrices[frameIndex]; composed[frameIndex] = 2u; return; }
+                composed[frameIndex] = 1u;
+                int32_t parent = parents[frameIndex];
+                if (parent >= 0 && uint32_t(parent) < frameCount) {
+                    compose(uint32_t(parent));
+                    worldMatrices[frameIndex] = multiplyMobileRwMatrices(worldMatrices[uint32_t(parent)], localMatrices[frameIndex]);
+                } else {
+                    worldMatrices[frameIndex] = localMatrices[frameIndex];
+                }
+                composed[frameIndex] = 2u;
+            };
+            for (uint32_t frameIndex = 0u; frameIndex < frameCount; ++frameIndex) compose(frameIndex);
+
+            bones.reserve(frameCount);
+            for (uint32_t frameIndex = 0u; frameIndex < frameCount; ++frameIndex) {
+                StorylandModelBone bone;
+                bone.index = frameIndex;
+                bone.offset = uint32_t(framePayload + 4u + size_t(frameIndex) * 56u);
+                bone.parentIndex = parents[frameIndex] >= 0 ? uint32_t(parents[frameIndex]) : 0xFFFFFFFFu;
+                bone.name = frameNames[frameIndex].empty() ? ("frame_" + std::to_string(frameIndex)) : frameNames[frameIndex];
+                bone.sectionKind = "Mobile LCS RenderWare frame";
+                bone.hasLocalPosition = true;
+                bone.localPosition = {localMatrices[frameIndex].m[12], localMatrices[frameIndex].m[13], localMatrices[frameIndex].m[14]};
+                bone.hasWorldPosition = true;
+                bone.worldPosition = {worldMatrices[frameIndex].m[12], worldMatrices[frameIndex].m[13], worldMatrices[frameIndex].m[14]};
+                bone.hasComposedPosition = true;
+                bone.composedPosition = bone.worldPosition;
+                bone.hasPreviewPosition = true;
+                bone.previewPosition = bone.worldPosition;
+                bone.previewPositionSource = "Mobile LCS RenderWare frame matrix";
+                bones.push_back(std::move(bone));
+            }
+        }
+    }
+
+    uint32_t atomicCount = 0u;
+    uint32_t stripCount = 0u;
+    for (size_t atomicOffset = 0u; atomicOffset + 40u <= clumpEnd; ++atomicOffset) {
+        if (modelReadU32(data, atomicOffset) != 0x14u || modelReadU32(data, atomicOffset + 8u) != 0x00000310u) continue;
+        size_t atomicStruct = atomicOffset + 12u;
+        if (!mobileRwHeaderValid(data, atomicStruct, clumpEnd, 0x01u, 0x00000310u)) continue;
+        uint32_t atomicStructSize = modelReadU32(data, atomicStruct + 4u);
+        if (atomicStructSize != 12u && atomicStructSize != 16u) continue;
+        size_t geometryOffset = atomicStruct + 12u + atomicStructSize;
+        if (!mobileRwHeaderValid(data, geometryOffset, clumpEnd, 0x0Fu, 0x0000F00Du)) continue;
+        size_t geometrySize = modelReadU32(data, geometryOffset + 4u);
+        size_t geometryBody = geometryOffset + 12u;
+        size_t geometryEnd = geometryBody + geometrySize;
+        if (geometrySize < 0x100u || geometryEnd > clumpEnd) continue;
+
+        uint32_t frameIndex = modelReadU32(data, atomicStruct + 12u);
+        MobileLcsRwMatrix frameMatrix;
+        if (frameIndex < worldMatrices.size()) frameMatrix = worldMatrices[frameIndex];
+
+        StorylandPreviewTransform packedTransform;
+        float sx = modelReadF32(data, geometryBody + 0x28u);
+        float sy = modelReadF32(data, geometryBody + 0x2Cu);
+        float sz = modelReadF32(data, geometryBody + 0x30u);
+        float tx = modelReadF32(data, geometryBody + 0x34u);
+        float ty = modelReadF32(data, geometryBody + 0x38u);
+        float tz = modelReadF32(data, geometryBody + 0x3Cu);
+        if (previewFiniteReasonable(sx, 4096.0f) && previewFiniteReasonable(sy, 4096.0f) && previewFiniteReasonable(sz, 4096.0f) &&
+            std::fabs(sx) > 0.000001f && std::fabs(sy) > 0.000001f && std::fabs(sz) > 0.000001f &&
+            previewFiniteReasonable(tx, 4096.0f) && previewFiniteReasonable(ty, 4096.0f) && previewFiniteReasonable(tz, 4096.0f)) {
+            packedTransform.valid = true;
+            packedTransform.sx = sx; packedTransform.sy = sy; packedTransform.sz = sz;
+            packedTransform.tx = tx; packedTransform.ty = ty; packedTransform.tz = tz;
+        }
+
+        uint32_t materialListRelative = modelReadU32(data, geometryBody + 0x10u) & 0xFFFFu;
+        size_t packetEnd = geometryEnd;
+        if (materialListRelative >= 0x80u && materialListRelative < geometrySize) {
+            packetEnd = geometryBody + materialListRelative;
+            std::vector<std::string> names = mobileRwMaterialNames(data, packetEnd, geometryEnd);
+            for (const std::string& name : names) materialTextureNames.push_back(name);
+        }
+
+        // RenderWare 2DFX positions are stored in geometry-local space.  Attach
+        // them to the atomic's composed frame before presenting them in Storyland.
+        appendRenderWare2dfxLights(data, geometryBody, geometryEnd, &frameMatrix, lights2dfx);
+
+        uint32_t localMaterial = 0u;
+        for (size_t marker = geometryBody; marker + 0x34u <= packetEnd; marker += 4u) {
+            if (modelReadU32(data, marker) != 0x6C018000u) continue;
+            size_t beforePoints = points.size();
+            size_t beforeTriangles = triangles.size();
+            if (!appendExactLeedsSplitMarker(data, marker, packetEnd, localMaterial, packedTransform,
+                                             points, triangles, texcoords, skinWeights)) continue;
+            for (size_t vertexIndex = beforePoints; vertexIndex < points.size(); ++vertexIndex) {
+                points[vertexIndex] = transformMobileRwPoint(frameMatrix, points[vertexIndex]);
+            }
+            if (triangles.size() > beforeTriangles) ++localMaterial;
+            ++stripCount;
+        }
+
+        std::ostringstream group;
+        group << "Mobile LCS Atomic #" << atomicCount << " @ " << modelHexOffset(atomicOffset);
+        std::string frameNote = frameIndex < frameNames.size() ? frameNames[frameIndex] : std::string();
+        addField(fieldRows, group.str(), "frame_index", uint32_t(atomicStruct + 12u), frameIndex,
+                 frameNote.empty() ? "RenderWare atomic frame index." : "RenderWare frame='" + frameNote + "'.");
+        addField(fieldRows, group.str(), "geometry_version", uint32_t(geometryOffset + 8u), 0x0000F00Du,
+                 "War Drum/Mobile LCS embedded PS2-native geometry marker; not a III/VC/SA desktop DFF geometry.");
+        addField(fieldRows, group.str(), "geometry_size", uint32_t(geometryOffset + 4u), uint32_t(geometrySize), "F00D geometry payload size.");
+        ++atomicCount;
+        atomicOffset = geometryEnd > atomicOffset ? geometryEnd - 1u : atomicOffset;
+    }
+
+    bool vehicle = false;
+    bool ped = false;
+    for (const std::string& name : frameNames) {
+        std::string lower = modelLowerAscii(name);
+        if (lower.find("chassis") != std::string::npos || lower.find("wheel") != std::string::npos || lower.find("door_") != std::string::npos) vehicle = true;
+        if (lower.find("pelvis") != std::string::npos || lower.find("spine") != std::string::npos || lower.find("upperarm") != std::string::npos) ped = true;
+    }
+    kind = vehicle ? StorylandModelKind::VehicleModel : ped ? StorylandModelKind::PedModel : StorylandModelKind::SimpleModel;
+    collectTextureNameHints();
+
+    outputLines.push_back({hasF00dGeometry
+        ? "Format: Mobile LCS RenderWare 3.1 DFF (War Drum F00D native geometry)."
+        : "Format: Mobile LCS RenderWare 3.1 frame-only DFF (no atomic or Geometry chunk)."});
+    outputLines.push_back({"Writer policy: lossless Mobile LCS DFF export enabled; III/VC/SA desktop Geometry variants are deliberately rejected."});
+    outputLines.push_back({"Frames: " + std::to_string(frameCount) + ", atomics: " + std::to_string(atomicCount) + ", native strips: " + std::to_string(stripCount) + "."});
+    outputLines.push_back({"Geometry: " + std::to_string(points.size()) + " vertices, " + std::to_string(triangles.size()) + " triangles."});
+    outputLines.push_back({"RenderWare 2DFX lights: " + std::to_string(lights2dfx.size()) + "."});
+    return true;
+}
+
 void StorylandModelFile::parse() {
     outputLines.clear();
     fieldRows.clear();
     textureHints.clear();
+    mobileLcsDff = false;
+    lights2dfx.clear();
+    if (parseMobileLcsDff()) return;
+    collectRenderWare2dfxLights();
     detectModelKind();
     collectTextureNameHints();
     collectPreviewPoints();
@@ -3778,6 +4179,10 @@ void StorylandModelFile::parse() {
     std::ostringstream pointLine;
     pointLine << "Geometry: " << points.size() << " vertices, " << triangles.size() << " triangles";
     outputLines.insert(outputLines.begin() + std::min<size_t>(2, outputLines.size()), {pointLine.str()});
+    if (!lights2dfx.empty()) {
+        outputLines.insert(outputLines.begin() + std::min<size_t>(3, outputLines.size()),
+                           {"RenderWare 2DFX lights: " + std::to_string(lights2dfx.size()) + "."});
+    }
 }
 
 const std::vector<StorylandModelLine>& StorylandModelFile::lines() const { return outputLines; }
@@ -3786,10 +4191,30 @@ const std::vector<StorylandModelTriangle>& StorylandModelFile::previewTriangles(
 const std::vector<StorylandModelTexcoord>& StorylandModelFile::previewTexcoords() const { return texcoords; }
 const std::vector<StorylandModelSkinWeights>& StorylandModelFile::previewSkinWeights() const { return skinWeights; }
 const std::vector<StorylandModelBone>& StorylandModelFile::armatureBones() const { return bones; }
+const std::vector<StorylandModelLight2dfx>& StorylandModelFile::preview2dfxLights() const { return lights2dfx; }
 const std::vector<std::string>& StorylandModelFile::previewMaterialTextureNames() const { return materialTextureNames; }
 const std::vector<std::string>& StorylandModelFile::textureNameHints() const { return textureHints; }
 const std::wstring& StorylandModelFile::sourcePath() const { return path; }
 size_t StorylandModelFile::fileSize() const { return data.size(); }
+bool StorylandModelFile::isMobileLcsDff() const { return mobileLcsDff; }
+bool StorylandModelFile::exportMobileLcsDffLossless(const std::wstring& outputPath, std::string& errorMessage) const {
+    if (!mobileLcsDff || !mobileLcsDffSignature(data)) {
+        errorMessage = "Export rejected: the loaded model is not a supported Mobile LCS RenderWare 3.1 F00D or frame-only DFF. Storyland will not write GTA III, Vice City, or San Andreas desktop Geometry variants through this command.";
+        return false;
+    }
+    std::ofstream file(std::filesystem::path(outputPath), std::ios::binary | std::ios::trunc);
+    if (!file) {
+        errorMessage = "Could not create the Mobile LCS DFF output file.";
+        return false;
+    }
+    if (!data.empty()) file.write(reinterpret_cast<const char*>(data.data()), std::streamsize(data.size()));
+    if (!file) {
+        errorMessage = "Could not write the complete Mobile LCS DFF output file.";
+        return false;
+    }
+    errorMessage.clear();
+    return true;
+}
 const std::vector<StorylandModelField>& StorylandModelFile::fields() const { return fieldRows; }
 StorylandModelKind StorylandModelFile::modelKind() const { return kind; }
 std::string StorylandModelFile::modelKindName() const {

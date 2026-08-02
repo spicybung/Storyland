@@ -1121,11 +1121,273 @@ bool StorylandDtzArchive::parse(std::string& errorMessage) {
     addHint(hints, unpackedData, "fonts.chk compressed", 0xDC, "Compressed CHK texture archive where present");
 
     rebuildSectorRecords();
+    rebuildLeeds2dfxEffects();
     rebuildDataBlocksAndFields();
     rebuildDirMatches();
     return true;
 }
 
+
+static bool dtzFiniteReasonableFloat(float value, float limit) {
+    return std::isfinite(value) && std::fabs(value) <= limit;
+}
+
+static const char* dtzLeeds2dfxEffectTypeName(uint8_t effectType) {
+    switch (effectType) {
+    case 0: return "LIGHT";
+    case 1: return "PARTICLE";
+    case 2: return "ATTRACTOR";
+    case 3: return "PED_BEHAVIOUR";
+    default: return "UNKNOWN";
+    }
+}
+
+void StorylandDtzArchive::rebuildLeeds2dfxEffects() {
+    leeds2dfxEffectsCache.clear();
+    leeds2dfxWorldInstancesCache.clear();
+    if (unpackedData.size() < 0x5Cu) return;
+
+    const uint32_t declaredCount = readU32(unpackedData, 0x54u);
+    const uint32_t tableOffset = readU32(unpackedData, 0x58u);
+    constexpr uint32_t rowStride = 0x40u;
+    if (declaredCount == 0u || declaredCount > 100000u) return;
+    if (tableOffset == 0u || uint64_t(tableOffset) + uint64_t(declaredCount) * rowStride > unpackedData.size()) return;
+
+    struct ModelEffectRange {
+        int32_t modelIndex = -1;
+        uint32_t modelHash = 0;
+        uint32_t modelInfoOffset = 0;
+        uint8_t modelType = 0;
+        uint32_t firstEffect = 0;
+        uint32_t effectCount = 0;
+    };
+
+    std::vector<int32_t> effectOwner(declaredCount, -1);
+    std::vector<uint32_t> effectOwnerHash(declaredCount, 0u);
+    std::vector<uint32_t> effectOwnerInfo(declaredCount, 0u);
+    std::vector<uint8_t> effectOwnerType(declaredCount, 0u);
+    std::vector<uint32_t> effectOwnerLocalIndex(declaredCount, 0u);
+
+    const uint32_t ideCount = readU32(unpackedData, 0x38u);
+    const uint32_t idePointerTable = readU32(unpackedData, 0x3Cu);
+    if (ideCount > 0u && ideCount <= 200000u &&
+        idePointerTable != 0u &&
+        uint64_t(idePointerTable) + uint64_t(ideCount) * 4ull <= unpackedData.size()) {
+        for (uint32_t modelIndex = 0u; modelIndex < ideCount; ++modelIndex) {
+            const uint32_t modelInfoOffset = readU32(unpackedData, size_t(idePointerTable) + size_t(modelIndex) * 4u);
+            if (modelInfoOffset == 0u || uint64_t(modelInfoOffset) + 0x20ull > unpackedData.size()) continue;
+
+            const uint32_t modelHash = readU32(unpackedData, size_t(modelInfoOffset) + 0x08u);
+            const uint8_t modelType = unpackedData[size_t(modelInfoOffset) + 0x10u];
+            const uint8_t effectCount = unpackedData[size_t(modelInfoOffset) + 0x11u];
+            const int16_t firstEffect = readI16(unpackedData, size_t(modelInfoOffset) + 0x18u);
+            if (effectCount == 0u || firstEffect < 0) continue;
+            if (uint32_t(firstEffect) >= declaredCount ||
+                uint32_t(firstEffect) + uint32_t(effectCount) > declaredCount) continue;
+
+            ModelEffectRange range;
+            range.modelIndex = int32_t(modelIndex);
+            range.modelHash = modelHash;
+            range.modelInfoOffset = modelInfoOffset;
+            range.modelType = modelType;
+            range.firstEffect = uint32_t(firstEffect);
+            range.effectCount = uint32_t(effectCount);
+
+            for (uint32_t localIndex = 0u; localIndex < range.effectCount; ++localIndex) {
+                const uint32_t globalIndex = range.firstEffect + localIndex;
+                effectOwner[globalIndex] = range.modelIndex;
+                effectOwnerHash[globalIndex] = range.modelHash;
+                effectOwnerInfo[globalIndex] = range.modelInfoOffset;
+                effectOwnerType[globalIndex] = range.modelType;
+                effectOwnerLocalIndex[globalIndex] = localIndex;
+            }
+        }
+    }
+
+    leeds2dfxEffectsCache.reserve(declaredCount);
+    for (uint32_t index = 0u; index < declaredCount; ++index) {
+        const size_t row = size_t(tableOffset) + size_t(index) * rowStride;
+
+        StorylandDtz2dfxEffect effect;
+        effect.index = index;
+        effect.rowOffset = uint32_t(row);
+        effect.localX = readFloat32(unpackedData, row + 0x00u);
+        effect.localY = readFloat32(unpackedData, row + 0x04u);
+        effect.localZ = readFloat32(unpackedData, row + 0x08u);
+        effect.positionW = readFloat32(unpackedData, row + 0x0Cu);
+        effect.red = unpackedData[row + 0x10u];
+        effect.green = unpackedData[row + 0x11u];
+        effect.blue = unpackedData[row + 0x12u];
+        effect.alpha = unpackedData[row + 0x13u];
+        effect.effectType = unpackedData[row + 0x14u];
+        effect.isLight = effect.effectType == 0u;
+
+        effect.valid =
+            effect.effectType <= 3u &&
+            dtzFiniteReasonableFloat(effect.localX, 1000000.0f) &&
+            dtzFiniteReasonableFloat(effect.localY, 1000000.0f) &&
+            dtzFiniteReasonableFloat(effect.localZ, 1000000.0f) &&
+            dtzFiniteReasonableFloat(effect.positionW, 1000000.0f);
+
+        if (effect.effectType == 0u) {
+            effect.coronaFarClip = readFloat32(unpackedData, row + 0x18u);
+            effect.pointLightRange = readFloat32(unpackedData, row + 0x1Cu);
+            effect.coronaSize = readFloat32(unpackedData, row + 0x20u);
+            effect.shadowSize = readFloat32(unpackedData, row + 0x24u);
+            effect.lightType = unpackedData[row + 0x28u];
+            effect.roadReflection = unpackedData[row + 0x29u];
+            effect.flareType = unpackedData[row + 0x2Au];
+            effect.shadowIntensity = unpackedData[row + 0x2Bu];
+            effect.flags = unpackedData[row + 0x2Cu];
+            effect.coronaTexturePointer = readU32(unpackedData, row + 0x30u);
+            effect.shadowTexturePointer = readU32(unpackedData, row + 0x34u);
+            effect.valid = effect.valid &&
+                dtzFiniteReasonableFloat(effect.coronaFarClip, 1000000.0f) &&
+                dtzFiniteReasonableFloat(effect.pointLightRange, 1000000.0f) &&
+                dtzFiniteReasonableFloat(effect.coronaSize, 100000.0f) &&
+                dtzFiniteReasonableFloat(effect.shadowSize, 100000.0f);
+        } else if (effect.effectType == 1u) {
+            effect.particleSubtype = readI32(unpackedData, row + 0x18u);
+            effect.directionX = readFloat32(unpackedData, row + 0x1Cu);
+            effect.directionY = readFloat32(unpackedData, row + 0x20u);
+            effect.directionZ = readFloat32(unpackedData, row + 0x24u);
+            effect.particleScale = readFloat32(unpackedData, row + 0x28u);
+            effect.valid = effect.valid &&
+                dtzFiniteReasonableFloat(effect.directionX, 1000000.0f) &&
+                dtzFiniteReasonableFloat(effect.directionY, 1000000.0f) &&
+                dtzFiniteReasonableFloat(effect.directionZ, 1000000.0f) &&
+                dtzFiniteReasonableFloat(effect.particleScale, 1000000.0f);
+        } else if (effect.effectType == 2u) {
+            effect.directionX = readFloat32(unpackedData, row + 0x18u);
+            effect.directionY = readFloat32(unpackedData, row + 0x1Cu);
+            effect.directionZ = readFloat32(unpackedData, row + 0x20u);
+            effect.attractorSubtype = unpackedData[row + 0x24u];
+            effect.attractorProbability = unpackedData[row + 0x25u];
+            effect.valid = effect.valid &&
+                dtzFiniteReasonableFloat(effect.directionX, 1000000.0f) &&
+                dtzFiniteReasonableFloat(effect.directionY, 1000000.0f) &&
+                dtzFiniteReasonableFloat(effect.directionZ, 1000000.0f);
+        } else if (effect.effectType == 3u) {
+            effect.directionX = readFloat32(unpackedData, row + 0x18u);
+            effect.directionY = readFloat32(unpackedData, row + 0x1Cu);
+            effect.directionZ = readFloat32(unpackedData, row + 0x20u);
+            effect.pedRotationX = readFloat32(unpackedData, row + 0x24u);
+            effect.pedRotationY = readFloat32(unpackedData, row + 0x28u);
+            effect.pedRotationZ = readFloat32(unpackedData, row + 0x2Cu);
+            effect.pedSubtype = unpackedData[row + 0x30u];
+            effect.valid = effect.valid &&
+                dtzFiniteReasonableFloat(effect.directionX, 1000000.0f) &&
+                dtzFiniteReasonableFloat(effect.directionY, 1000000.0f) &&
+                dtzFiniteReasonableFloat(effect.directionZ, 1000000.0f) &&
+                dtzFiniteReasonableFloat(effect.pedRotationX, 1000000.0f) &&
+                dtzFiniteReasonableFloat(effect.pedRotationY, 1000000.0f) &&
+                dtzFiniteReasonableFloat(effect.pedRotationZ, 1000000.0f);
+        }
+
+        if (effectOwner[index] >= 0) {
+            effect.modelIndex = effectOwner[index];
+            effect.modelHash = effectOwnerHash[index];
+            effect.modelInfoOffset = effectOwnerInfo[index];
+            effect.modelType = effectOwnerType[index];
+            effect.modelEffectIndex = effectOwnerLocalIndex[index];
+            effect.hasModelAssociation = true;
+        }
+
+        leeds2dfxEffectsCache.push_back(effect);
+    }
+
+    std::map<int32_t, std::vector<uint32_t>> effectIndicesByModel;
+    for (const StorylandDtz2dfxEffect& effect : leeds2dfxEffectsCache) {
+        if (effect.valid && effect.hasModelAssociation) {
+            effectIndicesByModel[effect.modelIndex].push_back(effect.index);
+        }
+    }
+
+    struct PoolDescriptor {
+        const char* name;
+        uint32_t headerOffset;
+    };
+    const PoolDescriptor pools[] = {
+        {"BUILDING", 0x24u},
+        {"TREADABLE", 0x28u},
+        {"DUMMY", 0x2Cu}
+    };
+
+    for (const PoolDescriptor& pool : pools) {
+        const uint32_t poolOffset = readU32(unpackedData, pool.headerOffset);
+        if (poolOffset == 0u || uint64_t(poolOffset) + 0x20ull > unpackedData.size()) continue;
+
+        const uint32_t itemsOffset = readU32(unpackedData, size_t(poolOffset) + 0x00u);
+        const uint32_t flagsOffset = readU32(unpackedData, size_t(poolOffset) + 0x04u);
+        const int32_t poolSize = readI32(unpackedData, size_t(poolOffset) + 0x08u);
+        if (poolSize < 0 || poolSize > 200000) continue;
+        if (uint64_t(itemsOffset) + uint64_t(poolSize) * 0x60ull > unpackedData.size()) continue;
+        if (uint64_t(flagsOffset) + uint64_t(poolSize) > unpackedData.size()) continue;
+
+        for (int32_t poolIndex = 0; poolIndex < poolSize; ++poolIndex) {
+            const uint8_t poolFlag = unpackedData[size_t(flagsOffset) + size_t(poolIndex)];
+            if ((poolFlag & 0x80u) != 0u) continue;
+
+            const size_t entityOffset = size_t(itemsOffset) + size_t(poolIndex) * 0x60u;
+            const int32_t modelIndex = int32_t(readI16(unpackedData, entityOffset + 0x56u));
+            const auto modelEffects = effectIndicesByModel.find(modelIndex);
+            if (modelEffects == effectIndicesByModel.end() || modelEffects->second.empty()) continue;
+
+            float matrix[16] = {};
+            bool matrixValid = true;
+            for (size_t component = 0u; component < 16u; ++component) {
+                matrix[component] = readFloat32(unpackedData, entityOffset + component * 4u);
+                if (!dtzFiniteReasonableFloat(matrix[component], 10000000.0f)) matrixValid = false;
+            }
+            if (!matrixValid) continue;
+
+            const float rightX = matrix[0], rightY = matrix[1], rightZ = matrix[2];
+            const float upX = matrix[4], upY = matrix[5], upZ = matrix[6];
+            const float atX = matrix[8], atY = matrix[9], atZ = matrix[10];
+            const float entityX = matrix[12], entityY = matrix[13], entityZ = matrix[14];
+            const int32_t secondaryModelIndex = int32_t(readI16(unpackedData, entityOffset + 0x58u));
+            const uint8_t level = unpackedData[entityOffset + 0x5Au];
+            const uint8_t area = unpackedData[entityOffset + 0x5Bu];
+
+            for (uint32_t effectIndex : modelEffects->second) {
+                if (effectIndex >= leeds2dfxEffectsCache.size()) continue;
+                const StorylandDtz2dfxEffect& effect = leeds2dfxEffectsCache[effectIndex];
+
+                StorylandDtz2dfxWorldInstance instance;
+                instance.index = uint32_t(leeds2dfxWorldInstancesCache.size());
+                instance.effectIndex = effectIndex;
+                instance.entityOffset = uint32_t(entityOffset);
+                instance.poolIndex = uint32_t(poolIndex);
+                instance.poolName = pool.name;
+                instance.poolFlag = poolFlag;
+                instance.modelIndex = modelIndex;
+                instance.secondaryModelIndex = secondaryModelIndex;
+                instance.level = level;
+                instance.area = area;
+                instance.rightX = rightX;
+                instance.rightY = rightY;
+                instance.rightZ = rightZ;
+                instance.upX = upX;
+                instance.upY = upY;
+                instance.upZ = upZ;
+                instance.atX = atX;
+                instance.atY = atY;
+                instance.atZ = atZ;
+                instance.entityX = entityX;
+                instance.entityY = entityY;
+                instance.entityZ = entityZ;
+                instance.worldX = rightX * effect.localX + upX * effect.localY + atX * effect.localZ + entityX;
+                instance.worldY = rightY * effect.localX + upY * effect.localY + atY * effect.localZ + entityY;
+                instance.worldZ = rightZ * effect.localX + upZ * effect.localY + atZ * effect.localZ + entityZ;
+                instance.valid =
+                    dtzFiniteReasonableFloat(instance.worldX, 10000000.0f) &&
+                    dtzFiniteReasonableFloat(instance.worldY, 10000000.0f) &&
+                    dtzFiniteReasonableFloat(instance.worldZ, 10000000.0f);
+                if (instance.valid) leeds2dfxWorldInstancesCache.push_back(instance);
+            }
+        }
+    }
+}
 void StorylandDtzArchive::rebuildSectorRecords() {
     records.clear();
     std::set<std::pair<uint32_t, uint32_t>> seenOffsets;
@@ -1779,6 +2041,67 @@ static void appendVcsWeaponFields(
     }
 }
 
+
+static void appendLeeds2dfxFields(
+    const std::vector<StorylandDtz2dfxEffect>& effects,
+    std::vector<StorylandDtzDataField>& fields,
+    size_t blockIndex,
+    const StorylandDtzDataBlock& block
+) {
+    for (const StorylandDtz2dfxEffect& effect : effects) {
+        if (effect.rowOffset < block.offset || effect.rowOffset >= block.inferredEnd) continue;
+        std::ostringstream rowLabel;
+        rowLabel << "effect[" << effect.index << "] " << dtzLeeds2dfxEffectTypeName(effect.effectType);
+        if (effect.hasModelAssociation) {
+            rowLabel << " model=" << effect.modelIndex << " hash=" << hex32(effect.modelHash);
+        }
+
+        const uint32_t base = effect.rowOffset;
+        addDtzDataField(fields, blockIndex, block, effect.index, base + 0x00u, 0x00u, 4u, rowLabel.str(), "position.x", "float", formatFloat32(effect.localX), false, "native model-space Leeds C2dEffect position x");
+        addDtzDataField(fields, blockIndex, block, effect.index, base + 0x04u, 0x04u, 4u, rowLabel.str(), "position.y", "float", formatFloat32(effect.localY), false, "native model-space Leeds C2dEffect position y");
+        addDtzDataField(fields, blockIndex, block, effect.index, base + 0x08u, 0x08u, 4u, rowLabel.str(), "position.z", "float", formatFloat32(effect.localZ), false, "native model-space Leeds C2dEffect position z");
+        addDtzDataField(fields, blockIndex, block, effect.index, base + 0x0Cu, 0x0Cu, 4u, rowLabel.str(), "position.w", "float", formatFloat32(effect.positionW), false, "fourth serialized position component");
+        addDtzDataField(fields, blockIndex, block, effect.index, base + 0x10u, 0x10u, 1u, rowLabel.str(), "red", "u8", byteValueText(effect.red), false, "effect color red");
+        addDtzDataField(fields, blockIndex, block, effect.index, base + 0x11u, 0x11u, 1u, rowLabel.str(), "green", "u8", byteValueText(effect.green), false, "effect color green");
+        addDtzDataField(fields, blockIndex, block, effect.index, base + 0x12u, 0x12u, 1u, rowLabel.str(), "blue", "u8", byteValueText(effect.blue), false, "effect color blue");
+        addDtzDataField(fields, blockIndex, block, effect.index, base + 0x13u, 0x13u, 1u, rowLabel.str(), "alpha", "u8", byteValueText(effect.alpha), false, "effect color alpha");
+        addDtzDataField(fields, blockIndex, block, effect.index, base + 0x14u, 0x14u, 1u, rowLabel.str(), "effectType", "u8", byteValueText(effect.effectType), false, "0=LIGHT, 1=PARTICLE, 2=ATTRACTOR, 3=PED_BEHAVIOUR");
+
+        if (effect.effectType == 0u) {
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x18u, 0x18u, 4u, rowLabel.str(), "lightDistance", "float", formatFloat32(effect.coronaFarClip), false, "corona/far distance");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x1Cu, 0x1Cu, 4u, rowLabel.str(), "lightOuterRange", "float", formatFloat32(effect.pointLightRange), false, "point-light outer range");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x20u, 0x20u, 4u, rowLabel.str(), "lightSize", "float", formatFloat32(effect.coronaSize), false, "corona/light sprite size");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x24u, 0x24u, 4u, rowLabel.str(), "lightInnerRange", "float", formatFloat32(effect.shadowSize), false, "point-light inner range");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x28u, 0x28u, 1u, rowLabel.str(), "lightFlash", "u8", byteValueText(effect.lightType), false, "steady/night/flicker/flash behavior");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x29u, 0x29u, 1u, rowLabel.str(), "lightWet", "u8", byteValueText(effect.roadReflection), false, "wet-road reflection mode");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x2Au, 0x2Au, 1u, rowLabel.str(), "lightFlare", "u8", byteValueText(effect.flareType), false, "lens flare mode");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x2Bu, 0x2Bu, 1u, rowLabel.str(), "shadowIntensity", "u8", byteValueText(effect.shadowIntensity), false, "shadow intensity");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x2Cu, 0x2Cu, 1u, rowLabel.str(), "lightFlags", "u8", byteValueText(effect.flags), false, "native Leeds light flags");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x30u, 0x30u, 4u, rowLabel.str(), "coronaTexturePointer", "u32", u32ValueText(effect.coronaTexturePointer), false, "relocated corona texture pointer");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x34u, 0x34u, 4u, rowLabel.str(), "shadowTexturePointer", "u32", u32ValueText(effect.shadowTexturePointer), false, "relocated shadow texture pointer");
+        } else if (effect.effectType == 1u) {
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x18u, 0x18u, 4u, rowLabel.str(), "particleSubtype", "i32", formatSignedInt(effect.particleSubtype), false, "particle effect subtype");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x1Cu, 0x1Cu, 4u, rowLabel.str(), "direction.x", "float", formatFloat32(effect.directionX), false, "particle direction x");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x20u, 0x20u, 4u, rowLabel.str(), "direction.y", "float", formatFloat32(effect.directionY), false, "particle direction y");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x24u, 0x24u, 4u, rowLabel.str(), "direction.z", "float", formatFloat32(effect.directionZ), false, "particle direction z");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x28u, 0x28u, 4u, rowLabel.str(), "particleScale", "float", formatFloat32(effect.particleScale), false, "particle scale");
+        } else if (effect.effectType == 2u) {
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x18u, 0x18u, 4u, rowLabel.str(), "direction.x", "float", formatFloat32(effect.directionX), false, "attractor direction x");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x1Cu, 0x1Cu, 4u, rowLabel.str(), "direction.y", "float", formatFloat32(effect.directionY), false, "attractor direction y");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x20u, 0x20u, 4u, rowLabel.str(), "direction.z", "float", formatFloat32(effect.directionZ), false, "attractor direction z");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x24u, 0x24u, 1u, rowLabel.str(), "attractorSubtype", "u8", byteValueText(effect.attractorSubtype), false, "attractor subtype");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x25u, 0x25u, 1u, rowLabel.str(), "attractorProbability", "u8", byteValueText(effect.attractorProbability), false, "attractor probability");
+        } else if (effect.effectType == 3u) {
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x18u, 0x18u, 4u, rowLabel.str(), "direction.x", "float", formatFloat32(effect.directionX), false, "ped behavior direction x");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x1Cu, 0x1Cu, 4u, rowLabel.str(), "direction.y", "float", formatFloat32(effect.directionY), false, "ped behavior direction y");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x20u, 0x20u, 4u, rowLabel.str(), "direction.z", "float", formatFloat32(effect.directionZ), false, "ped behavior direction z");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x24u, 0x24u, 4u, rowLabel.str(), "rotation.x", "float", formatFloat32(effect.pedRotationX), false, "ped behavior rotation x");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x28u, 0x28u, 4u, rowLabel.str(), "rotation.y", "float", formatFloat32(effect.pedRotationY), false, "ped behavior rotation y");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x2Cu, 0x2Cu, 4u, rowLabel.str(), "rotation.z", "float", formatFloat32(effect.pedRotationZ), false, "ped behavior rotation z");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x30u, 0x30u, 1u, rowLabel.str(), "pedSubtype", "u8", byteValueText(effect.pedSubtype), false, "ped behavior subtype");
+        }
+    }
+}
 void StorylandDtzArchive::rebuildDataBlocksAndFields() {
     dataBlocksCache.clear();
     dataFieldsCache.clear();
@@ -1894,6 +2217,26 @@ void StorylandDtzArchive::rebuildDataBlocksAndFields() {
         appendGenericPreviewFields(unpackedData, dataFieldsCache, blockIndex, dataBlocksCache[blockIndex], std::min(count, 32u));
     }
 
+
+    if (!leeds2dfxEffectsCache.empty()) {
+        uint32_t tableOffset = readU32(unpackedData, 0x58);
+        uint32_t count = uint32_t(leeds2dfxEffectsCache.size());
+        uint32_t rowSize = 0x40u;
+        uint64_t end64 = uint64_t(tableOffset) + uint64_t(count) * uint64_t(rowSize);
+        uint32_t end = end64 <= unpackedData.size() ? uint32_t(end64) : uint32_t(unpackedData.size());
+        appendDtzDataBlock(
+            dataBlocksCache,
+            "Leeds GAME.DTZ C2dEffect table",
+            "leeds-c2deffect-table",
+            0x58,
+            tableOffset,
+            end,
+            rowSize,
+            count,
+            false,
+            "Native Leeds-engine 64-byte C2dEffect table from header fields 0x54/0x58. Rows use the Stories serialized layout: float4 position, RGBA, effect type, typed payload, and CBaseModelInfo ownership. Allocated BUILDING/TREADABLE/DUMMY CEntity pools are decoded separately for world-space instances.");
+    }
+
     std::sort(dataBlocksCache.begin(), dataBlocksCache.end(), [](const StorylandDtzDataBlock& left, const StorylandDtzDataBlock& right) {
         if (left.offset != right.offset) return left.offset < right.offset;
         return left.name < right.name;
@@ -1913,6 +2256,7 @@ void StorylandDtzArchive::rebuildDataBlocksAndFields() {
         else if (block.parser == "timecyc-real-dword-view") appendTimecycFields(unpackedData, dataFieldsCache, blockIndex, block);
         else if (block.parser == "vcs-weapon-0x70-records") appendVcsWeaponFields(unpackedData, dataFieldsCache, blockIndex, block);
         else if (block.parser == "generic-0xE0-handling-view") appendGenericPreviewFields(unpackedData, dataFieldsCache, blockIndex, block, std::min(block.rowCount, 32u));
+        else if (block.parser == "leeds-c2deffect-table") appendLeeds2dfxFields(leeds2dfxEffectsCache, dataFieldsCache, blockIndex, block);
         else if (block.parser == "raw-scanned-header-pointer") appendGenericPreviewFields(unpackedData, dataFieldsCache, blockIndex, block, std::min(block.rowCount, 24u));
     }
     dataBlocksCache = std::move(sortedBlocks);
@@ -2499,6 +2843,8 @@ const std::vector<StorylandDtzResourceHint>& StorylandDtzArchive::resourceHints(
 const std::vector<StorylandDtzDirEntry>& StorylandDtzArchive::dirEntries() const { return dirMap; }
 const std::vector<StorylandDtzDataBlock>& StorylandDtzArchive::dataBlocks() const { return dataBlocksCache; }
 const std::vector<StorylandDtzDataField>& StorylandDtzArchive::dataFields() const { return dataFieldsCache; }
+const std::vector<StorylandDtz2dfxEffect>& StorylandDtzArchive::leeds2dfxEffects() const { return leeds2dfxEffectsCache; }
+const std::vector<StorylandDtz2dfxWorldInstance>& StorylandDtzArchive::leeds2dfxWorldInstances() const { return leeds2dfxWorldInstancesCache; }
 const std::vector<uint8_t>& StorylandDtzArchive::unpackedBytes() const { return unpackedData; }
 const std::wstring& StorylandDtzArchive::sourcePath() const { return path; }
 const std::wstring& StorylandDtzArchive::companionDirPath() const { return dirPath; }

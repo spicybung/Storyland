@@ -18,6 +18,7 @@ enum class LeedsPlatform {
 enum class TextureKind {
     Unknown,
     Psp,
+    RwPsp,
     Ps2,
     CtwTex
 };

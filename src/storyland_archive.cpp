@@ -96,6 +96,12 @@ static uint32_t readU32(const std::vector<uint8_t>& bytes, size_t offset) {
            (uint32_t(bytes[offset + 3]) << 24);
 }
 
+static uint16_t readU16(const std::vector<uint8_t>& bytes, size_t offset) {
+    if (offset + 2 > bytes.size()) return 0;
+    return uint16_t(bytes[offset + 0]) |
+           uint16_t(uint16_t(bytes[offset + 1]) << 8);
+}
+
 static void writeU32(std::vector<uint8_t>& bytes, size_t offset, uint32_t value) {
     if (offset + 4 > bytes.size()) return;
     bytes[offset + 0] = uint8_t(value & 0xFF);
@@ -170,9 +176,227 @@ static bool knownChunkIdent(uint32_t ident) {
     return ident == MDL_IDENT || ident == TEX_IDENT || ident == WRLD_IDENT || isAreaIdent(ident) || ident == GTAG_IDENT;
 }
 
-static uint16_t readU16(const std::vector<uint8_t>& bytes, size_t offset) {
-    if (offset + 2 > bytes.size()) return 0;
-    return uint16_t(bytes[offset + 0]) | (uint16_t(bytes[offset + 1]) << 8);
+static bool mobileLcsRwChunkHeaderValid(const std::vector<uint8_t>& bytes, size_t offset, size_t limit,
+                                        uint32_t expectedType = 0xFFFFFFFFu) {
+    if (offset + 12u > limit || limit > bytes.size()) return false;
+    uint32_t type = readU32(bytes, offset + 0u);
+    uint32_t size = readU32(bytes, offset + 4u);
+    uint32_t version = readU32(bytes, offset + 8u);
+    if (expectedType != 0xFFFFFFFFu && type != expectedType) return false;
+    if (version != 0x00000310u) return false;
+    if (size > limit - offset - 12u) return false;
+    return true;
+}
+
+static bool mobileLcsRawClumpAt(const std::vector<uint8_t>& bytes, size_t offset, size_t& outSize) {
+    outSize = 0;
+    if (!mobileLcsRwChunkHeaderValid(bytes, offset, bytes.size(), 0x10u)) return false;
+    uint32_t payloadSize = readU32(bytes, offset + 4u);
+    size_t clumpEnd = offset + 12u + size_t(payloadSize);
+    if (payloadSize < 32u || clumpEnd > bytes.size()) return false;
+
+    size_t child = offset + 12u;
+    if (!mobileLcsRwChunkHeaderValid(bytes, child, clumpEnd, 0x01u)) return false;
+    uint32_t structSize = readU32(bytes, child + 4u);
+    if (structSize != 4u && structSize != 12u) return false;
+    child += 12u + size_t(structSize);
+    if (!mobileLcsRwChunkHeaderValid(bytes, child, clumpEnd, 0x0Eu)) return false;
+
+    outSize = 12u + size_t(payloadSize);
+    return true;
+}
+
+static std::string mobileLcsSanitizeEntryStem(std::string value) {
+    while (!value.empty() && (value.back() == ' ' || value.back() == '\t' || value.back() == '.')) value.pop_back();
+    for (char& ch : value) {
+        unsigned char byte = static_cast<unsigned char>(ch);
+        if (!(std::isalnum(byte) || ch == '_' || ch == '-')) ch = '_';
+    }
+    while (!value.empty() && value.front() == '_') value.erase(value.begin());
+    if (value.size() > 80u) value.resize(80u);
+    return value;
+}
+
+static std::string mobileLcsFrameNameFromClump(const std::vector<uint8_t>& bytes, size_t offset, size_t size) {
+    const uint32_t frameNamePlugin = 0x0253F2FEu;
+    size_t end = std::min(bytes.size(), offset + size);
+    std::string first;
+    std::string preferred;
+    for (size_t probe = offset + 12u; probe + 12u <= end; ++probe) {
+        if (readU32(bytes, probe) != frameNamePlugin) continue;
+        uint32_t payloadSize = readU32(bytes, probe + 4u);
+        uint32_t version = readU32(bytes, probe + 8u);
+        if (version != 0x00000310u || payloadSize == 0u || payloadSize > 128u || probe + 12u + payloadSize > end) continue;
+        std::string name;
+        for (size_t i = 0; i < payloadSize; ++i) {
+            unsigned char ch = bytes[probe + 12u + i];
+            if (ch == 0) break;
+            if (ch < 32 || ch >= 127) { name.clear(); break; }
+            name.push_back(char(ch));
+        }
+        name = mobileLcsSanitizeEntryStem(name);
+        if (name.empty()) continue;
+        if (first.empty()) first = name;
+        std::string lower = name;
+        std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+        if (lower != "root" && lower != "scene_root" && lower.find("dummy") == std::string::npos) {
+            preferred = name;
+            break;
+        }
+    }
+    return preferred.empty() ? first : preferred;
+}
+
+static bool mobileLcsRwStringChunk(
+    const std::vector<uint8_t>& bytes,
+    size_t offset,
+    size_t limit,
+    std::string& textOut,
+    size_t& nextOffsetOut
+) {
+    textOut.clear();
+    nextOffsetOut = offset;
+    if (!mobileLcsRwChunkHeaderValid(bytes, offset, limit, 0x02u)) return false;
+
+    uint32_t payloadSize = readU32(bytes, offset + 4u);
+    if (payloadSize > 1024u) return false;
+    size_t payloadOffset = offset + 12u;
+    size_t payloadEnd = payloadOffset + size_t(payloadSize);
+    for (size_t cursor = payloadOffset; cursor < payloadEnd; ++cursor) {
+        unsigned char ch = bytes[cursor];
+        if (ch == 0u) break;
+        if (ch < 32u || ch >= 127u) {
+            textOut.clear();
+            return false;
+        }
+        textOut.push_back(char(ch));
+    }
+
+    nextOffsetOut = payloadEnd;
+    return true;
+}
+
+static bool mobileLcsRawTextureDictionaryAt(
+    const std::vector<uint8_t>& bytes,
+    size_t offset,
+    size_t& outSize,
+    std::vector<std::string>& textureNamesOut
+) {
+    outSize = 0u;
+    textureNamesOut.clear();
+    if (offset + 12u > bytes.size()) return false;
+    if (readU32(bytes, offset + 0u) != 0x16u || readU32(bytes, offset + 8u) != 0x00000310u) return false;
+
+    size_t limit = std::min(bytes.size(), offset + size_t(0x04000000u));
+    size_t cursor = offset + 12u;
+    if (!mobileLcsRwChunkHeaderValid(bytes, cursor, limit, 0x01u)) return false;
+    uint32_t dictionaryStructSize = readU32(bytes, cursor + 4u);
+    if (dictionaryStructSize < 4u || dictionaryStructSize > 32u) return false;
+    uint32_t textureCount = readU16(bytes, cursor + 12u);
+    if (textureCount == 0u || textureCount > 4096u) return false;
+    cursor += 12u + size_t(dictionaryStructSize);
+
+    textureNamesOut.reserve(textureCount);
+    for (uint32_t textureIndex = 0u; textureIndex < textureCount; ++textureIndex) {
+        if (cursor + 12u > limit) return false;
+        if (readU32(bytes, cursor + 0u) != 0x15u || readU32(bytes, cursor + 8u) != 0x00000310u) return false;
+
+        size_t child = cursor + 12u;
+        if (!mobileLcsRwChunkHeaderValid(bytes, child, limit, 0x01u)) return false;
+        uint32_t platformStructSize = readU32(bytes, child + 4u);
+        if (platformStructSize < 8u || platformStructSize > 64u) return false;
+        if (child + 12u + 4u > limit) return false;
+        if (readU32(bytes, child + 12u) != 0x00505350u) return false; // "PSP\0"
+        child += 12u + size_t(platformStructSize);
+
+        std::string textureName;
+        size_t nextChild = child;
+        if (!mobileLcsRwStringChunk(bytes, child, limit, textureName, nextChild)) return false;
+        child = nextChild;
+
+        std::string maskName;
+        if (!mobileLcsRwStringChunk(bytes, child, limit, maskName, nextChild)) return false;
+        child = nextChild;
+
+        if (!mobileLcsRwChunkHeaderValid(bytes, child, limit, 0x01u)) return false;
+        size_t rasterContainerEnd = child + 12u + size_t(readU32(bytes, child + 4u));
+        size_t rasterChild = child + 12u;
+        if (!mobileLcsRwChunkHeaderValid(bytes, rasterChild, rasterContainerEnd, 0x01u)) return false;
+        if (readU32(bytes, rasterChild + 4u) < 20u) return false;
+        rasterChild += 12u + size_t(readU32(bytes, rasterChild + 4u));
+        if (!mobileLcsRwChunkHeaderValid(bytes, rasterChild, rasterContainerEnd, 0x01u)) return false;
+
+        textureName = mobileLcsSanitizeEntryStem(textureName);
+        if (textureName.empty()) {
+            char fallback[48] = {};
+            std::snprintf(fallback, sizeof(fallback), "texture_%04u", textureIndex);
+            textureName = fallback;
+        }
+        textureNamesOut.push_back(textureName);
+
+        cursor = rasterContainerEnd;
+        if (mobileLcsRwChunkHeaderValid(bytes, cursor, limit, 0x03u)) {
+            cursor += 12u + size_t(readU32(bytes, cursor + 4u));
+        }
+    }
+
+    if (mobileLcsRwChunkHeaderValid(bytes, cursor, limit, 0x03u)) {
+        cursor += 12u + size_t(readU32(bytes, cursor + 4u));
+    }
+
+    if (cursor <= offset || cursor > limit) return false;
+    outSize = cursor - offset;
+    return true;
+}
+
+static std::vector<std::string> mobileLcsTextureNameHintsFromClump(
+    const std::vector<uint8_t>& bytes,
+    size_t offset,
+    size_t size
+) {
+    std::vector<std::string> hints;
+    std::set<std::string> seen;
+    size_t end = std::min(bytes.size(), offset + size);
+
+    for (size_t probe = offset + 12u; probe + 12u <= end; ++probe) {
+        if (readU32(bytes, probe + 0u) != 0x02u || readU32(bytes, probe + 8u) != 0x00000310u) continue;
+        uint32_t payloadSize = readU32(bytes, probe + 4u);
+        if (payloadSize == 0u || payloadSize > 128u || probe + 12u + payloadSize > end) continue;
+
+        std::string value;
+        for (uint32_t i = 0u; i < payloadSize; ++i) {
+            unsigned char ch = bytes[probe + 12u + i];
+            if (ch == 0u) break;
+            if (ch < 32u || ch >= 127u) {
+                value.clear();
+                break;
+            }
+            value.push_back(char(ch));
+        }
+        if (value.empty()) continue;
+        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+        if (seen.insert(value).second) hints.push_back(value);
+    }
+    return hints;
+}
+
+static std::string mobileLcsTextureMatchKey(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) value.pop_back();
+    return value;
+}
+
+static std::string mobileLcsTextureLooseKey(std::string value) {
+    value = mobileLcsTextureMatchKey(std::move(value));
+    const char* prefixes[] = {"xv_", "veh_", "vehicle_", "lcs_"};
+    for (const char* prefix : prefixes) {
+        size_t length = std::strlen(prefix);
+        if (value.size() > length && value.compare(0u, length, prefix) == 0) {
+            value.erase(0u, length);
+            break;
+        }
+    }
+    return value;
 }
 
 static float readF32(const std::vector<uint8_t>& bytes, size_t offset) {
@@ -2791,6 +3015,114 @@ void StorylandArchiveBrowser::buildWorldMeshes() {
     }
 }
 
+bool StorylandArchiveBrowser::buildEntriesFromMobileLcsImg(std::string& errorMessage) {
+    archiveEntries.clear();
+    worldPlacements.clear();
+    worldSectors.clear();
+    worldMeshCache.clear();
+    directTextureCache.clear();
+    imgResourceRowCache.clear();
+    resourceResolutionCache.clear();
+
+    if (currentImgBytes.size() < 2048u) {
+        errorMessage = "IMG is too small to be a Mobile LCS raw gta3.img archive.";
+        return false;
+    }
+
+    std::map<std::string, uint32_t> duplicateNames;
+    uint32_t dffCount = 0u;
+    uint32_t txdCount = 0u;
+    uint32_t textureCount = 0u;
+    size_t sector = 0;
+    while (sector * 2048u + 12u <= currentImgBytes.size()) {
+        size_t offset = sector * 2048u;
+        size_t clumpSize = 0;
+        if (!mobileLcsRawClumpAt(currentImgBytes, offset, clumpSize)) {
+            ++sector;
+            continue;
+        }
+
+        StorylandArchiveEntry entry;
+        entry.index = uint32_t(archiveEntries.size());
+        entry.startSector = uint32_t(sector);
+        entry.sectorCount = uint32_t((clumpSize + 2047u) / 2048u);
+        entry.byteOffset = uint64_t(offset);
+        entry.byteSize = uint64_t(std::min(currentImgBytes.size() - offset,
+            std::max<size_t>(2048u, ((clumpSize + 2047u) / 2048u) * 2048u)));
+        entry.chunkIdent = 0x10u;
+        entry.usesLvzChunkHeader = false;
+
+        std::string stem = mobileLcsFrameNameFromClump(currentImgBytes, offset, clumpSize);
+        if (stem.empty()) {
+            char fallback[64] = {};
+            std::snprintf(fallback, sizeof(fallback), "mobile_lcs_%05u", entry.index);
+            stem = fallback;
+        }
+        std::string key = stem;
+        std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+        uint32_t duplicate = duplicateNames[key]++;
+        if (duplicate != 0u) {
+            char suffix[24] = {};
+            std::snprintf(suffix, sizeof(suffix), "_%03u", duplicate);
+            stem += suffix;
+        }
+        entry.name = stem + ".dff";
+        archiveEntries.push_back(std::move(entry));
+        dffCount++;
+
+        sector += std::max<size_t>(1u, (clumpSize + 2047u) / 2048u);
+    }
+
+    for (size_t textureSector = 0u; textureSector * 2048u + 12u <= currentImgBytes.size(); ++textureSector) {
+        size_t offset = textureSector * 2048u;
+        size_t dictionarySize = 0u;
+        std::vector<std::string> textureNames;
+        if (!mobileLcsRawTextureDictionaryAt(currentImgBytes, offset, dictionarySize, textureNames)) continue;
+
+        StorylandArchiveEntry entry;
+        entry.index = uint32_t(archiveEntries.size());
+        entry.startSector = uint32_t(textureSector);
+        entry.sectorCount = uint32_t(std::max<size_t>(1u, (dictionarySize + 2047u) / 2048u));
+        entry.byteOffset = uint64_t(offset);
+        entry.byteSize = uint64_t(std::min(currentImgBytes.size() - offset,
+            size_t(entry.sectorCount) * 2048u));
+        entry.chunkIdent = 0x16u;
+        entry.usesLvzChunkHeader = false;
+        entry.textureNames = std::move(textureNames);
+
+        std::string firstTexture = entry.textureNames.empty() ? std::string("textures") : entry.textureNames.front();
+        firstTexture = mobileLcsSanitizeEntryStem(firstTexture);
+        if (firstTexture.empty()) firstTexture = "textures";
+        char name[128] = {};
+        std::snprintf(name, sizeof(name), "mobile_lcs_txd_%05u_%s.txd", entry.startSector, firstTexture.c_str());
+        entry.name = name;
+
+        textureCount += uint32_t(entry.textureNames.size());
+        txdCount++;
+        archiveEntries.push_back(std::move(entry));
+
+    }
+
+    if (archiveEntries.empty()) {
+        errorMessage = "No sector-aligned RenderWare 3.1 DFF clumps or PSP texture dictionaries were found. This is not the supported Mobile LCS raw gta3.img layout.";
+        return false;
+    }
+
+    std::sort(archiveEntries.begin(), archiveEntries.end(), [](const StorylandArchiveEntry& a, const StorylandArchiveEntry& b) {
+        if (a.byteOffset != b.byteOffset) return a.byteOffset < b.byteOffset;
+        return a.chunkIdent < b.chunkIdent;
+    });
+    for (size_t index = 0u; index < archiveEntries.size(); ++index) archiveEntries[index].index = uint32_t(index);
+
+    currentLevelSummary = "Mobile LCS raw gta3.img: " + std::to_string(dffCount) +
+        " sector-aligned RenderWare 3.1 DFF clumps, " + std::to_string(txdCount) +
+        " PSP RenderWare texture dictionaries, " + std::to_string(textureCount) +
+        " named textures; GAME.DTZ/LVZ is not required.";
+    currentImgSize = currentImgBytes.size();
+    errorMessage.clear();
+    return true;
+}
+
 bool StorylandArchiveBrowser::buildEntriesFromLvzAndImg(std::string& errorMessage) {
     archiveEntries.clear();
 
@@ -2981,19 +3313,26 @@ bool StorylandArchiveBrowser::loadLvzWithCompanionImg(const std::wstring& lvzPat
 
 bool StorylandArchiveBrowser::loadImgFromFile(const std::wstring& imgPath, std::string& errorMessage) {
     std::wstring lvzPath;
-    if (!autoFindCompanionLvzForImg(imgPath, lvzPath)) {
-        errorMessage = "IMG cannot be browsed by .DIR in retail LCS/VCS LVZ+IMG mode. Open the matching LVZ, or put the matching same-stem LVZ beside this IMG.";
+    if (autoFindCompanionLvzForImg(imgPath, lvzPath)) {
+        if (!loadLvzWithCompanionImg(lvzPath, errorMessage)) return false;
+
+        std::filesystem::path requested(imgPath);
+        std::filesystem::path loaded(currentImgPath);
+        if (lowerWide(requested.wstring()) != lowerWide(loaded.wstring())) currentImgPath = imgPath;
+        return true;
+    }
+
+    clear();
+    currentImgPath = imgPath;
+    if (!readWholeFile(imgPath, currentImgBytes, errorMessage)) {
+        clear();
         return false;
     }
-
-    if (!loadLvzWithCompanionImg(lvzPath, errorMessage)) return false;
-
-    std::filesystem::path requested(imgPath);
-    std::filesystem::path loaded(currentImgPath);
-    if (lowerWide(requested.wstring()) != lowerWide(loaded.wstring())) {
-        currentImgPath = imgPath;
+    currentImgSize = currentImgBytes.size();
+    if (!buildEntriesFromMobileLcsImg(errorMessage)) {
+        clear();
+        return false;
     }
-
     return true;
 }
 
@@ -3038,7 +3377,12 @@ bool StorylandArchiveBrowser::extractEntryBytes(size_t index, std::vector<uint8_
     }
 #endif
 
-    if (_fseeki64(file, static_cast<__int64>(entry.byteOffset), SEEK_SET) != 0) {
+#ifdef _WIN32
+    const int seekResult = _fseeki64(file, static_cast<__int64>(entry.byteOffset), SEEK_SET);
+#else
+    const int seekResult = fseeko(file, static_cast<off_t>(entry.byteOffset), SEEK_SET);
+#endif
+    if (seekResult != 0) {
         fclose(file);
         errorMessage = "Could not seek to IMG entry.";
         return false;
@@ -3079,6 +3423,7 @@ bool StorylandArchiveBrowser::extractEntryBytes(size_t index, std::vector<uint8_
 }
 
 bool StorylandArchiveBrowser::rebuildParsedCaches(std::string& errorMessage) {
+    if (currentLvzBytes.empty()) return buildEntriesFromMobileLcsImg(errorMessage);
     if (!buildEntriesFromLvzAndImg(errorMessage)) return false;
     buildDirectTexturesFromLvz();
     buildWorldSectorsAndPlacements();
@@ -3856,4 +4201,67 @@ bool StorylandArchiveBrowser::findEntryByStemAndExtension(const std::wstring& st
     }
 
     return false;
+}
+
+bool StorylandArchiveBrowser::findMobileLcsTextureDictionaryForEntry(size_t modelEntryIndex, size_t& outTextureEntryIndex) const {
+    if (modelEntryIndex >= archiveEntries.size()) return false;
+    const StorylandArchiveEntry& modelEntry = archiveEntries[modelEntryIndex];
+    if (modelEntry.chunkIdent != 0x10u || modelEntry.byteOffset >= currentImgBytes.size()) return false;
+
+    size_t available = currentImgBytes.size() - size_t(modelEntry.byteOffset);
+    size_t modelSize = size_t(std::min<uint64_t>(modelEntry.byteSize, uint64_t(available)));
+    size_t clumpSize = 0u;
+    if (mobileLcsRawClumpAt(currentImgBytes, size_t(modelEntry.byteOffset), clumpSize)) {
+        modelSize = std::min(modelSize, clumpSize);
+    }
+
+    std::vector<std::string> hints = mobileLcsTextureNameHintsFromClump(
+        currentImgBytes,
+        size_t(modelEntry.byteOffset),
+        modelSize
+    );
+    if (hints.empty()) return false;
+
+    std::string modelStem = modelEntry.name;
+    size_t dot = modelStem.find_last_of('.');
+    if (dot != std::string::npos) modelStem.resize(dot);
+    modelStem = mobileLcsTextureMatchKey(std::move(modelStem));
+
+    int bestScore = 0;
+    size_t bestIndex = 0u;
+    for (size_t entryIndex = 0u; entryIndex < archiveEntries.size(); ++entryIndex) {
+        const StorylandArchiveEntry& candidate = archiveEntries[entryIndex];
+        if (candidate.chunkIdent != 0x16u || candidate.textureNames.empty()) continue;
+
+        int score = 0;
+        for (const std::string& rawTextureName : candidate.textureNames) {
+            std::string textureName = mobileLcsTextureMatchKey(rawTextureName);
+            std::string textureLoose = mobileLcsTextureLooseKey(rawTextureName);
+
+            if (!modelStem.empty()) {
+                if (textureName == modelStem) score += 50000;
+                else if (textureName.find(modelStem) != std::string::npos) score += 12000;
+            }
+
+            for (const std::string& rawHint : hints) {
+                std::string hint = mobileLcsTextureMatchKey(rawHint);
+                std::string hintLoose = mobileLcsTextureLooseKey(rawHint);
+                if (hint.empty()) continue;
+
+                if (textureName == hint) score += 100000;
+                else if (!hintLoose.empty() && textureLoose == hintLoose) score += 60000;
+                else if (hint.size() >= 5u && textureName.find(hint) != std::string::npos) score += 12000;
+                else if (textureName.size() >= 5u && hint.find(textureName) != std::string::npos) score += 8000;
+            }
+        }
+
+        if (score > bestScore) {
+            bestScore = score;
+            bestIndex = entryIndex;
+        }
+    }
+
+    if (bestScore <= 0) return false;
+    outTextureEntryIndex = bestIndex;
+    return true;
 }

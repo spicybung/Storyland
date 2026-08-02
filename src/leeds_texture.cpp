@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <fstream>
+#include <filesystem>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -80,6 +81,10 @@ static bool bppReasonablePsp(uint32_t bpp) {
 
 static bool bppReasonablePs2(uint32_t bpp) {
     return bpp == 4 || bpp == 8 || bpp == 16 || bpp == 32;
+}
+
+static bool isPspTextureKind(TextureKind kind) {
+    return kind == TextureKind::Psp || kind == TextureKind::RwPsp;
 }
 
 static bool parsePspHeader(const std::vector<uint8_t>& data, uint32_t offset, LeedsTextureEntry& entry) {
@@ -207,6 +212,168 @@ static bool parseCtwStandaloneTex(const std::vector<uint8_t>& data, LeedsTexture
     }
 
     return false;
+}
+
+static bool rwChunkHeaderValid(const std::vector<uint8_t>& data, size_t offset, size_t limit, uint32_t expectedType) {
+    if (limit > data.size() || offset + 12u > limit) return false;
+    uint32_t type = readU32(data, offset + 0u);
+    uint32_t size = readU32(data, offset + 4u);
+    uint32_t version = readU32(data, offset + 8u);
+    if (type != expectedType || version != 0x00000310u) return false;
+    return size <= limit - offset - 12u;
+}
+
+static bool parseRwStringChunk(
+    const std::vector<uint8_t>& data,
+    size_t offset,
+    size_t limit,
+    std::string& textOut,
+    size_t& nextOffsetOut
+) {
+    textOut.clear();
+    nextOffsetOut = offset;
+    if (!rwChunkHeaderValid(data, offset, limit, 0x02u)) return false;
+    uint32_t size = readU32(data, offset + 4u);
+    if (size > 1024u) return false;
+
+    size_t payload = offset + 12u;
+    for (uint32_t index = 0u; index < size; ++index) {
+        unsigned char ch = data[payload + index];
+        if (ch == 0u) break;
+        if (ch < 32u || ch >= 127u) {
+            textOut.clear();
+            return false;
+        }
+        textOut.push_back(char(ch));
+    }
+    nextOffsetOut = payload + size_t(size);
+    return true;
+}
+
+static bool parseMobileLcsRwTxd(
+    const std::vector<uint8_t>& data,
+    std::vector<LeedsTextureEntry>& entriesOut,
+    std::string& errorMessage
+) {
+    entriesOut.clear();
+    if (data.size() < 32u || readU32(data, 0u) != 0x16u || readU32(data, 8u) != 0x00000310u) return false;
+
+    size_t limit = data.size();
+    size_t cursor = 12u;
+    if (!rwChunkHeaderValid(data, cursor, limit, 0x01u)) {
+        errorMessage = "Mobile LCS RenderWare TXD has an invalid dictionary Struct chunk.";
+        return false;
+    }
+
+    uint32_t dictionaryStructSize = readU32(data, cursor + 4u);
+    if (dictionaryStructSize < 4u || dictionaryStructSize > 32u) {
+        errorMessage = "Mobile LCS RenderWare TXD has an invalid dictionary Struct size.";
+        return false;
+    }
+    uint32_t textureCount = readU16(data, cursor + 12u);
+    if (textureCount == 0u || textureCount > 4096u) {
+        errorMessage = "Mobile LCS RenderWare TXD has an invalid texture count.";
+        return false;
+    }
+    cursor += 12u + size_t(dictionaryStructSize);
+
+    entriesOut.reserve(textureCount);
+    for (uint32_t textureIndex = 0u; textureIndex < textureCount; ++textureIndex) {
+        if (cursor + 12u > limit || readU32(data, cursor + 0u) != 0x15u || readU32(data, cursor + 8u) != 0x00000310u) {
+            errorMessage = "Mobile LCS RenderWare TXD ended before all native textures were parsed.";
+            entriesOut.clear();
+            return false;
+        }
+
+        size_t nativeOffset = cursor;
+        size_t child = cursor + 12u;
+        if (!rwChunkHeaderValid(data, child, limit, 0x01u)) {
+            errorMessage = "Mobile LCS RenderWare native texture has an invalid platform Struct chunk.";
+            entriesOut.clear();
+            return false;
+        }
+        uint32_t platformStructSize = readU32(data, child + 4u);
+        if (platformStructSize < 8u || platformStructSize > 64u || readU32(data, child + 12u) != 0x00505350u) {
+            errorMessage = "RenderWare TXD is not the supported Mobile LCS PSP-native texture layout.";
+            entriesOut.clear();
+            return false;
+        }
+        child += 12u + size_t(platformStructSize);
+
+        std::string textureName;
+        size_t nextChild = child;
+        if (!parseRwStringChunk(data, child, limit, textureName, nextChild)) {
+            errorMessage = "Mobile LCS RenderWare native texture has an invalid name chunk.";
+            entriesOut.clear();
+            return false;
+        }
+        child = nextChild;
+
+        std::string maskName;
+        if (!parseRwStringChunk(data, child, limit, maskName, nextChild)) {
+            errorMessage = "Mobile LCS RenderWare native texture has an invalid mask-name chunk.";
+            entriesOut.clear();
+            return false;
+        }
+        child = nextChild;
+
+        if (!rwChunkHeaderValid(data, child, limit, 0x01u)) {
+            errorMessage = "Mobile LCS RenderWare native texture has an invalid raster container.";
+            entriesOut.clear();
+            return false;
+        }
+        size_t rasterContainerEnd = child + 12u + size_t(readU32(data, child + 4u));
+        size_t rasterChild = child + 12u;
+        if (!rwChunkHeaderValid(data, rasterChild, rasterContainerEnd, 0x01u) || readU32(data, rasterChild + 4u) < 20u) {
+            errorMessage = "Mobile LCS RenderWare native texture has an invalid raster header.";
+            entriesOut.clear();
+            return false;
+        }
+
+        size_t rasterHeaderPayload = rasterChild + 12u;
+        uint32_t width = readU32(data, rasterHeaderPayload + 0u);
+        uint32_t height = readU32(data, rasterHeaderPayload + 4u);
+        uint32_t bpp = readU32(data, rasterHeaderPayload + 8u);
+        uint32_t mipCount = readU32(data, rasterHeaderPayload + 12u);
+        uint32_t rasterFlags = readU32(data, rasterHeaderPayload + 16u);
+        if (!dimensionsReasonable(int(width), int(height)) || !bppReasonablePsp(bpp) || mipCount == 0u || mipCount > 16u) {
+            errorMessage = "Mobile LCS RenderWare native texture has unsupported dimensions, BPP, or mip count.";
+            entriesOut.clear();
+            return false;
+        }
+
+        rasterChild += 12u + size_t(readU32(data, rasterChild + 4u));
+        if (!rwChunkHeaderValid(data, rasterChild, rasterContainerEnd, 0x01u)) {
+            errorMessage = "Mobile LCS RenderWare native texture has no raster payload chunk.";
+            entriesOut.clear();
+            return false;
+        }
+
+        LeedsTextureEntry entry;
+        entry.name = textureName.empty() ? ("texture_" + std::to_string(textureIndex)) : textureName;
+        entry.kind = TextureKind::RwPsp;
+        entry.containerBase = uint32_t(nativeOffset);
+        entry.textureHeaderOffset = uint32_t(rasterHeaderPayload);
+        entry.rasterOffset = uint32_t(rasterChild + 12u);
+        entry.blockSize = readU32(data, rasterChild + 4u);
+        entry.flags = rasterFlags;
+        entry.width = int(width);
+        entry.height = int(height);
+        entry.widthPow2 = isPowerOfTwoInt(int(width)) ? log2ExactInt(int(width)) : 0u;
+        entry.heightPow2 = isPowerOfTwoInt(int(height)) ? log2ExactInt(int(height)) : 0u;
+        entry.bpp = uint8_t(bpp);
+        entry.mipCount = uint8_t(mipCount);
+        entry.swizzleWidth = uint16_t(bpp == 4u ? std::max<uint32_t>(1u, width / 2u) : width);
+        entriesOut.push_back(entry);
+
+        cursor = rasterContainerEnd;
+        if (rwChunkHeaderValid(data, cursor, limit, 0x03u)) {
+            cursor += 12u + size_t(readU32(data, cursor + 4u));
+        }
+    }
+
+    errorMessage.clear();
+    return !entriesOut.empty();
 }
 
 static uint32_t ctwPart1By1(uint32_t value) {
@@ -590,7 +757,7 @@ static bool findPaletteStartForEntry(const std::vector<uint8_t>& data, const Lee
     // look "varied" enough to fool the old usefulness test into treating them as
     // a palette.  PS2 archives more often use the immediate-palette layout, so
     // keep that order for PS2.
-    if (entry.kind == TextureKind::Psp && entry.blockSize >= paletteBytes) {
+    if (isPspTextureKind(entry.kind) && entry.blockSize >= paletteBytes) {
         paletteStartCandidates.push_back(entry.rasterOffset + entry.blockSize - paletteBytes);
     }
 
@@ -599,7 +766,7 @@ static bool findPaletteStartForEntry(const std::vector<uint8_t>& data, const Lee
         paletteStartCandidates.push_back(entry.rasterOffset + payloadBytes);
     }
 
-    if (entry.kind != TextureKind::Psp && entry.blockSize >= paletteBytes) {
+    if (!isPspTextureKind(entry.kind) && entry.blockSize >= paletteBytes) {
         paletteStartCandidates.push_back(entry.rasterOffset + entry.blockSize - paletteBytes);
     }
 
@@ -780,7 +947,7 @@ static std::vector<uint8_t> readPalette(const std::vector<uint8_t>& data, const 
     // post-base bytes are valid-looking mip data, so the old "first useful
     // palette" heuristic picked mip pixels as colours and made PSP textures look
     // scrambled/garbage.
-    if (entry.kind == TextureKind::Psp && entry.blockSize >= paletteBytes) {
+    if (isPspTextureKind(entry.kind) && entry.blockSize >= paletteBytes) {
         paletteStartCandidates.push_back(entry.rasterOffset + entry.blockSize - paletteBytes);
     }
 
@@ -789,7 +956,7 @@ static std::vector<uint8_t> readPalette(const std::vector<uint8_t>& data, const 
         paletteStartCandidates.push_back(entry.rasterOffset + payloadBytes);
     }
 
-    if (entry.kind != TextureKind::Psp && entry.blockSize >= paletteBytes) {
+    if (!isPspTextureKind(entry.kind) && entry.blockSize >= paletteBytes) {
         paletteStartCandidates.push_back(entry.rasterOffset + entry.blockSize - paletteBytes);
     }
 
@@ -1132,7 +1299,7 @@ bool LeedsTextureArchive::loadFromFile(const std::wstring& filePath, LeedsPlatfo
 }
 
 bool LeedsTextureArchive::saveToFile(const std::wstring& filePath, std::string& errorMessage) const {
-    std::ofstream file(filePath, std::ios::binary);
+    std::ofstream file(std::filesystem::path(filePath), std::ios::binary);
     if (!file) {
         errorMessage = "Could not open output file.";
         return false;
@@ -1147,6 +1314,10 @@ bool LeedsTextureArchive::saveToFile(const std::wstring& filePath, std::string& 
 
 bool LeedsTextureArchive::parse(LeedsPlatform platform, std::string& errorMessage) {
     entries.clear();
+
+    if (dataBytes.size() >= 12u && readU32(dataBytes, 0u) == 0x16u && readU32(dataBytes, 8u) == 0x00000310u) {
+        return parseMobileLcsRwTxd(dataBytes, entries, errorMessage);
+    }
 
     LeedsTextureEntry ctwTex;
     if (parseCtwStandaloneTex(dataBytes, ctwTex)) {
@@ -1288,7 +1459,7 @@ bool LeedsTextureArchive::decodeTexture(size_t textureIndex, RgbaImage& image, s
     image.rgba.assign(pixelCount * 4, 255);
     const uint8_t* raw = dataBytes.data() + entry.rasterOffset;
 
-    if (entry.kind == TextureKind::Psp) {
+    if (isPspTextureKind(entry.kind)) {
         if (entry.bpp == 32) {
             std::vector<uint8_t> rgba = entry.swizzleWidth ? unswizzlePspBytes(raw, baseBytes, entry.width, entry.height, 4, 1) : std::vector<uint8_t>(raw, raw + baseBytes);
             image.rgba = std::move(rgba);
@@ -1380,6 +1551,10 @@ bool LeedsTextureArchive::replaceTextureAsBpp(size_t textureIndex, const RgbaIma
     }
     if (entry.kind == TextureKind::CtwTex) {
         errorMessage = "Standalone CTW .tex replacement is not enabled yet.";
+        return false;
+    }
+    if (entry.kind == TextureKind::RwPsp) {
+        errorMessage = "Mobile LCS RenderWare TXD texture replacement is read-only in this build.";
         return false;
     }
     if (entry.kind == TextureKind::Psp && targetBpp == 16) {
@@ -1557,6 +1732,10 @@ bool LeedsTextureArchive::renameTexture(size_t textureIndex, const std::string& 
     }
 
     LeedsTextureEntry entry = entries[textureIndex];
+    if (entry.kind == TextureKind::RwPsp) {
+        errorMessage = "Mobile LCS RenderWare TXD texture renaming is read-only in this build.";
+        return false;
+    }
     if (entry.containerBase + 0x50 > dataBytes.size()) {
         errorMessage = "Texture container name field points outside the file.";
         return false;

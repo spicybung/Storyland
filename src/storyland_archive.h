@@ -14,6 +14,7 @@ struct StorylandArchiveEntry {
     uint32_t chunkIdent = 0;
     bool usesLvzChunkHeader = false;
     std::string name;
+    std::vector<std::string> textureNames;
 };
 
 struct StorylandWorldPlacement {
@@ -149,6 +150,7 @@ public:
     bool saveLvzImgPair(const std::wstring& lvzPath, const std::wstring& imgPath, bool compressLvz, std::string& errorMessage) const;
     bool overwriteCurrentLvzImgPair(bool compressLvz, std::string& errorMessage) const;
     bool findEntryByStemAndExtension(const std::wstring& stem, const std::initializer_list<std::wstring>& extensions, size_t& outIndex) const;
+    bool findMobileLcsTextureDictionaryForEntry(size_t modelEntryIndex, size_t& outTextureEntryIndex) const;
 
 private:
     std::wstring currentImgPath;
@@ -173,6 +175,7 @@ private:
     bool writeWholeFile(const std::wstring& path, const std::vector<uint8_t>& bytes, std::string& errorMessage) const;
     bool rebuildParsedCaches(std::string& errorMessage);
     bool buildEntriesFromLvzAndImg(std::string& errorMessage);
+    bool buildEntriesFromMobileLcsImg(std::string& errorMessage);
     void buildWorldSectorsAndPlacements();
     void buildWorldMeshes();
     void buildDirectTexturesFromLvz();

@@ -74,6 +74,9 @@
 #define GL_CLAMP_TO_EDGE 0x812F
 #endif
 
+#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
+#define DWMWA_USE_IMMERSIVE_DARK_MODE 20
+#endif
 #ifndef DWMWA_BORDER_COLOR
 #define DWMWA_BORDER_COLOR 34
 #endif
@@ -164,6 +167,8 @@ typedef void (APIENTRY *PFNGLACTIVETEXTUREPROC)(GLenum texture);
 #define ID_FILE_QUIT 1055
 #define ID_FILE_RECENT_CLEAR 1056
 #define ID_HELP_WIKI 1057
+#define ID_FILE_EXPORT_MOBILE_LCS_DFF 1058
+#define ID_VIEW_SHOW_2DFX_LIGHTS 1059
 #define ID_FILE_RECENT_BASE 3000
 #define ID_TREE 2001
 #define ID_DETAILS 2002
@@ -254,11 +259,11 @@ static void applyStorylandPaneBackground(HWND mainWindow) {
     const COLORREF paneColor = storylandPaneBackgroundColor();
     gPaneBackgroundBrush = CreateSolidBrush(paneColor);
     applyStorylandNativeMenuTheme(mainWindow);
-    // The themed WS_EX_CLIENTEDGE bevel is always pale. Remove it in Dark mode
-    // so the deliberately darker four-pixel pane gutters become the separators.
-    setStorylandClientEdge(gTree, !gEyeFriendlyPaneBackground);
-    setStorylandClientEdge(gPreview, !gEyeFriendlyPaneBackground);
-    setStorylandClientEdge(gDetails, !gEyeFriendlyPaneBackground);
+    // The themed WS_EX_CLIENTEDGE bevel is always pale and ignores the active
+    // LCS/VCS/CTW tint. Storyland draws the pane frame itself in the client area.
+    setStorylandClientEdge(gTree, false);
+    setStorylandClientEdge(gPreview, false);
+    setStorylandClientEdge(gDetails, false);
     if (gTree) {
         TreeView_SetBkColor(gTree, paneColor);
         TreeView_SetTextColor(gTree, storylandPaneTextColor());
@@ -333,6 +338,7 @@ static bool gOpenGlShowGrid = false;
 static bool gOpenGlShowBones = false;
 static bool gOpenGlShowBounds = false;
 static bool gOpenGlShowViewCube = true;
+static bool gOpenGlShow2dfxLights = true;
 static bool gModelViewCubeDrag = false;
 static GLuint gStoriesShaderProgram = 0;
 static bool gStoriesShaderTried = false;
@@ -569,6 +575,8 @@ enum class StorylandTreeKind {
     DtzDirEntry,
     DtzDataBlock,
     DtzDataField,
+    DtzLeeds2dfx,
+    DtzLeeds2dfxWorld,
     ModelField,
     ModelBone,
     WblOverview,
@@ -667,7 +675,7 @@ static std::wstring canonicalDtzImgResourceName(const std::wstring& displayName)
     std::transform(lower.begin(), lower.end(), lower.begin(), [](wchar_t c) { return wchar_t(towlower(c)); });
 
     const wchar_t* knownExtensions[] = {
-        L".mdl", L".dff", L".wbl", L".xtx", L".chk", L".tex", L".anim", L".col", L".col2", L".dat", L".ipl", L".ide", L".cut", L".dir", L".bin", L".dtz"
+        L".mdl", L".dff", L".wbl", L".xtx", L".chk", L".tex", L".txd", L".anim", L".col", L".col2", L".dat", L".ipl", L".ide", L".cut", L".dir", L".bin", L".dtz"
     };
 
     size_t bestPos = std::wstring::npos;
@@ -719,7 +727,7 @@ static bool containsWideNoCase(const std::wstring& text, const std::wstring& par
 static StorylandTitleTint titleTintFromPath(const std::wstring& path) {
     std::wstring ext = getExtensionLower(path);
 
-    if (ext == L".chk") return StorylandTitleTint::LCS;
+    if (ext == L".chk" || ext == L".txd") return StorylandTitleTint::LCS;
     if (ext == L".xtx") return StorylandTitleTint::VCS;
     if (ext == L".wbl" || ext == L".tex") return StorylandTitleTint::CTW;
 
@@ -731,6 +739,15 @@ static StorylandTitleTint titleTintFromPath(const std::wstring& path) {
     return StorylandTitleTint::Default;
 }
 
+static COLORREF storylandPaneBorderColor() {
+    switch (gTitleTint) {
+    case StorylandTitleTint::LCS: return RGB(181, 221, 242);
+    case StorylandTitleTint::VCS: return RGB(255, 188, 218);
+    case StorylandTitleTint::CTW: return RGB(130, 20, 30);
+    default: return gEyeFriendlyPaneBackground ? RGB(74, 78, 90) : GetSysColor(COLOR_WINDOWFRAME);
+    }
+}
+
 static void applyStorylandTitleTint(StorylandTitleTint tint) {
     gTitleTint = tint;
     if (!gMainWindow) return;
@@ -739,16 +756,19 @@ static void applyStorylandTitleTint(StorylandTitleTint tint) {
     DWORD borderColor = DWMWA_COLOR_DEFAULT;
     DWORD textColor = DWMWA_COLOR_DEFAULT;
 
+    BOOL immersiveDarkMode = TRUE;
     switch (tint) {
     case StorylandTitleTint::LCS:
-        captionColor = RGB(184, 224, 255);
-        borderColor = RGB(105, 166, 218);
+        captionColor = RGB(181, 221, 242);
+        borderColor = RGB(181, 221, 242);
         textColor = RGB(18, 34, 50);
+        immersiveDarkMode = FALSE;
         break;
     case StorylandTitleTint::VCS:
         captionColor = RGB(255, 188, 218);
-        borderColor = RGB(224, 108, 168);
+        borderColor = RGB(255, 188, 218);
         textColor = RGB(54, 24, 42);
+        immersiveDarkMode = FALSE;
         break;
     case StorylandTitleTint::CTW:
         captionColor = RGB(84, 8, 18);
@@ -759,9 +779,18 @@ static void applyStorylandTitleTint(StorylandTitleTint tint) {
         break;
     }
 
+    DwmSetWindowAttribute(gMainWindow, DWMWA_USE_IMMERSIVE_DARK_MODE, &immersiveDarkMode, sizeof(immersiveDarkMode));
     DwmSetWindowAttribute(gMainWindow, DWMWA_CAPTION_COLOR, &captionColor, sizeof(captionColor));
     DwmSetWindowAttribute(gMainWindow, DWMWA_BORDER_COLOR, &borderColor, sizeof(borderColor));
     DwmSetWindowAttribute(gMainWindow, DWMWA_TEXT_COLOR, &textColor, sizeof(textColor));
+
+    SetWindowPos(gMainWindow, nullptr, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    RedrawWindow(gMainWindow, nullptr, nullptr,
+        RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW | RDW_ALLCHILDREN);
+    for (HWND pane : {gTree, gPreview, gDetails}) {
+        if (pane) RedrawWindow(pane, nullptr, nullptr, RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW);
+    }
 }
 
 static void applyStorylandTitleTintForPath(const std::wstring& path) {
@@ -863,6 +892,7 @@ static void fitModelViewportCloser();
 static bool handleModelViewportShortcut(WPARAM key);
 static bool prepareDtzDirEntryPreview(int index, std::wstring& previewSummary);
 static void openSelectedDtzDirEntryStandalone();
+static const wchar_t* leeds2dfxEffectTypeName(uint8_t type);
 
 static bool sameWideNoCase(const std::wstring& a, const std::wstring& b) {
     if (a.size() != b.size()) return false;
@@ -874,7 +904,7 @@ static bool sameWideNoCase(const std::wstring& a, const std::wstring& b) {
 
 static bool textureArchiveExtension(const std::wstring& path) {
     std::wstring ext = getExtensionLower(path);
-    return ext == L".xtx" || ext == L".chk" || ext == L".tex";
+    return ext == L".xtx" || ext == L".chk" || ext == L".tex" || ext == L".txd";
 }
 
 static void appendUniquePath(std::vector<std::wstring>& paths, const std::wstring& path) {
@@ -890,7 +920,7 @@ static std::vector<std::wstring> collectCompanionTextureCandidates(const std::ws
     std::wstring directory = getDirectoryPart(modelPath);
     std::wstring stem = getFileStemPart(modelPath);
 
-    const wchar_t* directExtensions[] = {L".xtx", L".chk", L".tex", L".XTX", L".CHK", L".TEX"};
+    const wchar_t* directExtensions[] = {L".xtx", L".chk", L".tex", L".txd", L".XTX", L".CHK", L".TEX", L".TXD"};
     for (const wchar_t* extension : directExtensions) {
         std::wstring candidate = directory + stem + extension;
         if (fileExists(candidate)) appendUniquePath(paths, candidate);
@@ -909,7 +939,7 @@ static std::vector<std::wstring> collectCompanionTextureCandidates(const std::ws
         FindClose(find);
     }
 
-    const wchar_t* patterns[] = {L"*.xtx", L"*.chk", L"*.tex", L"*.XTX", L"*.CHK", L"*.TEX"};
+    const wchar_t* patterns[] = {L"*.xtx", L"*.chk", L"*.tex", L"*.txd", L"*.XTX", L"*.CHK", L"*.TEX", L"*.TXD"};
     for (const wchar_t* pattern : patterns) {
         find = FindFirstFileW((directory + pattern).c_str(), &findData);
         if (find == INVALID_HANDLE_VALUE) continue;
@@ -948,8 +978,10 @@ static void setStatus(const std::wstring& text) {
 
 static std::wstring buildModelStatusLine() {
     std::wstringstream status;
-    status << L"MDL | " << widen(gModelFile.modelKindName())
-           << L" | " << gModelFile.armatureBones().size() << L" bones";
+    status << (gModelFile.isMobileLcsDff() ? L"Mobile LCS DFF | " : L"MDL | ")
+           << widen(gModelFile.modelKindName())
+           << L" | " << gModelFile.armatureBones().size() << L" frames/bones"
+           << L" | " << gModelFile.preview2dfxLights().size() << L" 2DFX lights";
     if (gModelTextureLoaded && !gModelTexturePath.empty()) {
         status << L" | " << std::filesystem::path(gModelTexturePath).filename().wstring()
                << L" | " << gModelTextureRegions.size() << L" textures"
@@ -1382,7 +1414,7 @@ static bool findBestCompanionTextureArchive(const std::wstring& modelPath, std::
     archivePathOut.clear();
     textureIndexOut = -1;
 
-    const wchar_t* extensions[] = {L".xtx", L".chk", L".tex", L".XTX", L".CHK", L".TEX"};
+    const wchar_t* extensions[] = {L".xtx", L".chk", L".tex", L".txd", L".XTX", L".CHK", L".TEX", L".TXD"};
     for (const wchar_t* extension : extensions) {
 
 
@@ -1390,7 +1422,7 @@ static bool findBestCompanionTextureArchive(const std::wstring& modelPath, std::
     }
 
     WIN32_FIND_DATAW findData = {};
-    const wchar_t* patterns[] = {L"*.xtx", L"*.chk", L"*.tex", L"*.XTX", L"*.CHK", L"*.TEX"};
+    const wchar_t* patterns[] = {L"*.xtx", L"*.chk", L"*.tex", L"*.txd", L"*.XTX", L"*.CHK", L"*.TEX", L"*.TXD"};
     for (const wchar_t* pattern : patterns) {
         HANDLE find = FindFirstFileW((directory + pattern).c_str(), &findData);
         if (find == INVALID_HANDLE_VALUE) continue;
@@ -1572,7 +1604,7 @@ static bool loadCompanionTextureForCurrentModel(const std::wstring& modelPath, s
 
     std::vector<std::wstring> candidatePaths = collectCompanionTextureCandidates(modelPath);
     if (candidatePaths.empty()) {
-        statusOut = L"No companion .xtx/.chk/.tex found beside MDL.";
+        statusOut = L"No companion .xtx/.chk/.tex/.txd found beside the model.";
         gModelTextureStatus = statusOut;
         return false;
     }
@@ -2646,6 +2678,21 @@ static void selectDtzOverview() {
     const uint32_t ideCount = readCurrentDtzU32(0x38);
     const uint32_t twoDfxCount = readCurrentDtzU32(0x54);
     const uint32_t cullCount = readCurrentDtzU32(0x94);
+    size_t decodedLeeds2dfxEffects = 0;
+    size_t decodedLeeds2dfxLights = 0;
+    size_t modelLinkedLeeds2dfxEffects = 0;
+    size_t worldLeeds2dfxLights = 0;
+    const auto& nativeEffects = gDtzArchive.leeds2dfxEffects();
+    for (const auto& effect : nativeEffects) {
+        if (!effect.valid) continue;
+        decodedLeeds2dfxEffects++;
+        if (effect.isLight) decodedLeeds2dfxLights++;
+        if (effect.hasModelAssociation) modelLinkedLeeds2dfxEffects++;
+    }
+    for (const auto& instance : gDtzArchive.leeds2dfxWorldInstances()) {
+        if (!instance.valid || instance.effectIndex >= nativeEffects.size()) continue;
+        if (nativeEffects[instance.effectIndex].isLight) worldLeeds2dfxLights++;
+    }
 
     std::wstringstream ss;
     ss << L"GAME.DTZ detailed overview\r\n\r\n";
@@ -2681,6 +2728,14 @@ static void selectDtzOverview() {
     ss << L"  Structured fields decoded from actual bytes: " << scannedFields.size() << L"\r\n";
     ss << L"  Editable GAME.DTZ data fields: " << editableScannedFields << L"\r\n";
     ss << L"  Open the tree node 'Real scanned DTZ data blocks / editable DAT analogues' to inspect object.dat, carcols palette, cull.ipl, STAT_* pedstats, particle-style rows, and generic real header ranges.\r\n\r\n";
+
+    ss << L"Leeds native 2DFX / C2dEffect table:\r\n";
+    ss << L"  Header-declared effects: " << twoDfxCount << L"\r\n";
+    ss << L"  Valid decoded effects: " << decodedLeeds2dfxEffects << L"\r\n";
+    ss << L"  Valid decoded light definitions: " << decodedLeeds2dfxLights << L"\r\n";
+    ss << L"  Definitions linked through CBaseModelInfo ranges: " << modelLinkedLeeds2dfxEffects << L"\r\n";
+    ss << L"  Allocated BUILDING/TREADABLE/DUMMY world light instances: " << worldLeeds2dfxLights << L"\r\n";
+    ss << L"  The right viewport uses each allocated CEntity world matrix to place native model-space effects. It falls back to a model-definition atlas only when no allocated pool instances can be resolved.\r\n\r\n";
 
     ss << L"World placement / map structures:\r\n";
     appendDtzPointerOverviewLine(ss, L"gpThePaths", 0x20, readCurrentDtzU32(0x20), L"paths", L"path data");
@@ -2769,6 +2824,81 @@ static void populateDtzList() {
     addTreeItem(overviewRoot, L"World/IPL/IDE/streaming pointers: paths, IPL pools, IDE table, CStreamingInfo");
     addTreeItem(overviewRoot, L"Data blocks below are decoded from the file, not placeholder labels");
 
+    const auto& leeds2dfxEffects = gDtzArchive.leeds2dfxEffects();
+    const auto& leeds2dfxWorldInstances = gDtzArchive.leeds2dfxWorldInstances();
+    size_t leeds2dfxValidCount = 0;
+    size_t leeds2dfxLightCount = 0;
+    size_t leeds2dfxAssociatedCount = 0;
+    size_t leeds2dfxWorldLightCount = 0;
+    for (const auto& effect : leeds2dfxEffects) {
+        if (!effect.valid) continue;
+        leeds2dfxValidCount++;
+        if (effect.isLight) leeds2dfxLightCount++;
+        if (effect.hasModelAssociation) leeds2dfxAssociatedCount++;
+    }
+    for (const auto& instance : leeds2dfxWorldInstances) {
+        if (!instance.valid || instance.effectIndex >= leeds2dfxEffects.size()) continue;
+        if (leeds2dfxEffects[instance.effectIndex].isLight) leeds2dfxWorldLightCount++;
+    }
+
+    std::wstringstream leeds2dfxTitle;
+    leeds2dfxTitle << L"Leeds GAME.DTZ native 2DFX  definitions=" << leeds2dfxValidCount
+                   << L"  lights=" << leeds2dfxLightCount
+                   << L"  model-owned=" << leeds2dfxAssociatedCount
+                   << L"  world lights=" << leeds2dfxWorldLightCount;
+    HTREEITEM leeds2dfxRoot = addTreeItem(root, leeds2dfxTitle.str());
+
+    HTREEITEM definitionsRoot = addTreeItem(leeds2dfxRoot, L"Global 64-byte C2dEffect definitions");
+    if (leeds2dfxValidCount == 0) {
+        addTreeItem(definitionsRoot, L"No valid native C2dEffect rows were decoded from GAME.DTZ header fields 0x54/0x58.");
+    } else {
+        for (size_t effectIndex = 0; effectIndex < leeds2dfxEffects.size(); ++effectIndex) {
+            const auto& effect = leeds2dfxEffects[effectIndex];
+            if (!effect.valid) continue;
+            std::wstringstream line;
+            line << L"#" << effect.index
+                 << L"  " << leeds2dfxEffectTypeName(effect.effectType)
+                 << L"  local=(" << effect.localX << L", " << effect.localY << L", " << effect.localZ << L")"
+                 << L"  rgba=(" << int(effect.red) << L", " << int(effect.green) << L", " << int(effect.blue) << L", " << int(effect.alpha) << L")";
+            if (effect.isLight) {
+                line << L"  outer=" << effect.pointLightRange
+                     << L"  size=" << effect.coronaSize
+                     << L"  flash=" << int(effect.lightType)
+                     << L"  flags=" << hexWide(effect.flags, 2);
+            }
+            if (effect.hasModelAssociation) {
+                line << L"  model=" << effect.modelIndex
+                     << L"  hash=" << hexWide(effect.modelHash)
+                     << L"  modelEffect=" << effect.modelEffectIndex;
+            } else {
+                line << L"  model=<unresolved>";
+            }
+            addTreeItem(definitionsRoot, line.str(), StorylandTreeKind::DtzLeeds2dfx, int(effectIndex));
+        }
+    }
+
+    std::wstringstream worldTitle;
+    worldTitle << L"Allocated BUILDING/TREADABLE/DUMMY CEntity world instances  lights=" << leeds2dfxWorldLightCount
+               << L"  all-effects=" << leeds2dfxWorldInstances.size();
+    HTREEITEM worldRoot = addTreeItem(leeds2dfxRoot, worldTitle.str());
+    if (leeds2dfxWorldInstances.empty()) {
+        addTreeItem(worldRoot, L"No allocated CEntity instances owning native 2DFX were resolved from the three GAME.DTZ pools.");
+    } else {
+        for (size_t instanceIndex = 0; instanceIndex < leeds2dfxWorldInstances.size(); ++instanceIndex) {
+            const auto& instance = leeds2dfxWorldInstances[instanceIndex];
+            if (!instance.valid || instance.effectIndex >= leeds2dfxEffects.size()) continue;
+            const auto& effect = leeds2dfxEffects[instance.effectIndex];
+            if (!effect.isLight) continue;
+            std::wstringstream line;
+            line << L"#" << instance.index
+                 << L"  " << widen(instance.poolName) << L"[" << instance.poolIndex << L"]"
+                 << L"  model=" << instance.modelIndex
+                 << L"  effect=" << instance.effectIndex
+                 << L"  world=(" << instance.worldX << L", " << instance.worldY << L", " << instance.worldZ << L")"
+                 << L"  rgba=(" << int(effect.red) << L", " << int(effect.green) << L", " << int(effect.blue) << L", " << int(effect.alpha) << L")";
+            addTreeItem(worldRoot, line.str(), StorylandTreeKind::DtzLeeds2dfxWorld, int(instanceIndex));
+        }
+    }
     HTREEITEM dataRoot = addTreeItem(root, L"DAT-style blocks from GAME.DTZ / editable fields");
     const auto& dataBlocks = gDtzArchive.dataBlocks();
     const auto& dataFields = gDtzArchive.dataFields();
@@ -2913,9 +3043,10 @@ static void populateDtzList() {
 
     expandTreeItem(root);
     expandTreeItem(overviewRoot);
+    expandTreeItem(leeds2dfxRoot);
     expandTreeItem(dataRoot);
     expandTreeItem(imgRoot);
-    std::wstring status = std::to_wstring(dataBlocks.size()) + L" DAT blocks, " + std::to_wstring(dirEntries.size()) + L" internal streaming entries, " + std::to_wstring(records.size()) + L" raw DTZ records decoded from GAME.DTZ";
+    std::wstring status = std::to_wstring(leeds2dfxWorldLightCount) + L" native Leeds world-light instances from " + std::to_wstring(leeds2dfxLightCount) + L" C2dEffect light definitions, " + std::to_wstring(dataBlocks.size()) + L" DAT blocks, " + std::to_wstring(dirEntries.size()) + L" internal streaming entries, " + std::to_wstring(records.size()) + L" raw DTZ records decoded from GAME.DTZ";
     if (gDtzArchive.hasCompanionImg()) status += L"; companion IMG loaded";
     status += L".";
     setStatus(status);
@@ -2924,9 +3055,9 @@ static void populateDtzList() {
 
 static void populateModelList() {
     clearView();
-    HTREEITEM root = addTreeItem(TVI_ROOT, L"MDL / Leeds model");
+    HTREEITEM root = addTreeItem(TVI_ROOT, gModelFile.isMobileLcsDff() ? L"Mobile LCS RenderWare DFF" : L"MDL / Leeds model");
     std::wstringstream summary;
-    summary << L"Detected " << widen(gModelFile.modelKindName()) << L"  size=" << gModelFile.fileSize() << L" bytes";
+    summary << L"Detected " << (gModelFile.isMobileLcsDff() ? L"Mobile LCS RenderWare 3.1 DFF / " : L"") << widen(gModelFile.modelKindName()) << L"  size=" << gModelFile.fileSize() << L" bytes";
     addTreeItem(root, summary.str());
 
     const auto& bones = gModelFile.armatureBones();
@@ -2948,6 +3079,23 @@ static void populateModelList() {
             }
             addTreeItem(armatureRoot, line.str(), StorylandTreeKind::ModelBone, int(i));
         }
+    }
+
+    const auto& modelLights = gModelFile.preview2dfxLights();
+    if (!modelLights.empty()) {
+        std::wstringstream lightTitle;
+        lightTitle << L"RenderWare DFF-plugin 2DFX corona lights  count=" << modelLights.size();
+        HTREEITEM lightsRoot = addTreeItem(root, lightTitle.str());
+        for (size_t i = 0; i < modelLights.size(); ++i) {
+            const auto& light = modelLights[i];
+            std::wstringstream line;
+            line << L"#" << i << L" pos=(" << light.position.x << L", " << light.position.y << L", " << light.position.z << L")"
+                 << L" rgba=(" << int(light.red) << L", " << int(light.green) << L", " << int(light.blue) << L", " << int(light.alpha) << L")"
+                 << L" corona=" << light.coronaSize << L" range=" << light.pointLightRange;
+            if (!light.coronaTextureName.empty()) line << L" tex=" << widen(light.coronaTextureName);
+            addTreeItem(lightsRoot, line.str());
+        }
+        expandTreeItem(lightsRoot);
     }
 
     if (gModelAnimLoaded) {
@@ -3080,7 +3228,7 @@ static bool archiveEntryIsModel(const StorylandArchiveEntry& entry) {
 
 static bool archiveEntryIsTextureArchive(const StorylandArchiveEntry& entry) {
     std::string ext = archiveEntryExtensionLower(entry.name);
-    return ext == ".xtx" || ext == ".chk" || ext == ".tex";
+    return ext == ".xtx" || ext == ".chk" || ext == ".tex" || ext == ".txd";
 }
 
 static bool archiveEntryIsAnimation(const StorylandArchiveEntry& entry) {
@@ -3262,11 +3410,51 @@ static void populateArchiveList() {
     clearView();
     rebuildArchiveResourceScrollLists();
 
-    HTREEITEM root = addTreeItem(TVI_ROOT, gArchiveBrowser.hasLvzContext() ? L"LVZ + IMG archive browse" : L"IMG archive browse");
+    HTREEITEM root = addTreeItem(TVI_ROOT, gArchiveBrowser.hasLvzContext() ? L"LVZ + IMG archive browse" : L"Mobile LCS raw gta3.img browse");
     if (gArchiveBrowser.hasLvzContext()) addTreeItem(root, L"LVZ: " + gArchiveBrowser.lvzPath());
     if (gArchiveBrowser.hasImgContext()) addTreeItem(root, L"IMG: " + gArchiveBrowser.imgPath());
     if (gArchiveBrowser.hasLvzContext()) addTreeItem(root, L"No .DIR: retail LVZ+IMG uses LVZ chunk headers + IMG payloads.");
     if (!gArchiveBrowser.levelSummary().empty()) addTreeItem(root, widen(gArchiveBrowser.levelSummary()));
+
+    if (!gArchiveBrowser.hasLvzContext()) {
+        HTREEITEM modelRoot = addTreeItem(root, L"Mobile LCS RenderWare DFF clumps");
+        HTREEITEM textureRoot = addTreeItem(root, L"Mobile LCS RenderWare PSP texture dictionaries");
+        const auto& entries = gArchiveBrowser.entries();
+        size_t modelCount = 0u;
+        size_t textureDictionaryCount = 0u;
+        size_t namedTextureCount = 0u;
+        for (size_t entryIndex = 0; entryIndex < entries.size(); ++entryIndex) {
+            if (entries[entryIndex].chunkIdent == 0x10u) {
+                addArchiveEntryTreeItem(modelRoot, entries[entryIndex], entryIndex);
+                modelCount++;
+            } else if (entries[entryIndex].chunkIdent == 0x16u) {
+                addArchiveEntryTreeItem(textureRoot, entries[entryIndex], entryIndex);
+                textureDictionaryCount++;
+                namedTextureCount += entries[entryIndex].textureNames.size();
+            }
+        }
+        if (modelCount == 0u) addTreeItem(modelRoot, L"No sector-aligned Mobile LCS DFF clumps were found.");
+        if (textureDictionaryCount == 0u) addTreeItem(textureRoot, L"No sector-aligned Mobile LCS PSP texture dictionaries were found.");
+
+        std::wstringstream details;
+        details << L"Mobile LCS raw gta3.img archive\r\n\r\n"
+                << L"IMG: " << gArchiveBrowser.imgPath() << L"\r\n"
+                << L"IMG bytes: " << gArchiveBrowser.imgFileSize() << L"\r\n"
+                << L"Mobile LCS DFF clumps: " << modelCount << L"\r\n"
+                << L"Mobile LCS texture dictionaries: " << textureDictionaryCount << L"\r\n"
+                << L"Named embedded textures: " << namedTextureCount << L"\r\n\r\n"
+                << L"This archive has no GAME.DTZ, LVZ, or external DIR. Storyland scans the 2048-byte IMG sectors for RenderWare 3.1 clumps and PSP-native RenderWare texture dictionaries.\r\n"
+                << L"Double-click a DFF to open its Mobile LCS F00D native geometry, frame hierarchy, materials, embedded matching TXD textures, and any RenderWare 2DFX lights.\r\n"
+                << L"File > Export Selected Resource writes the selected sector allocation. A separately opened Mobile LCS DFF can be written losslessly with File > Export Mobile LCS DFF.\r\n";
+        setDetails(details.str());
+        expandTreeItem(root);
+        expandTreeItem(modelRoot);
+        gSelectedIndex = -1;
+        gSelectedKind = StorylandTreeKind::None;
+        InvalidateRect(gPreview, nullptr, TRUE);
+        setStatus(std::to_wstring(modelCount) + L" Mobile LCS DFFs and " + std::to_wstring(textureDictionaryCount) + L" embedded TXDs found; matching textures auto-attach on model open.");
+        return;
+    }
 
     HTREEITEM resolutionRoot = addTreeItem(root, L"Resource resolution (placement RES -> IMG payload)");
     HTREEITEM resolvedRoot = addTreeItem(resolutionRoot, L"Resolved exactly");
@@ -3474,6 +3662,29 @@ static void selectArchiveRoot() {
     gSelectedKind = StorylandTreeKind::None;
 
     const auto& entries = gArchiveBrowser.entries();
+    if (!gArchiveBrowser.hasLvzContext()) {
+        size_t modelCount = 0u;
+        size_t textureDictionaryCount = 0u;
+        size_t namedTextureCount = 0u;
+        for (const auto& entry : entries) {
+            if (entry.chunkIdent == 0x10u) modelCount++;
+            else if (entry.chunkIdent == 0x16u) {
+                textureDictionaryCount++;
+                namedTextureCount += entry.textureNames.size();
+            }
+        }
+        std::wstringstream ss;
+        ss << L"Mobile LCS raw gta3.img archive\r\n\r\n"
+           << L"IMG: " << gArchiveBrowser.imgPath() << L"\r\n"
+           << L"IMG bytes: " << gArchiveBrowser.imgFileSize() << L"\r\n"
+           << L"Sector-aligned Mobile LCS DFF clumps: " << modelCount << L"\r\n"
+           << L"Sector-aligned Mobile LCS texture dictionaries: " << textureDictionaryCount << L"\r\n"
+           << L"Named embedded textures: " << namedTextureCount << L"\r\n\r\n"
+           << L"No GAME.DTZ, LVZ, or desktop GTA IMG directory is required for this format. Storyland locates each RenderWare 3.1 clump and PSP-native texture dictionary directly on its 2048-byte sector boundary.\r\n";
+        setDetails(ss.str());
+        InvalidateRect(gPreview, nullptr, TRUE);
+        return;
+    }
     const auto& placements = gArchiveBrowser.placements();
     const auto& sectors = gArchiveBrowser.sectors();
     int worldCount = 0;
@@ -3535,9 +3746,19 @@ static void selectArchiveEntry(int index) {
     if (archiveEntryIsWorld(entry)) {
         ss << L"\r\nPreview: this WRLD/AREA sector is shown alone in the OpenGL viewport.\r\n";
     } else if (archiveEntryIsModel(entry)) {
-        ss << L"\r\nPreview: double-click this model to open it in the MDL viewer.\r\n";
+        ss << L"\r\nPreview: double-click this model to open it in the MDL viewer. A matching embedded Mobile LCS TXD is extracted and attached automatically when one is found.\r\n";
     } else if (archiveEntryIsTextureArchive(entry)) {
-        ss << L"\r\nPreview: double-click this texture archive to open it in the texture viewer.\r\n";
+        if (!entry.textureNames.empty()) {
+            ss << L"\r\nEmbedded textures: " << entry.textureNames.size() << L"\r\n";
+            const size_t visibleTextureCount = std::min<size_t>(entry.textureNames.size(), 64u);
+            for (size_t textureIndex = 0u; textureIndex < visibleTextureCount; ++textureIndex) {
+                ss << L"  " << widen(entry.textureNames[textureIndex]) << L"\r\n";
+            }
+            if (visibleTextureCount < entry.textureNames.size()) {
+                ss << L"  ... " << (entry.textureNames.size() - visibleTextureCount) << L" more\r\n";
+            }
+        }
+        ss << L"\r\nPreview: double-click this Mobile LCS PSP texture dictionary to open it in the texture viewer.\r\n";
     } else {
         ss << L"\r\nThis resource is listed, but not directly decoded yet.\r\n";
     }
@@ -7183,6 +7404,155 @@ static void selectDtzSectorRecord(int index) {
     InvalidateRect(gPreview, nullptr, TRUE);
 }
 
+
+static const wchar_t* leeds2dfxEffectTypeName(uint8_t type) {
+    switch (type) {
+    case 0: return L"Light";
+    case 1: return L"Particle";
+    case 2: return L"Attractor";
+    case 3: return L"Ped behaviour";
+    default: return L"Unknown";
+    }
+}
+
+static const wchar_t* leeds2dfxLightTypeName(uint8_t type) {
+    switch (type) {
+    case 0: return L"Always on";
+    case 1: return L"On at night";
+    case 2: return L"Flicker";
+    case 3: return L"Flicker at night";
+    case 4: return L"Flash 1";
+    case 5: return L"Flash 1 at night";
+    case 6: return L"Flash 2";
+    case 7: return L"Flash 2 at night";
+    case 8: return L"Flash 3";
+    case 9: return L"Flash 3 at night";
+    case 10: return L"Random flicker";
+    case 11: return L"Random flicker at night";
+    case 12: return L"Special";
+    case 13: return L"Bridge flash 1";
+    case 14: return L"Bridge flash 2";
+    default: return L"Unknown";
+    }
+}
+
+static void appendDtzLeeds2dfxPayloadDetails(std::wstringstream& ss, const StorylandDtz2dfxEffect& effect) {
+    if (effect.effectType == 0u) {
+        ss << L"\r\nLeeds C2dEffect::Light payload\r\n\r\n"
+           << L"Distance / corona far clip (+0x18): " << effect.coronaFarClip << L"\r\n"
+           << L"Outer point-light range (+0x1C): " << effect.pointLightRange << L"\r\n"
+           << L"Corona size (+0x20): " << effect.coronaSize << L"\r\n"
+           << L"Inner range / shadow size (+0x24): " << effect.shadowSize << L"\r\n"
+           << L"Flash mode (+0x28): " << leeds2dfxLightTypeName(effect.lightType) << L" (" << int(effect.lightType) << L")\r\n"
+           << L"Wet-road reflection (+0x29): " << int(effect.roadReflection) << L"\r\n"
+           << L"Flare type (+0x2A): " << int(effect.flareType) << L"\r\n"
+           << L"Shadow intensity (+0x2B): " << int(effect.shadowIntensity) << L"\r\n"
+           << L"Flags (+0x2C): " << hexWide(effect.flags, 2) << L"\r\n"
+           << L"  LOS check: " << ((effect.flags & 0x01u) ? L"yes" : L"no") << L"\r\n"
+           << L"  Normal fog: " << ((effect.flags & 0x02u) ? L"yes" : L"no") << L"\r\n"
+           << L"  Always fog: " << ((effect.flags & 0x04u) ? L"yes" : L"no") << L"\r\n"
+           << L"  Hide-object flag: " << ((effect.flags & 0x08u) ? L"yes" : L"no") << L"\r\n"
+           << L"  Long-distance flag: " << ((effect.flags & 0x10u) ? L"yes" : L"no") << L"\r\n"
+           << L"Corona texture pointer (+0x30): " << hexWide(effect.coronaTexturePointer) << L"\r\n"
+           << L"Shadow texture pointer (+0x34): " << hexWide(effect.shadowTexturePointer) << L"\r\n";
+    } else if (effect.effectType == 1u) {
+        ss << L"\r\nLeeds C2dEffect::Particle payload\r\n\r\n"
+           << L"Particle subtype (+0x18): " << effect.particleSubtype << L"\r\n"
+           << L"Direction (+0x1C): (" << effect.directionX << L", " << effect.directionY << L", " << effect.directionZ << L")\r\n"
+           << L"Particle scale (+0x28): " << effect.particleScale << L"\r\n";
+    } else if (effect.effectType == 2u) {
+        ss << L"\r\nLeeds C2dEffect::Attractor payload\r\n\r\n"
+           << L"Direction (+0x18): (" << effect.directionX << L", " << effect.directionY << L", " << effect.directionZ << L")\r\n"
+           << L"Attractor subtype (+0x24): " << int(effect.attractorSubtype) << L"\r\n"
+           << L"Probability (+0x25): " << int(effect.attractorProbability) << L"\r\n";
+    } else if (effect.effectType == 3u) {
+        ss << L"\r\nLeeds C2dEffect::PedBehaviour payload\r\n\r\n"
+           << L"Direction (+0x18): (" << effect.directionX << L", " << effect.directionY << L", " << effect.directionZ << L")\r\n"
+           << L"Rotation (+0x24): (" << effect.pedRotationX << L", " << effect.pedRotationY << L", " << effect.pedRotationZ << L")\r\n"
+           << L"Ped behaviour subtype (+0x30): " << int(effect.pedSubtype) << L"\r\n";
+    }
+}
+
+static void selectDtzLeeds2dfx(int index) {
+    const auto& effects = gDtzArchive.leeds2dfxEffects();
+    if (index < 0 || size_t(index) >= effects.size()) return;
+    const auto& effect = effects[size_t(index)];
+
+    gSelectedIndex = index;
+    gSelectedKind = StorylandTreeKind::DtzLeeds2dfx;
+
+    std::wstringstream ss;
+    ss << L"Leeds-engine GAME.DTZ C2dEffect definition\r\n\r\n"
+       << L"Global effect index: " << effect.index << L"\r\n"
+       << L"Serialized 64-byte row offset: " << hexWide(effect.rowOffset, 6) << L"\r\n"
+       << L"Valid decoded row: " << (effect.valid ? L"yes" : L"no") << L"\r\n"
+       << L"Effect type (+0x14): " << leeds2dfxEffectTypeName(effect.effectType) << L" (" << int(effect.effectType) << L")\r\n"
+       << L"Model-local position float4 (+0x00): (" << effect.localX << L", " << effect.localY << L", " << effect.localZ << L", " << effect.positionW << L")\r\n"
+       << L"RGBA (+0x10): (" << int(effect.red) << L", " << int(effect.green) << L", " << int(effect.blue) << L", " << int(effect.alpha) << L")\r\n";
+
+    if (effect.hasModelAssociation) {
+        ss << L"Owning model index: " << effect.modelIndex << L"\r\n"
+           << L"Owning model hash: " << hexWide(effect.modelHash) << L"\r\n"
+           << L"Owning CBaseModelInfo offset: " << hexWide(effect.modelInfoOffset, 6) << L"\r\n"
+           << L"Model info type: " << int(effect.modelType) << L"\r\n"
+           << L"Effect index inside model range: " << effect.modelEffectIndex << L"\r\n";
+        if (!effect.modelName.empty()) ss << L"Model name: " << widen(effect.modelName) << L"\r\n";
+    } else {
+        ss << L"Owning model: unresolved from the current CBaseModelInfo pointer table\r\n";
+    }
+
+    appendDtzLeeds2dfxPayloadDetails(ss, effect);
+
+    ss << L"\r\nRendering source\r\n\r\n"
+       << L"Storyland first resolves this model-local effect through allocated BUILDING, TREADABLE, and DUMMY CEntity records and applies each entity's native right/up/at/position matrix. "
+       << L"The separated model-local atlas is used only when no allocated world instances can be recovered. RenderWare DFF-plugin 2DFX is a separate, lower-priority source used while viewing an individual DFF.\r\n";
+
+    setDetails(ss.str());
+    setStatus(L"Selected Leeds GAME.DTZ C2dEffect #" + std::to_wstring(effect.index));
+    InvalidateRect(gPreview, nullptr, FALSE);
+}
+
+static void selectDtzLeeds2dfxWorld(int index) {
+    const auto& instances = gDtzArchive.leeds2dfxWorldInstances();
+    const auto& effects = gDtzArchive.leeds2dfxEffects();
+    if (index < 0 || size_t(index) >= instances.size()) return;
+    const auto& instance = instances[size_t(index)];
+    if (instance.effectIndex >= effects.size()) return;
+    const auto& effect = effects[instance.effectIndex];
+
+    gSelectedIndex = index;
+    gSelectedKind = StorylandTreeKind::DtzLeeds2dfxWorld;
+
+    std::wstringstream ss;
+    ss << L"Leeds GAME.DTZ native world 2DFX instance\r\n\r\n"
+       << L"World instance index: " << instance.index << L"\r\n"
+       << L"Pool: " << widen(instance.poolName) << L"\r\n"
+       << L"Pool slot: " << instance.poolIndex << L"\r\n"
+       << L"Pool allocation flag: " << hexWide(instance.poolFlag, 2) << L"\r\n"
+       << L"CEntity offset: " << hexWide(instance.entityOffset, 6) << L"\r\n"
+       << L"Primary model index (+0x56): " << instance.modelIndex << L"\r\n"
+       << L"Secondary model index (+0x58): " << instance.secondaryModelIndex << L"\r\n"
+       << L"Level (+0x5A): " << int(instance.level) << L"\r\n"
+       << L"Area (+0x5B): " << int(instance.area) << L"\r\n"
+       << L"C2dEffect index: " << instance.effectIndex << L"\r\n"
+       << L"C2dEffect type: " << leeds2dfxEffectTypeName(effect.effectType) << L"\r\n"
+       << L"\r\nNative CEntity matrix\r\n\r\n"
+       << L"Right: (" << instance.rightX << L", " << instance.rightY << L", " << instance.rightZ << L")\r\n"
+       << L"Up: (" << instance.upX << L", " << instance.upY << L", " << instance.upZ << L")\r\n"
+       << L"At: (" << instance.atX << L", " << instance.atY << L", " << instance.atZ << L")\r\n"
+       << L"Entity position: (" << instance.entityX << L", " << instance.entityY << L", " << instance.entityZ << L")\r\n"
+       << L"Model-local effect position: (" << effect.localX << L", " << effect.localY << L", " << effect.localZ << L")\r\n"
+       << L"Resolved world position: (" << instance.worldX << L", " << instance.worldY << L", " << instance.worldZ << L")\r\n"
+       << L"RGBA: (" << int(effect.red) << L", " << int(effect.green) << L", " << int(effect.blue) << L", " << int(effect.alpha) << L")\r\n";
+
+    appendDtzLeeds2dfxPayloadDetails(ss, effect);
+    ss << L"\r\nThis is the native Leeds light/effect placement used by the GAME.DTZ viewport. It is not a RenderWare DFF-plugin helper and is not placed in the model-local fallback atlas.\r\n";
+
+    setDetails(ss.str());
+    setStatus(L"Selected native Leeds world 2DFX instance #" + std::to_wstring(instance.index));
+    InvalidateRect(gPreview, nullptr, FALSE);
+}
+
 static void selectDtzDataBlock(int index) {
     const auto& blocks = gDtzArchive.dataBlocks();
     const auto& fields = gDtzArchive.dataFields();
@@ -7257,6 +7627,8 @@ static void selectDtzPayload(const StorylandTreePayload& payload) {
     else if (payload.kind == StorylandTreeKind::DtzDirEntry) selectDtzDirEntry(payload.index);
     else if (payload.kind == StorylandTreeKind::DtzDataBlock) selectDtzDataBlock(payload.index);
     else if (payload.kind == StorylandTreeKind::DtzDataField) selectDtzDataField(payload.index);
+    else if (payload.kind == StorylandTreeKind::DtzLeeds2dfx) selectDtzLeeds2dfx(payload.index);
+    else if (payload.kind == StorylandTreeKind::DtzLeeds2dfxWorld) selectDtzLeeds2dfxWorld(payload.index);
 }
 
 
@@ -7487,9 +7859,13 @@ static bool openImgWithGameDtzPair(const std::wstring& imgPath, std::string& err
     if (!gDtzArchive.loadCompanionImg(imgPath, error)) return false;
 
     gMode = StorylandMode::DtzArchive;
+    resetModelViewport();
+    gModelDistance = 4.0f;
     populateDtzList();
     SetWindowTextW(gMainWindow, L"Storyland - GAME.DTZ + gta3PS*.img");
-    applyStorylandTitleTintForPath(imgPath);
+    StorylandTitleTint pairTint = titleTintFromPath(dtzPath);
+    if (pairTint == StorylandTitleTint::Default) pairTint = StorylandTitleTint::LCS;
+    applyStorylandTitleTint(pairTint);
     setStatus(L"Opened GAME.DTZ + IMG pair from IMG: " + imgPath);
     return true;
 }
@@ -7498,7 +7874,7 @@ static void openStorylandFile(const std::wstring& path) {
     if (path.empty()) return;
     std::wstring ext = getExtensionLower(path);
     std::string error;
-    if (ext == L".anim" || ext == L".chk" || ext == L".xtx" || ext == L".tex" ||
+    if (ext == L".anim" || ext == L".chk" || ext == L".xtx" || ext == L".tex" || ext == L".txd" ||
         ext == L".img" || ext == L".lvz" || ext == L".wbl" || ext == L".dir" ||
         ext == L".dtz" || ext == L".bin" || ext == L".mdl" || ext == L".dff") {
         addRecentFile(path);
@@ -7553,7 +7929,7 @@ static void openStorylandFile(const std::wstring& path) {
 
     clearView();
 
-    if (ext == L".chk" || ext == L".xtx" || ext == L".tex") {
+    if (ext == L".chk" || ext == L".xtx" || ext == L".tex" || ext == L".txd") {
         if (!gTextureArchive.loadFromFile(path, LeedsPlatform::Auto, error)) {
             MessageBoxW(gMainWindow, widen(error).c_str(), L"Storyland texture open failed", MB_ICONERROR);
             return;
@@ -7573,7 +7949,7 @@ static void openStorylandFile(const std::wstring& path) {
             }
             populateDtzList();
             SetWindowTextW(gMainWindow, L"Storyland - GAME.DTZ + gta3PS*.img");
-            applyStorylandTitleTintForPath(path);
+            applyStorylandTitleTint(gTitleTint == StorylandTitleTint::Default ? StorylandTitleTint::LCS : gTitleTint);
             setStatus(L"Loaded companion IMG for current GAME.DTZ: " + path);
             return;
         }
@@ -7585,7 +7961,7 @@ static void openStorylandFile(const std::wstring& path) {
             gModelDistance = 8.0f;
             populateArchiveList();
             SetWindowTextW(gMainWindow, L"Storyland - IMG Browser");
-            applyStorylandTitleTintForPath(path);
+            applyStorylandTitleTint(gArchiveBrowser.hasLvzContext() ? titleTintFromPath(path) : StorylandTitleTint::LCS);
             return;
         }
 
@@ -7640,7 +8016,7 @@ static void openStorylandFile(const std::wstring& path) {
         }
         populateDtzList();
         SetWindowTextW(gMainWindow, L"Storyland - GAME.DTZ + gta3PS2.dir");
-        applyStorylandTitleTintForPath(path);
+        applyStorylandTitleTint(gTitleTint == StorylandTitleTint::Default ? StorylandTitleTint::LCS : gTitleTint);
         return;
     }
 
@@ -7650,9 +8026,14 @@ static void openStorylandFile(const std::wstring& path) {
             return;
         }
         gMode = StorylandMode::DtzArchive;
+        resetModelViewport();
+        gModelDistance = 4.0f;
         populateDtzList();
         SetWindowTextW(gMainWindow, gDtzArchive.hasCompanionImg() ? L"Storyland - GAME.DTZ + gta3PS*.img" : L"Storyland - GAME.DTZ");
-        applyStorylandTitleTintForPath(path);
+        StorylandTitleTint dtzTint = titleTintFromPath(path);
+        if (dtzTint == StorylandTitleTint::Default) dtzTint = StorylandTitleTint::LCS;
+        applyStorylandTitleTint(dtzTint);
+        InvalidateRect(gPreview, nullptr, FALSE);
         return;
     }
 
@@ -7690,8 +8071,9 @@ static void openStorylandFile(const std::wstring& path) {
         }
 
         selectModelField(0);
-        SetWindowTextW(gMainWindow, gModelAnimLoaded ? L"Storyland - MDL Viewer + ANIM" : L"Storyland - MDL Viewer");
-        StorylandTitleTint modelTint = titleTintFromPath(path);
+        if (gModelFile.isMobileLcsDff()) SetWindowTextW(gMainWindow, L"Storyland - Mobile LCS DFF Viewer");
+        else SetWindowTextW(gMainWindow, gModelAnimLoaded ? L"Storyland - MDL Viewer + ANIM" : L"Storyland - MDL Viewer");
+        StorylandTitleTint modelTint = gModelFile.isMobileLcsDff() ? StorylandTitleTint::LCS : titleTintFromPath(path);
         if (modelTint == StorylandTitleTint::Default && !gModelTexturePath.empty()) modelTint = titleTintFromPath(gModelTexturePath);
         applyStorylandTitleTint(modelTint);
         setStatus(buildModelStatusLine());
@@ -7699,7 +8081,7 @@ static void openStorylandFile(const std::wstring& path) {
         return;
     }
 
-    MessageBoxW(gMainWindow, L"Unknown extension. Storyland opens .chk/.xtx/.tex textures, .mdl/.dff/.wbl models, .anim animations, .dtz/.bin GAME.DTZ, .img/.lvz archives, and .dir sector maps after GAME.DTZ is open.", L"Storyland", MB_ICONINFORMATION);
+    MessageBoxW(gMainWindow, L"Unknown extension. Storyland opens .chk/.xtx/.tex/.txd textures, .mdl/.dff/.wbl models, .anim animations, .dtz/.bin GAME.DTZ, .img/.lvz archives, and .dir sector maps after GAME.DTZ is open.", L"Storyland", MB_ICONINFORMATION);
 }
 
 static bool writeWholeFileBinary(const std::wstring& path, const std::vector<uint8_t>& bytes, std::string& error) {
@@ -7735,7 +8117,10 @@ static void clearDtzEmbeddedPreviewState() {
 
 static bool currentModeUsesInteractiveModelViewport() {
     if (gMode == StorylandMode::ModelFile || gMode == StorylandMode::ArchiveFile || gMode == StorylandMode::AnimFile || gMode == StorylandMode::WblFile) return true;
-    if (gMode == StorylandMode::DtzArchive && gDtzEmbeddedPreviewKind == DtzEmbeddedPreviewKind::ModelFile) return true;
+    if (gMode == StorylandMode::DtzArchive) {
+        if (gDtzEmbeddedPreviewKind == DtzEmbeddedPreviewKind::ModelFile) return true;
+        if (gDtzEmbeddedPreviewKind == DtzEmbeddedPreviewKind::None && !gDtzArchive.leeds2dfxEffects().empty()) return true;
+    }
     return false;
 }
 
@@ -7755,7 +8140,7 @@ static void openSelectedArchiveEntry() {
         setStatus(L"WRLD/AREA sector is shown alone in the LVZ/IMG OpenGL preview.");
         return;
     }
-    if (!(ext == L".mdl" || ext == L".dff" || ext == L".xtx" || ext == L".chk" || ext == L".tex" || ext == L".dtz" || ext == L".bin")) {
+    if (!(ext == L".mdl" || ext == L".dff" || ext == L".xtx" || ext == L".chk" || ext == L".tex" || ext == L".txd" || ext == L".dtz" || ext == L".bin")) {
         selectArchiveEntry(gSelectedIndex);
         setStatus(L"Selected embedded resource is listed but not directly openable yet.");
         return;
@@ -7778,10 +8163,19 @@ static void openSelectedArchiveEntry() {
     if (ext == L".mdl" || ext == L".dff") {
         std::wstring stem = getFileStemPart(name);
         size_t companionIndex = 0;
-        if (gArchiveBrowser.findEntryByStemAndExtension(stem, {L".xtx", L".chk", L".tex"}, companionIndex)) {
+        bool foundCompanion = gArchiveBrowser.findEntryByStemAndExtension(stem, {L".xtx", L".chk", L".tex", L".txd"}, companionIndex);
+        bool mobileMatchedCompanion = false;
+        if (!foundCompanion && gArchiveBrowser.findMobileLcsTextureDictionaryForEntry(size_t(gSelectedIndex), companionIndex)) {
+            foundCompanion = true;
+            mobileMatchedCompanion = true;
+        }
+        if (foundCompanion) {
             std::vector<uint8_t> textureBytes;
             if (gArchiveBrowser.extractEntryBytes(companionIndex, textureBytes, error)) {
-                std::wstring companionPath = extractRoot + L"\\" + widen(gArchiveBrowser.entries()[companionIndex].name);
+                std::wstring companionName = mobileMatchedCompanion
+                    ? stem + L".txd"
+                    : widen(gArchiveBrowser.entries()[companionIndex].name);
+                std::wstring companionPath = extractRoot + L"\\" + companionName;
                 writeWholeFileBinary(companionPath, textureBytes, error);
             }
         }
@@ -7927,10 +8321,10 @@ static std::wstring buildExportLogText() {
                << L" | " << widen(r.note) << L"\r\n";
         }
     } else if (gMode == StorylandMode::ArchiveFile) {
-        ss << L"Mode: LVZ + IMG archive\r\n\r\n";
+        ss << (gArchiveBrowser.hasLvzContext() ? L"Mode: LVZ + IMG archive\r\n\r\n" : L"Mode: Mobile LCS raw gta3.img archive\r\n\r\n");
         if (gArchiveBrowser.hasLvzContext()) ss << L"LVZ: " << gArchiveBrowser.lvzPath() << L"\r\n";
         if (gArchiveBrowser.hasImgContext()) ss << L"IMG: " << gArchiveBrowser.imgPath() << L"\r\n";
-        ss << L"DIR: none; retail LVZ+IMG mode\r\n";
+        ss << (gArchiveBrowser.hasLvzContext() ? L"DIR: none; retail LVZ+IMG mode\r\n" : L"Directory: sector-scanned Mobile LCS RenderWare clumps; no GAME.DTZ/LVZ/DIR\r\n");
         ss << L"Summary: " << widen(gArchiveBrowser.levelSummary()) << L"\r\n";
         ss << L"IMG size: " << gArchiveBrowser.imgFileSize() << L" bytes\r\n";
         ss << L"Parsed sectors: " << gArchiveBrowser.sectors().size() << L"\r\n";
@@ -8249,7 +8643,7 @@ static void replaceSelectedArchiveResourceFromFile() {
         return;
     }
 
-    std::wstring path = openFileDialog(L"BLeeds / Leeds resource\0*.mdl;*.dff;*.wbl;*.xtx;*.chk;*.tex;*.wrld;*.area;*.bin\0All files\0*.*\0");
+    std::wstring path = openFileDialog(L"BLeeds / Leeds resource\0*.mdl;*.dff;*.wbl;*.xtx;*.chk;*.tex;*.txd;*.wrld;*.area;*.bin\0All files\0*.*\0");
     if (path.empty()) return;
 
     std::vector<uint8_t> replacementBytes;
@@ -8338,7 +8732,7 @@ static void exportSelectedResourceBytes() {
 
     if (suggestedName.empty()) suggestedName = L"storyland_resource.bin";
     std::wstring outputPath = saveFileDialogWithInitial(
-        L"Leeds resource\0*.mdl;*.dff;*.wbl;*.xtx;*.chk;*.tex;*.wrld;*.area;*.anim;*.bin\0All files\0*.*\0",
+        L"Leeds resource\0*.mdl;*.dff;*.wbl;*.xtx;*.chk;*.tex;*.txd;*.wrld;*.area;*.anim;*.bin\0All files\0*.*\0",
         L"bin",
         suggestedName
     );
@@ -8348,6 +8742,27 @@ static void exportSelectedResourceBytes() {
         return;
     }
     setStatus(L"Exported and verified selected resource: " + outputPath + L" (" + std::to_wstring(bytes.size()) + L" bytes)");
+}
+
+static void exportMobileLcsDff() {
+    if (gMode != StorylandMode::ModelFile || !gModelFile.isMobileLcsDff()) {
+        MessageBoxW(gMainWindow,
+            L"This command only writes a supported Mobile LCS RenderWare 3.1 DFF: either War Drum F00D native geometry or a named frame-only clump with no Geometry chunk. GTA III, Vice City, and San Andreas desktop Geometry variants are deliberately rejected.",
+            L"Export Mobile LCS DFF", MB_ICONINFORMATION);
+        return;
+    }
+
+    std::wstring suggested = getFileStemPart(gModelFile.sourcePath()) + L"_mobile_lcs.dff";
+    std::wstring outputPath = saveFileDialogWithInitial(
+        L"Mobile LCS DFF\0*.dff\0All files\0*.*\0", L"dff", suggested);
+    if (outputPath.empty()) return;
+
+    std::string error;
+    if (!gModelFile.exportMobileLcsDffLossless(outputPath, error)) {
+        MessageBoxW(gMainWindow, widen(error).c_str(), L"Mobile LCS DFF export failed", MB_ICONERROR);
+        return;
+    }
+    setStatus(L"Exported lossless Mobile LCS DFF: " + outputPath + L" (" + std::to_wstring(gModelFile.fileSize()) + L" bytes)");
 }
 
 static bool loadedModelUsesPspGeometry() {
@@ -8515,7 +8930,7 @@ static void overwriteCurrentLvzImgPair() {
 
 static void exportEditedTextureArchive() {
     if (gMode != StorylandMode::TextureArchive) {
-        MessageBoxW(gMainWindow, L"Open a .chk/.xtx/.tex texture archive first.", L"Storyland", MB_ICONINFORMATION);
+        MessageBoxW(gMainWindow, L"Open a .chk/.xtx/.tex/.txd texture archive first.", L"Storyland", MB_ICONINFORMATION);
         return;
     }
 
@@ -8699,9 +9114,9 @@ static void replaceSelectedDtzDirEntryFromFile() {
     std::wstring selectedNameBefore = widen(entries[size_t(gSelectedIndex)].name);
 
     static const wchar_t replacementFilter[] =
-        L"Leeds / Stories resource\0*.mdl;*.dff;*.xtx;*.chk;*.tex;*.anim;*.cam;*.cut;*.col;*.col2;*.bin\0"
+        L"Leeds / Stories resource\0*.mdl;*.dff;*.xtx;*.chk;*.tex;*.txd;*.anim;*.cam;*.cut;*.col;*.col2;*.bin\0"
         L"Model files\0*.mdl;*.dff\0"
-        L"Texture archives\0*.xtx;*.chk;*.tex\0"
+        L"Texture archives\0*.xtx;*.chk;*.tex;*.txd\0"
         L"Animation / cutscene / collision\0*.anim;*.cam;*.cut;*.col;*.col2\0"
         L"All files\0*.*\0";
     std::wstring replacementPath = openFileDialog(replacementFilter);
@@ -9648,6 +10063,7 @@ static void drawModelPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
     const auto& tris = gModelFile.previewTriangles();
     const auto& texcoords = gModelFile.previewTexcoords();
     const auto& bones = gModelFile.armatureBones();
+    const auto& lights2dfx = gModelFile.preview2dfxLights();
     if (!gOpenGlReady && !initializeOpenGlPreview(hwnd)) {
         FillRect(dc, &rc, reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1));
         std::wstring title = L"OpenGL init failed. MDL: " + widen(gModelFile.modelKindName()) + L" points=" + std::to_wstring(pts.size());
@@ -9759,6 +10175,10 @@ static void drawModelPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
         if (!boneHasVisiblePreviewPosition(bone)) continue;
         StorylandModelPoint p = displayAnimatedModelBonePosition(boneIndex);
         includePointInBounds(p.x, p.y, p.z);
+    }
+
+    for (const auto& light : lights2dfx) {
+        includePointInBounds(light.position.x, light.position.y, light.position.z);
     }
 
     float centerX = (minX + maxX) * 0.5f;
@@ -9943,6 +10363,79 @@ static void drawModelPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
         glEnd();
     }
 
+    if (gOpenGlShow2dfxLights && !lights2dfx.empty()) {
+        stopStoriesShaderProgram();
+        setupFixedPipelineStoriesLighting(false);
+        glDisable(GL_TEXTURE_2D);
+        glDisable(GL_CULL_FACE);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+        glDepthMask(GL_FALSE);
+
+        GLfloat modelView[16] = {};
+        glGetFloatv(GL_MODELVIEW_MATRIX, modelView);
+        StorylandModelPoint cameraRight{modelView[0], modelView[4], modelView[8]};
+        StorylandModelPoint cameraUp{modelView[1], modelView[5], modelView[9]};
+        float rightLength = std::sqrt(cameraRight.x * cameraRight.x + cameraRight.y * cameraRight.y + cameraRight.z * cameraRight.z);
+        float upLength = std::sqrt(cameraUp.x * cameraUp.x + cameraUp.y * cameraUp.y + cameraUp.z * cameraUp.z);
+        if (rightLength > 0.000001f) { cameraRight.x /= rightLength; cameraRight.y /= rightLength; cameraRight.z /= rightLength; }
+        if (upLength > 0.000001f) { cameraUp.x /= upLength; cameraUp.y /= upLength; cameraUp.z /= upLength; }
+
+        const bool night = gStoriesSky.time() < 6.0f || gStoriesSky.time() >= 20.0f;
+        const DWORD lightTick = GetTickCount();
+        auto drawCoronaFan = [&](const StorylandModelLight2dfx& light, float radius, float alphaScale) {
+            const int segments = 24;
+            glBegin(GL_TRIANGLE_FAN);
+            glColor4ub(light.red, light.green, light.blue,
+                       uint8_t(std::clamp(float(light.alpha) * alphaScale, 0.0f, 255.0f)));
+            glVertex3f(light.position.x, light.position.y, light.position.z);
+            glColor4ub(light.red, light.green, light.blue, 0u);
+            for (int segment = 0; segment <= segments; ++segment) {
+                float angle = float(segment) * 6.28318530718f / float(segments);
+                float cs = std::cos(angle);
+                float sn = std::sin(angle);
+                glVertex3f(
+                    light.position.x + cameraRight.x * (cs * radius) + cameraUp.x * (sn * radius),
+                    light.position.y + cameraRight.y * (cs * radius) + cameraUp.y * (sn * radius),
+                    light.position.z + cameraRight.z * (cs * radius) + cameraUp.z * (sn * radius));
+            }
+            glEnd();
+        };
+
+        for (const auto& light : lights2dfx) {
+            const bool dayOnly = (light.flags1 & 0x20u) != 0u;
+            const bool nightOnly = (light.flags1 & 0x40u) != 0u;
+            if (dayOnly && night && !nightOnly) continue;
+            if (nightOnly && !night && !dayOnly) continue;
+            const bool blinking = (light.flags1 & 0x80u) != 0u || (light.flags2 & 0x02u) != 0u || (light.flags2 & 0x10u) != 0u;
+            if (blinking && ((lightTick / 420u) & 1u) == 0u) continue;
+
+            if (light.pointLightRange > 0.0f) {
+                float ringRadius = std::max(0.02f, light.pointLightRange);
+                glLineWidth(1.0f);
+                glColor4ub(light.red, light.green, light.blue, 72u);
+                glBegin(GL_LINE_LOOP);
+                for (int segment = 0; segment < 32; ++segment) {
+                    float angle = float(segment) * 6.28318530718f / 32.0f;
+                    glVertex3f(light.position.x + std::cos(angle) * ringRadius,
+                               light.position.y + std::sin(angle) * ringRadius,
+                               light.position.z);
+                }
+                glEnd();
+            }
+
+            if ((light.flags1 & 0x08u) == 0u) {
+                float radius = std::max(0.025f, light.coronaSize * 0.12f);
+                drawCoronaFan(light, radius * 1.85f, 0.20f);
+                drawCoronaFan(light, radius, 0.82f);
+            }
+        }
+
+        glDepthMask(GL_TRUE);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDisable(GL_BLEND);
+    }
+
     if (!bones.empty() && gOpenGlShowBones) {
         stopStoriesShaderProgram();
         setupFixedPipelineStoriesLighting(false);
@@ -10009,6 +10502,386 @@ static void drawModelPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
     wglMakeCurrent(nullptr, nullptr);
 }
 
+
+struct StorylandDtz2dfxPreviewLight {
+    const StorylandDtz2dfxEffect* effect = nullptr;
+    const StorylandDtz2dfxWorldInstance* worldInstance = nullptr;
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+};
+
+static float leeds2dfxLightPulse(const StorylandDtz2dfxEffect& effect, DWORD tick, bool night) {
+    const bool nightOnly =
+        effect.lightType == 1u || effect.lightType == 3u || effect.lightType == 5u ||
+        effect.lightType == 7u || effect.lightType == 9u || effect.lightType == 11u;
+    float activeScale = (nightOnly && !night) ? 0.18f : 1.0f;
+
+    switch (effect.lightType) {
+    case 2:
+    case 3: {
+        float phase = float((tick + effect.index * 137u) % 900u) / 900.0f;
+        activeScale *= 0.35f + 0.65f * std::fabs(std::sin(phase * 18.8495559f));
+        break;
+    }
+    case 4:
+    case 5:
+        activeScale *= (((tick / 520u) + effect.index) & 1u) ? 1.0f : 0.20f;
+        break;
+    case 6:
+    case 7:
+        activeScale *= (((tick / 780u) + effect.index) % 3u) == 0u ? 1.0f : 0.18f;
+        break;
+    case 8:
+    case 9:
+        activeScale *= (((tick / 260u) + effect.index) & 1u) ? 1.0f : 0.12f;
+        break;
+    case 10:
+    case 11: {
+        uint32_t seed = uint32_t(tick / 110u) ^ (effect.index * 1664525u + 1013904223u);
+        seed ^= seed >> 16;
+        activeScale *= (seed & 3u) == 0u ? 0.16f : 0.72f + float((seed >> 8) & 0xFFu) / 900.0f;
+        break;
+    }
+    case 13:
+        activeScale *= (((tick / 640u) + effect.index) & 1u) ? 1.0f : 0.16f;
+        break;
+    case 14:
+        activeScale *= (((tick / 640u) + effect.index + 1u) & 1u) ? 1.0f : 0.16f;
+        break;
+    default:
+        break;
+    }
+
+    return std::clamp(activeScale, 0.08f, 1.0f);
+}
+
+static bool dtz2dfxPreviewLightSelected(const StorylandDtz2dfxPreviewLight& preview) {
+    if (gSelectedKind == StorylandTreeKind::DtzLeeds2dfxWorld) {
+        return preview.worldInstance != nullptr && gSelectedIndex == int(preview.worldInstance->index);
+    }
+    if (gSelectedKind == StorylandTreeKind::DtzLeeds2dfx) {
+        return preview.effect != nullptr && gSelectedIndex == int(preview.effect->index);
+    }
+    return false;
+}
+
+static std::vector<StorylandDtz2dfxPreviewLight> buildDtz2dfxPreviewLights() {
+    const auto& effects = gDtzArchive.leeds2dfxEffects();
+    const auto& worldInstances = gDtzArchive.leeds2dfxWorldInstances();
+
+    std::vector<StorylandDtz2dfxPreviewLight> worldLights;
+    worldLights.reserve(worldInstances.size());
+    for (const auto& instance : worldInstances) {
+        if (!instance.valid || instance.effectIndex >= effects.size()) continue;
+        const auto& effect = effects[instance.effectIndex];
+        if (!effect.valid || !effect.isLight) continue;
+
+        StorylandDtz2dfxPreviewLight preview;
+        preview.effect = &effect;
+        preview.worldInstance = &instance;
+        preview.x = instance.worldX;
+        preview.y = instance.worldY;
+        preview.z = instance.worldZ;
+        worldLights.push_back(preview);
+    }
+    if (!worldLights.empty()) return worldLights;
+
+    std::map<int32_t, std::vector<const StorylandDtz2dfxEffect*>> groups;
+    for (const auto& effect : effects) {
+        if (!effect.valid || !effect.isLight) continue;
+        int32_t groupKey = effect.hasModelAssociation ? effect.modelIndex : -1;
+        groups[groupKey].push_back(&effect);
+    }
+
+    struct GroupLayout {
+        int32_t key = -1;
+        std::vector<const StorylandDtz2dfxEffect*> effects;
+        float centerX = 0.0f;
+        float centerY = 0.0f;
+        float centerZ = 0.0f;
+        float span = 1.0f;
+    };
+
+    std::vector<GroupLayout> layouts;
+    layouts.reserve(groups.size());
+    float maximumGroupSpan = 1.0f;
+    for (const auto& pair : groups) {
+        GroupLayout layout;
+        layout.key = pair.first;
+        layout.effects = pair.second;
+
+        bool haveBounds = false;
+        float minX = 0.0f, minY = 0.0f, minZ = 0.0f;
+        float maxX = 0.0f, maxY = 0.0f, maxZ = 0.0f;
+        for (const StorylandDtz2dfxEffect* effect : layout.effects) {
+            if (!haveBounds) {
+                minX = maxX = effect->localX;
+                minY = maxY = effect->localY;
+                minZ = maxZ = effect->localZ;
+                haveBounds = true;
+            } else {
+                minX = std::min(minX, effect->localX);
+                minY = std::min(minY, effect->localY);
+                minZ = std::min(minZ, effect->localZ);
+                maxX = std::max(maxX, effect->localX);
+                maxY = std::max(maxY, effect->localY);
+                maxZ = std::max(maxZ, effect->localZ);
+            }
+        }
+        layout.centerX = (minX + maxX) * 0.5f;
+        layout.centerY = (minY + maxY) * 0.5f;
+        layout.centerZ = (minZ + maxZ) * 0.5f;
+        layout.span = std::max(1.0f, std::max(maxX - minX, std::max(maxY - minY, maxZ - minZ)));
+        maximumGroupSpan = std::max(maximumGroupSpan, layout.span);
+        layouts.push_back(std::move(layout));
+    }
+
+    std::vector<StorylandDtz2dfxPreviewLight> previewLights;
+    size_t totalLights = 0;
+    for (const GroupLayout& layout : layouts) totalLights += layout.effects.size();
+    previewLights.reserve(totalLights);
+    if (layouts.empty()) return previewLights;
+
+    int columns = std::max(1, int(std::ceil(std::sqrt(double(layouts.size())))));
+    int rows = std::max(1, int((layouts.size() + size_t(columns) - 1u) / size_t(columns)));
+    float spacing = std::max(6.0f, maximumGroupSpan * 1.55f + 2.0f);
+
+    for (size_t groupIndex = 0; groupIndex < layouts.size(); ++groupIndex) {
+        const GroupLayout& layout = layouts[groupIndex];
+        int column = int(groupIndex % size_t(columns));
+        int row = int(groupIndex / size_t(columns));
+        float groupX = (float(column) - float(columns - 1) * 0.5f) * spacing;
+        float groupY = (float(rows - 1) * 0.5f - float(row)) * spacing;
+
+        for (const StorylandDtz2dfxEffect* effect : layout.effects) {
+            StorylandDtz2dfxPreviewLight preview;
+            preview.effect = effect;
+            preview.x = effect->localX - layout.centerX + groupX;
+            preview.y = effect->localY - layout.centerY + groupY;
+            preview.z = effect->localZ - layout.centerZ;
+            previewLights.push_back(preview);
+        }
+    }
+
+    return previewLights;
+}
+
+static void drawDtzLeeds2dfxPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
+    if (!gOpenGlShow2dfxLights) {
+        HBRUSH brush = CreateSolidBrush(RGB(181, 221, 242));
+        FillRect(dc, &rc, brush);
+        DeleteObject(brush);
+        std::wstring text = L"Leeds GAME.DTZ 2DFX display is disabled in View > OpenGL preview.";
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(18, 34, 50));
+        TextOutW(dc, rc.left + 12, rc.top + 12, text.c_str(), int(text.size()));
+        return;
+    }
+    std::vector<StorylandDtz2dfxPreviewLight> lights = buildDtz2dfxPreviewLights();
+    if (lights.empty()) {
+        HBRUSH brush = CreateSolidBrush(RGB(181, 221, 242));
+        FillRect(dc, &rc, brush);
+        DeleteObject(brush);
+        std::wstring text = L"No valid Leeds GAME.DTZ C2dEffect lights were decoded.";
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(18, 34, 50));
+        TextOutW(dc, rc.left + 12, rc.top + 12, text.c_str(), int(text.size()));
+        return;
+    }
+
+    if (!gOpenGlReady && !initializeOpenGlPreview(hwnd)) {
+        FillRect(dc, &rc, reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1));
+        std::wstring title = L"OpenGL init failed for Leeds GAME.DTZ 2DFX preview.";
+        TextOutW(dc, rc.left + 8, rc.top + 8, title.c_str(), int(title.size()));
+        return;
+    }
+    if (!wglMakeCurrent(dc, gOpenGlContext)) {
+        FillRect(dc, &rc, reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1));
+        std::wstring title = L"OpenGL context activation failed for Leeds GAME.DTZ 2DFX preview.";
+        TextOutW(dc, rc.left + 8, rc.top + 8, title.c_str(), int(title.size()));
+        return;
+    }
+
+    const int width = std::max<int>(1, int(rc.right - rc.left));
+    const int height = std::max<int>(1, int(rc.bottom - rc.top));
+    glViewport(0, 0, width, height);
+    setStoriesViewportClearColor();
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glDisable(GL_ALPHA_TEST);
+    glDisable(GL_TEXTURE_2D);
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_TRUE);
+
+    double aspect = double(width) / double(height);
+    setPerspectiveProjection(45.0, aspect, 0.01, 1000.0);
+    drawStoriesViewportSky(100.0f);
+
+    bool haveBounds = false;
+    float minX = 0.0f, minY = 0.0f, minZ = 0.0f;
+    float maxX = 0.0f, maxY = 0.0f, maxZ = 0.0f;
+    for (const auto& light : lights) {
+        if (!haveBounds) {
+            minX = maxX = light.x;
+            minY = maxY = light.y;
+            minZ = maxZ = light.z;
+            haveBounds = true;
+        } else {
+            minX = std::min(minX, light.x); maxX = std::max(maxX, light.x);
+            minY = std::min(minY, light.y); maxY = std::max(maxY, light.y);
+            minZ = std::min(minZ, light.z); maxZ = std::max(maxZ, light.z);
+        }
+    }
+
+    float centerX = (minX + maxX) * 0.5f;
+    float centerY = (minY + maxY) * 0.5f;
+    float centerZ = (minZ + maxZ) * 0.5f;
+    float spanX = std::max(0.001f, maxX - minX);
+    float spanY = std::max(0.001f, maxY - minY);
+    float spanZ = std::max(0.001f, maxZ - minZ);
+    float largestSpan = std::max(spanX, std::max(spanY, spanZ));
+    float modelScale = 3.6f / std::max(1.0f, largestSpan);
+    const bool worldPositioned = !lights.empty() && lights.front().worldInstance != nullptr;
+    const float minimumVisibleRadius = worldPositioned ? std::max(0.10f, largestSpan * 0.0015f) : 0.06f;
+    const int coronaSegments = lights.size() > 1500u ? 12 : (lights.size() > 500u ? 16 : 24);
+    const bool drawAllRangeRings = lights.size() < 400u;
+
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+    glTranslatef(gModelPanX, gModelPanY, -gModelDistance);
+    glMultModelQuat(gModelViewRotation);
+    glScalef(modelScale, modelScale, modelScale);
+    glTranslatef(-centerX, -centerY, -centerZ);
+
+    stopStoriesShaderProgram();
+    setupFixedPipelineStoriesLighting(false);
+
+    if (gOpenGlShowGrid) {
+        float gridExtent = std::max(2.0f, largestSpan * 0.6f);
+        float step = gridExtent / 10.0f;
+        glLineWidth(1.0f);
+        glColor4f(0.18f, 0.23f, 0.28f, 0.55f);
+        glBegin(GL_LINES);
+        for (int index = -10; index <= 10; ++index) {
+            float d = float(index) * step;
+            glVertex3f(centerX - gridExtent, centerY + d, centerZ);
+            glVertex3f(centerX + gridExtent, centerY + d, centerZ);
+            glVertex3f(centerX + d, centerY - gridExtent, centerZ);
+            glVertex3f(centerX + d, centerY + gridExtent, centerZ);
+        }
+        glEnd();
+    }
+
+    GLfloat modelView[16] = {};
+    glGetFloatv(GL_MODELVIEW_MATRIX, modelView);
+    StorylandModelPoint cameraRight{modelView[0], modelView[4], modelView[8]};
+    StorylandModelPoint cameraUp{modelView[1], modelView[5], modelView[9]};
+    float rightLength = std::sqrt(cameraRight.x * cameraRight.x + cameraRight.y * cameraRight.y + cameraRight.z * cameraRight.z);
+    float upLength = std::sqrt(cameraUp.x * cameraUp.x + cameraUp.y * cameraUp.y + cameraUp.z * cameraUp.z);
+    if (rightLength > 0.000001f) {
+        cameraRight.x /= rightLength; cameraRight.y /= rightLength; cameraRight.z /= rightLength;
+    }
+    if (upLength > 0.000001f) {
+        cameraUp.x /= upLength; cameraUp.y /= upLength; cameraUp.z /= upLength;
+    }
+
+    const bool night = gStoriesSky.time() < 6.0f || gStoriesSky.time() >= 20.0f;
+    const DWORD tick = GetTickCount();
+    glDisable(GL_CULL_FACE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+    glDepthMask(GL_FALSE);
+
+    auto drawCorona = [&](const StorylandDtz2dfxPreviewLight& preview, float radius, float alphaScale) {
+        const auto& effect = *preview.effect;
+        const int segments = coronaSegments;
+        glBegin(GL_TRIANGLE_FAN);
+        glColor4ub(effect.red, effect.green, effect.blue,
+                   uint8_t(std::clamp(float(effect.alpha) * alphaScale, 0.0f, 255.0f)));
+        glVertex3f(preview.x, preview.y, preview.z);
+        glColor4ub(effect.red, effect.green, effect.blue, 0u);
+        for (int segment = 0; segment <= segments; ++segment) {
+            float angle = float(segment) * 6.28318530718f / float(segments);
+            float cs = std::cos(angle);
+            float sn = std::sin(angle);
+            glVertex3f(
+                preview.x + cameraRight.x * cs * radius + cameraUp.x * sn * radius,
+                preview.y + cameraRight.y * cs * radius + cameraUp.y * sn * radius,
+                preview.z + cameraRight.z * cs * radius + cameraUp.z * sn * radius);
+        }
+        glEnd();
+    };
+
+    for (const auto& preview : lights) {
+        const auto& effect = *preview.effect;
+        const bool selected = dtz2dfxPreviewLightSelected(preview);
+        float pulse = leeds2dfxLightPulse(effect, tick, night);
+        float range = std::fabs(effect.pointLightRange);
+        if (range > 0.0001f && (drawAllRangeRings || selected)) {
+            float ringRadius = std::max(minimumVisibleRadius, range);
+            glLineWidth(selected ? 2.5f : 1.0f);
+            glColor4ub(effect.red, effect.green, effect.blue, uint8_t(45.0f + 95.0f * pulse));
+            glBegin(GL_LINE_LOOP);
+            const int ringSegments = lights.size() > 1000u ? 16 : 36;
+            for (int segment = 0; segment < ringSegments; ++segment) {
+                float angle = float(segment) * 6.28318530718f / float(ringSegments);
+                glVertex3f(preview.x + std::cos(angle) * ringRadius,
+                           preview.y + std::sin(angle) * ringRadius,
+                           preview.z);
+            }
+            glEnd();
+        }
+
+        float radius = std::max(minimumVisibleRadius, std::fabs(effect.coronaSize) * 0.18f);
+        if ((effect.flags & 0x10u) != 0u) radius *= 1.35f;
+        if (lights.size() > 1500u) {
+            drawCorona(preview, radius * 1.85f, 0.20f * pulse);
+            drawCorona(preview, radius, 0.88f * pulse);
+        } else {
+            drawCorona(preview, radius * 2.3f, 0.12f * pulse);
+            drawCorona(preview, radius * 1.45f, 0.30f * pulse);
+            drawCorona(preview, radius, 0.88f * pulse);
+        }
+
+        if (selected) {
+            float marker = std::max(minimumVisibleRadius * 2.0f, radius * 1.8f);
+            glLineWidth(2.5f);
+            glColor4ub(255u, 255u, 255u, 220u);
+            glBegin(GL_LINES);
+            glVertex3f(preview.x - marker, preview.y, preview.z);
+            glVertex3f(preview.x + marker, preview.y, preview.z);
+            glVertex3f(preview.x, preview.y - marker, preview.z);
+            glVertex3f(preview.x, preview.y + marker, preview.z);
+            glVertex3f(preview.x, preview.y, preview.z - marker);
+            glVertex3f(preview.x, preview.y, preview.z + marker);
+            glEnd();
+        }
+    }
+
+    glDepthMask(GL_TRUE);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDisable(GL_BLEND);
+
+    drawOpenGlViewCube(hwnd, width, height);
+    glFlush();
+    SwapBuffers(dc);
+    drawOpenGlViewCubeLabels(hwnd, dc);
+    wglMakeCurrent(nullptr, nullptr);
+
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(18, 34, 50));
+    std::wstringstream overlay;
+    if (worldPositioned) {
+        overlay << L"Leeds GAME.DTZ world 2DFX: " << lights.size()
+                << L" allocated CEntity light instances | BUILDING/TREADABLE/DUMMY native matrices";
+    } else {
+        overlay << L"Leeds GAME.DTZ model-local fallback atlas: " << lights.size()
+                << L" light definitions | no allocated world instances resolved";
+    }
+    std::wstring overlayText = overlay.str();
+    TextOutW(dc, rc.left + 10, rc.top + 10, overlayText.c_str(), int(overlayText.size()));
+}
+
 static LRESULT CALLBACK previewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_PAINT) {
         PAINTSTRUCT ps;
@@ -10022,6 +10895,7 @@ static LRESULT CALLBACK previewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         else if (gMode == StorylandMode::AnimFile) drawAnimPreviewOpenGl(hwnd, dc, rc);
         else if (gMode == StorylandMode::DtzArchive && gDtzEmbeddedPreviewKind == DtzEmbeddedPreviewKind::TextureArchive) drawTexturePreview(dc, rc);
         else if (gMode == StorylandMode::DtzArchive && gDtzEmbeddedPreviewKind == DtzEmbeddedPreviewKind::ModelFile) drawModelPreviewOpenGl(hwnd, dc, rc);
+        else if (gMode == StorylandMode::DtzArchive) drawDtzLeeds2dfxPreviewOpenGl(hwnd, dc, rc);
         else {
             HBRUSH emptyPreviewBrush = CreateSolidBrush(RGB(181, 221, 242));
             FillRect(dc, &rc, emptyPreviewBrush);
@@ -10396,6 +11270,7 @@ static void createMenuBar(HWND hwnd) {
     AppendMenuW(gFileMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(gFileMenu, MF_STRING, ID_FILE_SAVE_AS, L"Save As / Rebuild GAME.DTZ...");
     AppendMenuW(gFileMenu, MF_STRING, ID_FILE_EXPORT_LOG, L"Export Log...");
+    AppendMenuW(gFileMenu, MF_STRING, ID_FILE_EXPORT_MOBILE_LCS_DFF, L"Export Mobile LCS DFF (Lossless)...");
     AppendMenuW(gFileMenu, MF_STRING, ID_FILE_DMA_TLB_PREFLIGHT, L"Run DMA/VIF Test...");
     AppendMenuW(gFileMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(gFileMenu, MF_STRING, ID_ARCHIVE_EXPORT_LVZ_IMG_PAIR, L"Export/Rebuild LVZ+IMG Pair...");
@@ -10430,6 +11305,8 @@ static void createMenuBar(HWND hwnd) {
     CheckMenuItem(gOpenGlMenu, ID_VIEW_SHOW_BONES, MF_BYCOMMAND | (gOpenGlShowBones ? MF_CHECKED : MF_UNCHECKED));
     AppendMenuW(gOpenGlMenu, MF_STRING, ID_VIEW_SHOW_BOUNDS, L"Show bounds");
     CheckMenuItem(gOpenGlMenu, ID_VIEW_SHOW_BOUNDS, MF_BYCOMMAND | (gOpenGlShowBounds ? MF_CHECKED : MF_UNCHECKED));
+    AppendMenuW(gOpenGlMenu, MF_STRING, ID_VIEW_SHOW_2DFX_LIGHTS, L"Show Leeds GAME.DTZ + RenderWare DFF 2DFX lights");
+    CheckMenuItem(gOpenGlMenu, ID_VIEW_SHOW_2DFX_LIGHTS, MF_BYCOMMAND | (gOpenGlShow2dfxLights ? MF_CHECKED : MF_UNCHECKED));
     AppendMenuW(gOpenGlMenu, MF_STRING, ID_VIEW_SHOW_VIEWCUBE, L"Show viewport cube");
     CheckMenuItem(gOpenGlMenu, ID_VIEW_SHOW_VIEWCUBE, MF_BYCOMMAND | (gOpenGlShowViewCube ? MF_CHECKED : MF_UNCHECKED));
     AppendMenuW(view, MF_POPUP, reinterpret_cast<UINT_PTR>(gOpenGlMenu), L"OpenGL preview");
@@ -10473,6 +11350,49 @@ static void createMenuBar(HWND hwnd) {
     AppendMenuW(gMainMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(gHelpMenu), L"Help");
 }
 
+
+static void drawStorylandPaneClientBorder(HWND hwnd) {
+    HDC dc = GetDC(hwnd);
+    if (!dc) return;
+
+    RECT client{};
+    GetClientRect(hwnd, &client);
+    HBRUSH borderBrush = CreateSolidBrush(storylandPaneBorderColor());
+    if (borderBrush) {
+        FrameRect(dc, &client, borderBrush);
+        if (client.right - client.left > 2 && client.bottom - client.top > 2) {
+            InflateRect(&client, -1, -1);
+            FrameRect(dc, &client, borderBrush);
+        }
+        DeleteObject(borderBrush);
+    }
+    ReleaseDC(hwnd, dc);
+}
+
+static LRESULT CALLBACK storylandPaneBorderSubclassProc(
+    HWND hwnd,
+    UINT message,
+    WPARAM wParam,
+    LPARAM lParam,
+    UINT_PTR subclassId,
+    DWORD_PTR referenceData
+) {
+    if (message == WM_PAINT) {
+        LRESULT result = DefSubclassProc(hwnd, message, wParam, lParam);
+        drawStorylandPaneClientBorder(hwnd);
+        return result;
+    }
+    if (message == WM_NCPAINT || message == WM_NCACTIVATE) {
+        LRESULT result = DefSubclassProc(hwnd, message, wParam, lParam);
+        drawStorylandPaneClientBorder(hwnd);
+        return result;
+    }
+    if (message == WM_NCDESTROY) {
+        RemoveWindowSubclass(hwnd, storylandPaneBorderSubclassProc, subclassId);
+    }
+    return DefSubclassProc(hwnd, message, wParam, lParam);
+}
+
 static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE: {
@@ -10486,7 +11406,7 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         gMenuStrip = CreateWindowExW(0, menuStripClass.lpszClassName, nullptr,
             WS_CHILD | WS_VISIBLE, 0, 0, 100, 28, hwnd,
             reinterpret_cast<HMENU>(ID_MENU_STRIP), gInstance, nullptr);
-        gTree = CreateWindowExW(WS_EX_CLIENTEDGE, WC_TREEVIEWW, nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP | TVS_HASLINES | TVS_LINESATROOT | TVS_HASBUTTONS | TVS_SHOWSELALWAYS | WS_VSCROLL | WS_HSCROLL, 0, 0, 100, 100, hwnd, reinterpret_cast<HMENU>(ID_TREE), gInstance, nullptr);
+        gTree = CreateWindowExW(0, WC_TREEVIEWW, nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP | TVS_HASLINES | TVS_LINESATROOT | TVS_HASBUTTONS | TVS_SHOWSELALWAYS | WS_VSCROLL | WS_HSCROLL, 0, 0, 100, 100, hwnd, reinterpret_cast<HMENU>(ID_TREE), gInstance, nullptr);
         WNDCLASSW previewClass = {};
         previewClass.lpfnWndProc = previewProc;
         previewClass.hInstance = gInstance;
@@ -10494,14 +11414,17 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         previewClass.hCursor = LoadCursor(nullptr, IDC_ARROW);
         previewClass.style = CS_OWNDC | CS_DBLCLKS;
         RegisterClassW(&previewClass);
-        gPreview = CreateWindowExW(WS_EX_CLIENTEDGE, previewClass.lpszClassName, nullptr, WS_CHILD | WS_VISIBLE, 0, 0, 100, 100, hwnd, reinterpret_cast<HMENU>(ID_PREVIEW), gInstance, nullptr);
+        gPreview = CreateWindowExW(0, previewClass.lpszClassName, nullptr, WS_CHILD | WS_VISIBLE, 0, 0, 100, 100, hwnd, reinterpret_cast<HMENU>(ID_PREVIEW), gInstance, nullptr);
         initializeOpenGlPreview(gPreview);
-        gDetails = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", nullptr, WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, 0, 0, 100, 100, hwnd, reinterpret_cast<HMENU>(ID_DETAILS), gInstance, nullptr);
+        gDetails = CreateWindowExW(0, L"EDIT", nullptr, WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, 0, 0, 100, 100, hwnd, reinterpret_cast<HMENU>(ID_DETAILS), gInstance, nullptr);
+        SetWindowSubclass(gTree, storylandPaneBorderSubclassProc, 1, 0);
+        SetWindowSubclass(gPreview, storylandPaneBorderSubclassProc, 2, 0);
+        SetWindowSubclass(gDetails, storylandPaneBorderSubclassProc, 3, 0);
         gStatus = CreateWindowExW(0, STATUSCLASSNAMEW, nullptr, WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(ID_STATUS), gInstance, nullptr);
         applyStorylandPaneBackground(hwnd);
         gStoriesSkyLastTick = GetTickCount();
         SetTimer(hwnd, 2, 33, nullptr);
-        setStatus(L"Open .chk/.xtx/.tex textures, .mdl/.wbl models, .anim files, or GAME.DTZ");
+        setStatus(L"Open .chk/.xtx/.tex/.txd textures, .mdl/.dff/.wbl models, .anim files, a raw Mobile LCS gta3.img, or GAME.DTZ");
         return 0;
     }
     case WM_SIZE:
@@ -10557,7 +11480,8 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             float elapsedSeconds = float(tick - gStoriesSkyLastTick) / 1000.0f;
             gStoriesSkyLastTick = tick;
             gStoriesSky.update(std::min(elapsedSeconds, 0.25f));
-            if (gOpenGlRenderMode == StorylandOpenGlRenderMode::Stories && gStoriesSky.isEnabled()) {
+            if ((gOpenGlRenderMode == StorylandOpenGlRenderMode::Stories && gStoriesSky.isEnabled()) ||
+                (gMode == StorylandMode::DtzArchive && gDtzEmbeddedPreviewKind == DtzEmbeddedPreviewKind::None && gOpenGlShow2dfxLights)) {
                 InvalidateRect(gPreview, nullptr, FALSE);
             }
             return 0;
@@ -10572,8 +11496,14 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         break;
 
     case WM_DWMCOLORIZATIONCOLORCHANGED:
+    case WM_THEMECHANGED:
+    case WM_SETTINGCHANGE:
         applyStorylandTitleTint(gTitleTint);
         return 0;
+
+    case WM_ACTIVATE:
+        if (LOWORD(wParam) != WA_INACTIVE) applyStorylandTitleTint(gTitleTint);
+        break;
 
     case WM_SYSCHAR:
         switch (towlower(wchar_t(wParam))) {
@@ -10597,7 +11527,7 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         }
         switch (commandId) {
         case ID_FILE_OPEN: {
-            std::wstring path = openFileDialog(L"Storyland files\0*.dtz;*.bin;*.img;*.lvz;*.area;*.wbl;*.mdl;*.dff;*.anim;*.chk;*.xtx;*.tex\0All files\0*.*\0");
+            std::wstring path = openFileDialog(L"Storyland files\0*.dtz;*.bin;*.img;*.lvz;*.area;*.wbl;*.mdl;*.dff;*.anim;*.chk;*.xtx;*.tex;*.txd\0All files\0*.*\0");
             openStorylandFile(path);
             break;
         }
@@ -10616,6 +11546,7 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             break;
         case ID_FILE_SAVE_AS: saveCurrentAs(); break;
         case ID_FILE_EXPORT_LOG: exportCurrentLog(); break;
+        case ID_FILE_EXPORT_MOBILE_LCS_DFF: exportMobileLcsDff(); break;
         case ID_FILE_EXPORT_SELECTED_RESOURCE: exportSelectedResourceBytes(); break;
         case ID_FILE_DMA_TLB_PREFLIGHT: runSelectedDmaTlbPreflight(); break;
         case ID_FILE_EXPORT_TEXTURE: exportSelectedTexture(); break;
@@ -10683,6 +11614,11 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         case ID_VIEW_SHOW_BOUNDS:
             gOpenGlShowBounds = !gOpenGlShowBounds;
             CheckMenuItem(gOpenGlMenu, ID_VIEW_SHOW_BOUNDS, MF_BYCOMMAND | (gOpenGlShowBounds ? MF_CHECKED : MF_UNCHECKED));
+            InvalidateRect(gPreview, nullptr, FALSE);
+            break;
+        case ID_VIEW_SHOW_2DFX_LIGHTS:
+            gOpenGlShow2dfxLights = !gOpenGlShow2dfxLights;
+            CheckMenuItem(gOpenGlMenu, ID_VIEW_SHOW_2DFX_LIGHTS, MF_BYCOMMAND | (gOpenGlShow2dfxLights ? MF_CHECKED : MF_UNCHECKED));
             InvalidateRect(gPreview, nullptr, FALSE);
             break;
         case ID_VIEW_SHOW_VIEWCUBE:

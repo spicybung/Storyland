@@ -55,6 +55,30 @@ struct StorylandModelSkinWeights {
     StorylandModelSkinInfluence influences[4];
 };
 
+struct StorylandModelLight2dfx {
+    StorylandModelPoint position;
+    uint8_t red = 255;
+    uint8_t green = 255;
+    uint8_t blue = 255;
+    uint8_t alpha = 255;
+    float coronaFarClip = 0.0f;
+    float pointLightRange = 0.0f;
+    float coronaSize = 1.0f;
+    float shadowSize = 0.0f;
+    uint8_t coronaShowMode = 0;
+    uint8_t coronaEnableReflection = 0;
+    uint8_t coronaFlareType = 0;
+    uint8_t shadowColorMultiplier = 0;
+    uint8_t flags1 = 0;
+    uint8_t flags2 = 0;
+    int8_t lookDirectionX = 0;
+    int8_t lookDirectionY = 0;
+    int8_t lookDirectionZ = 0;
+    bool hasLookDirection = false;
+    std::string coronaTextureName;
+    std::string shadowTextureName;
+};
+
 struct StorylandModelBone {
     uint32_t index = 0;
     uint32_t offset = 0;
@@ -95,6 +119,7 @@ public:
     const std::vector<StorylandModelTexcoord>& previewTexcoords() const;
     const std::vector<StorylandModelSkinWeights>& previewSkinWeights() const;
     const std::vector<StorylandModelBone>& armatureBones() const;
+    const std::vector<StorylandModelLight2dfx>& preview2dfxLights() const;
     const std::vector<std::string>& previewMaterialTextureNames() const;
     const std::vector<std::string>& textureNameHints() const;
     const std::vector<StorylandModelField>& fields() const;
@@ -102,6 +127,8 @@ public:
     std::string modelKindName() const;
     const std::wstring& sourcePath() const;
     size_t fileSize() const;
+    bool isMobileLcsDff() const;
+    bool exportMobileLcsDffLossless(const std::wstring& outputPath, std::string& errorMessage) const;
 
 private:
     std::wstring path;
@@ -112,13 +139,17 @@ private:
     std::vector<StorylandModelTexcoord> texcoords;
     std::vector<StorylandModelSkinWeights> skinWeights;
     std::vector<StorylandModelBone> bones;
+    std::vector<StorylandModelLight2dfx> lights2dfx;
     std::vector<std::string> materialTextureNames;
     std::vector<std::string> textureHints;
     std::vector<StorylandModelField> fieldRows;
     StorylandModelKind kind = StorylandModelKind::Unknown;
     bool previewUsesPspNativeSkinPalette = false;
+    bool mobileLcsDff = false;
 
     void parse();
+    bool parseMobileLcsDff();
+    void collectRenderWare2dfxLights();
     void collectPreviewPoints();
     void collectArmatureBones();
     void collectTextureNameHints();
