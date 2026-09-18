@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 if(POLICY CMP0091)
     cmake_policy(SET CMP0091 NEW)
 endif()
-project(Storyland VERSION 1.0.3 LANGUAGES CXX RC)
+project(Storyland VERSION 1.1.5 LANGUAGES CXX RC)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -48,10 +48,18 @@ add_executable(Storyland WIN32
     src/wic_image.cpp
     src/storyland_dtz.cpp
     src/storyland_model.cpp
+    src/storyland_analysis_graph.cpp
+    src/storyland_analysis_graph.h
+    src/storyland_opengl_renderer.cpp
+    src/storyland_opengl_renderer.h
+    src/storyland_shaders.cpp
+    src/storyland_shaders.h
     src/storyland_archive.cpp
     src/storyland_anim.cpp
     src/storyland_wbl.cpp
     src/storyland_sky.cpp
+    src/storyland_scm.cpp
+    src/storyland_scm.h
     src/storyland_atomic_io.h
     src/storyland_dma_validator.cpp
     src/storyland_dma_validator.h
@@ -59,21 +67,20 @@ add_executable(Storyland WIN32
     src/storyland_psp_validator.h
     src/storyland_model_validator.cpp
     src/storyland_model_validator.h
+    src/storyland_media.cpp
+    src/storyland_media.h
     "${STORYLAND_RESOURCE_FILE}"
 )
 
 target_include_directories(Storyland PRIVATE src)
-target_link_libraries(Storyland PRIVATE ZLIB::ZLIB windowscodecs ole32 comctl32 comdlg32 shell32 advapi32 opengl32 gdi32 dwmapi)
+target_link_libraries(Storyland PRIVATE ZLIB::ZLIB windowscodecs ole32 comctl32 comdlg32 shell32 advapi32 opengl32 gdi32 dwmapi winmm mfplat mfreadwrite mfuuid propsys)
 
 
 add_custom_command(TARGET Storyland POST_BUILD
-    # The active Stories GLSL is compiled into main.cpp. Remove artifacts left
-    # by older builds so the Release folder accurately shows its dependencies.
-    COMMAND ${CMAKE_COMMAND} -E remove_directory
-        "$<TARGET_FILE_DIR:Storyland>/shaders"
+    # Storyland GLSL is compiled directly from src/storyland_shaders.cpp.
     COMMAND ${CMAKE_COMMAND} -E rm -f
         "$<TARGET_FILE_DIR:Storyland>/timecyc.dat"
         "$<TARGET_FILE_DIR:Storyland>/zlib1.dll"
         "$<TARGET_FILE_DIR:Storyland>/zlibd1.dll"
-    COMMENT "Removing obsolete external shaders, timecycle, and zlib DLLs"
+    COMMENT "Removing obsolete timecycle and zlib DLL artifacts"
 )
