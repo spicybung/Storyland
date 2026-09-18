@@ -4,6 +4,7 @@
 #include <wincodec.h>
 #include <comdef.h>
 #include <sstream>
+#include <limits>
 #include <vector>
 
 static std::string hresultText(HRESULT hr) {
@@ -64,9 +65,23 @@ bool loadImageWithWic(const std::wstring& path, RgbaImage& image, std::string& e
 
     UINT width = 0;
     UINT height = 0;
-    frame->GetSize(&width, &height);
-    if (width == 0 || height == 0 || width > 16384 || height > 16384) {
-        errorMessage = "Image dimensions are invalid.";
+    hr = frame->GetSize(&width, &height);
+    if (FAILED(hr)) {
+        errorMessage = "Could not read image dimensions: " + hresultText(hr);
+        return false;
+    }
+
+    // Storyland's PS2 authoring path supports at most 4096x4096. Reject larger
+    // decoded images before allocating/copying RGBA data. This also prevents a
+    // small compressed image from expanding into a catastrophic memory request.
+    if (width == 0 || height == 0 || width > 4096u || height > 4096u) {
+        errorMessage = "Image dimensions are invalid or exceed the 4096x4096 Storyland texture limit.";
+        return false;
+    }
+    const uint64_t rgbaBytes64 = uint64_t(width) * uint64_t(height) * 4ull;
+    if (rgbaBytes64 > uint64_t((std::numeric_limits<UINT>::max)()) ||
+        rgbaBytes64 > uint64_t((std::numeric_limits<size_t>::max)())) {
+        errorMessage = "Decoded image buffer would be too large.";
         return false;
     }
 
@@ -85,8 +100,8 @@ bool loadImageWithWic(const std::wstring& path, RgbaImage& image, std::string& e
 
     image.width = int(width);
     image.height = int(height);
-    image.rgba.resize(size_t(width) * size_t(height) * 4);
-    hr = converter->CopyPixels(nullptr, width * 4, UINT(image.rgba.size()), image.rgba.data());
+    image.rgba.resize(size_t(rgbaBytes64));
+    hr = converter->CopyPixels(nullptr, width * 4u, UINT(rgbaBytes64), image.rgba.data());
     if (FAILED(hr)) {
         errorMessage = "Could not copy image pixels: " + hresultText(hr);
         return false;
@@ -95,8 +110,15 @@ bool loadImageWithWic(const std::wstring& path, RgbaImage& image, std::string& e
 }
 
 bool savePngWithWic(const std::wstring& path, const RgbaImage& image, std::string& errorMessage) {
-    if (image.width <= 0 || image.height <= 0 || image.rgba.size() != size_t(image.width) * size_t(image.height) * 4) {
-        errorMessage = "Image buffer is invalid.";
+    if (image.width <= 0 || image.height <= 0 || image.width > 4096 || image.height > 4096) {
+        errorMessage = "Image buffer dimensions are invalid.";
+        return false;
+    }
+    const uint64_t rgbaBytes64 = uint64_t(image.width) * uint64_t(image.height) * 4ull;
+    if (rgbaBytes64 > uint64_t((std::numeric_limits<UINT>::max)()) ||
+        rgbaBytes64 > uint64_t((std::numeric_limits<size_t>::max)()) ||
+        image.rgba.size() != size_t(rgbaBytes64)) {
+        errorMessage = "Image buffer is invalid or too large.";
         return false;
     }
 
@@ -160,7 +182,7 @@ bool savePngWithWic(const std::wstring& path, const RgbaImage& image, std::strin
         errorMessage = "Could not set PNG pixel format: " + hresultText(hr);
         return false;
     }
-    hr = frame->WritePixels(UINT(image.height), UINT(image.width * 4), UINT(image.rgba.size()), const_cast<BYTE*>(image.rgba.data()));
+    hr = frame->WritePixels(UINT(image.height), UINT(image.width * 4), UINT(rgbaBytes64), const_cast<BYTE*>(image.rgba.data()));
     if (FAILED(hr)) {
         errorMessage = "Could not write PNG pixels: " + hresultText(hr);
         return false;

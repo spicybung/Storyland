@@ -5,7 +5,9 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <filesystem>
 #include <iomanip>
+#include <limits>
 #include <map>
 #include <set>
 #include <sstream>
@@ -47,50 +49,48 @@ static std::string animHex32(uint32_t value) {
 }
 
 static bool animReadWholeFile(const std::wstring& filePath, std::vector<uint8_t>& bytes, std::string& errorMessage) {
+    constexpr uint64_t kMaxAnimBytes = 512ull * 1024ull * 1024ull;
+    bytes.clear();
 #ifdef _WIN32
     FILE* file = nullptr;
     if (_wfopen_s(&file, filePath.c_str(), L"rb") != 0 || file == nullptr) {
         errorMessage = "Could not open .anim file.";
         return false;
     }
-    fseek(file, 0, SEEK_END);
-    long size = ftell(file);
-    fseek(file, 0, SEEK_SET);
-    if (size < 0) {
-        fclose(file);
-        errorMessage = "Could not determine .anim file size.";
-        return false;
+    if (_fseeki64(file, 0, SEEK_END) != 0) {
+        fclose(file); errorMessage = "Could not seek .anim file."; return false;
     }
-    bytes.resize(size_t(size));
-    if (!bytes.empty()) {
-        size_t readCount = fread(bytes.data(), 1, bytes.size(), file);
-        if (readCount != bytes.size()) {
-            fclose(file);
-            errorMessage = "Could not read full .anim file.";
-            return false;
-        }
+    const __int64 signedSize = _ftelli64(file);
+    if (signedSize < 0 || uint64_t(signedSize) > kMaxAnimBytes ||
+        uint64_t(signedSize) > uint64_t((std::numeric_limits<size_t>::max)())) {
+        fclose(file); errorMessage = ".anim file is too large to load safely."; return false;
+    }
+    if (_fseeki64(file, 0, SEEK_SET) != 0) {
+        fclose(file); errorMessage = "Could not rewind .anim file."; return false;
+    }
+    bytes.resize(size_t(signedSize));
+    if (!bytes.empty() && fread(bytes.data(), 1, bytes.size(), file) != bytes.size()) {
+        fclose(file); bytes.clear(); errorMessage = "Could not read full .anim file."; return false;
     }
     fclose(file);
     return true;
 #else
-    std::string narrow(filePath.begin(), filePath.end());
-    std::ifstream file(narrow, std::ios::binary);
-    if (!file) {
-        errorMessage = "Could not open .anim file.";
-        return false;
-    }
+    std::ifstream file(std::filesystem::path(filePath), std::ios::binary);
+    if (!file) { errorMessage = "Could not open .anim file."; return false; }
     file.seekg(0, std::ios::end);
-    std::streamoff size = file.tellg();
-    file.seekg(0, std::ios::beg);
-    if (size < 0) {
-        errorMessage = "Could not determine .anim file size.";
-        return false;
+    const std::streamoff size = file.tellg();
+    if (size < 0 || uint64_t(size) > kMaxAnimBytes ||
+        uint64_t(size) > uint64_t((std::numeric_limits<size_t>::max)()) ||
+        uint64_t(size) > uint64_t((std::numeric_limits<std::streamsize>::max)())) {
+        errorMessage = ".anim file is too large to load safely."; return false;
     }
+    file.seekg(0, std::ios::beg);
     bytes.resize(size_t(size));
-    if (!bytes.empty()) file.read(reinterpret_cast<char*>(bytes.data()), size);
-    if (!file && size != 0) {
-        errorMessage = "Could not read full .anim file.";
-        return false;
+    if (!bytes.empty()) {
+        file.read(reinterpret_cast<char*>(bytes.data()), std::streamsize(bytes.size()));
+        if (size_t(file.gcount()) != bytes.size()) {
+            bytes.clear(); errorMessage = "Could not read full .anim file."; return false;
+        }
     }
     return true;
 #endif
@@ -496,8 +496,12 @@ static StorylandAnimPoseBone animBasePoseBone(uint32_t index) {
 }
 
 
-bool StorylandAnimFile::loadFromFile(const std::wstring& filePath, std::string& errorMessage) {
-    path = filePath;
+bool StorylandAnimFile::loadFromMemory(
+    const std::vector<uint8_t>& bytes,
+    const std::wstring& displayPath,
+    std::string& errorMessage) {
+    constexpr size_t kMaximumAnimBytes = 512u * 1024u * 1024u;
+    path = displayPath;
     data.clear();
     fieldRows.clear();
     trackRows.clear();
@@ -509,14 +513,39 @@ bool StorylandAnimFile::loadFromFile(const std::wstring& filePath, std::string& 
     activeClip = 0;
     hasCandidates = false;
 
-    if (!animReadWholeFile(filePath, data, errorMessage)) return false;
-    if (data.empty()) {
-        errorMessage = ".anim file is empty.";
+    if (bytes.size() > kMaximumAnimBytes) {
+        errorMessage = ".anim file is too large to load safely.";
+        return false;
+    }
+    data = bytes;
+    if (data.size() < 0x20u) {
+        errorMessage = ".anim file is too small to contain a Leeds ANIM header.";
+        return false;
+    }
+    if (animReadU32(data, 0x00) != 0x616E696Du) {
+        errorMessage = "Not a Rockstar Leeds ANIM container: expected byte magic 'mina'.";
+        return false;
+    }
+
+    const uint32_t logicalSize = animReadU32(data, 0x08);
+    if (logicalSize != 0u && (logicalSize < 0x20u || logicalSize > data.size())) {
+        errorMessage = "ANIM logical file size is outside the physical file.";
         return false;
     }
 
     parse();
+    if (clipRows.empty()) {
+        errorMessage = "ANIM header is valid, but no safe CAnimBlendTree entries were found.";
+        return false;
+    }
+    errorMessage.clear();
     return true;
+}
+
+bool StorylandAnimFile::loadFromFile(const std::wstring& filePath, std::string& errorMessage) {
+    std::vector<uint8_t> bytes;
+    if (!animReadWholeFile(filePath, bytes, errorMessage)) return false;
+    return loadFromMemory(bytes, filePath, errorMessage);
 }
 
 void StorylandAnimFile::parse() {
@@ -579,6 +608,20 @@ void StorylandAnimFile::collectHeaderFields() {
     sizeField.note = "Raw .anim byte size.";
     fieldRows.push_back(sizeField);
 
+    auto addHeaderField = [&](const char* name, uint32_t offset, uint32_t value, const char* note) {
+        StorylandAnimField field;
+        field.group = "Leeds ANIM header";
+        field.name = name;
+        field.offset = offset;
+        field.value = value;
+        field.note = note;
+        fieldRows.push_back(field);
+    };
+    addHeaderField("logical_file_size", 0x08u, animReadU32(data, 0x08u), "Logical ANIM size; physical files may contain padding after this boundary.");
+    addHeaderField("relocation_table", 0x0Cu, animReadU32(data, 0x0Cu), "Relocation-table offset.");
+    addHeaderField("relocation_table_duplicate", 0x10u, animReadU32(data, 0x10u), "Second relocation-table pointer; normally matches 0x0C.");
+    addHeaderField("relocation_count", 0x14u, animReadU32(data, 0x14u), "Number of relocation entries, not animation pointer-table byte count.");
+
     for (size_t index = 0; index < dwordCount; ++index) {
         uint32_t offset = uint32_t(index * 4);
         uint32_t value = animReadU32(data, offset);
@@ -592,8 +635,9 @@ void StorylandAnimFile::collectHeaderFields() {
         std::ostringstream note;
         note << animHex32(value);
         if (offset == 0x00 && value == 0x616E696Du) note << " / 'anim' magic stored little-endian as bytes m i n a";
-        if (offset == 0x0C || offset == 0x10) note << " / animation data end or relocation/table pointer candidate";
-        if (offset == 0x14) note << " / top pointer table byte count candidate";
+        if (offset == 0x08) note << " / logical file size";
+        if (offset == 0x0C || offset == 0x10) note << " / relocation table pointer";
+        if (offset == 0x14) note << " / relocation entry count";
         if (std::isfinite(asFloat) && asFloat > -100000.0f && asFloat < 100000.0f) {
             note << " / float=" << asFloat;
         }
@@ -603,91 +647,72 @@ void StorylandAnimFile::collectHeaderFields() {
 }
 
 void StorylandAnimFile::scanLeedsAnimationClips() {
-    if (data.size() < 0x24) return;
-    if (animReadU32(data, 0x00) != 0x616E696Du) return;
+    if (data.size() < 0x20u || animReadU32(data, 0x00u) != 0x616E696Du) return;
 
-    uint32_t tableByteCount = animReadU32(data, 0x14);
-    if (tableByteCount == 0 || tableByteCount > 0x4000u) return;
+    uint32_t logicalSize = animReadU32(data, 0x08u);
+    if (logicalSize < 0x20u || logicalSize > data.size()) logicalSize = uint32_t(data.size());
 
-    uint32_t pointerCount = tableByteCount / 4u;
-    if (0x20u + pointerCount * 4u > data.size()) {
-        pointerCount = uint32_t((data.size() - 0x20u) / 4u);
-    }
-
-    // Some banks store a much larger relocation count at 0x14.
-    // If the first pointer lands immediately after the pointer table, that
-    // gives the real clip count directly.  Keep the 0x14 count for tail-table
-    // banks such as strip.anim, where the first clip entry lives near EOF.
-    uint32_t firstEntryOffset = animReadU32(data, 0x20);
-    if (firstEntryOffset >= 0x20u &&
-        firstEntryOffset <= 0x4000u &&
-        ((firstEntryOffset - 0x20u) % 4u) == 0u) {
-        uint32_t countFromFirstEntry = (firstEntryOffset - 0x20u) / 4u;
-        if (countFromFirstEntry > 0 && countFromFirstEntry < pointerCount) {
-            pointerCount = countFromFirstEntry;
-        }
-    }
-
+    // BLeeds-verified layout: a pointer array begins at 0x20.  It is not sized
+    // by header+0x14 (that field is relocation count).  Stop when an entry is
+    // zero, out of range, has an invalid bone table, or has a bad fixed name.
     std::set<uint32_t> seenEntryOffsets;
-    for (uint32_t pointerIndex = 0; pointerIndex < pointerCount; ++pointerIndex) {
-        uint32_t entryOffset = animReadU32(data, 0x20u + pointerIndex * 4u);
-        if (!animValidPointer(data, entryOffset) || entryOffset + 0x24u > data.size()) continue;
-        if (!seenEntryOffsets.insert(entryOffset).second) continue;
+    for (uint32_t tableOffset = 0x20u; tableOffset + 4u <= logicalSize; tableOffset += 4u) {
+        uint32_t entryOffset = animReadU32(data, tableOffset);
+        if (entryOffset == 0u) break;
+        if (entryOffset < 0x20u || entryOffset + 36u > logicalSize) break;
+        if (!seenEntryOffsets.insert(entryOffset).second) break;
 
-        uint32_t channelTableOffset = animReadU32(data, entryOffset + 0x00);
-        std::string name = animReadFixedString(data, entryOffset + 0x04, 24);
-        uint32_t channelCount = animReadU16(data, entryOffset + 0x1C);
-        uint32_t flags = animReadU16(data, entryOffset + 0x1E);
-        float clipDuration = animReadF32(data, entryOffset + 0x20);
+        uint32_t channelTableOffset = animReadU32(data, entryOffset + 0x00u);
+        if (channelTableOffset < 0x20u || channelTableOffset >= logicalSize) break;
 
-        if (!animLooksLikeUsefulString(name)) continue;
-        if (channelCount == 0 || channelCount > 160) continue;
-        if (!std::isfinite(clipDuration) || clipDuration <= 0.0f || clipDuration > 120.0f) continue;
-        if (!animValidPointer(data, channelTableOffset) || channelTableOffset + channelCount * 12u > data.size()) continue;
+        std::string name = animReadFixedString(data, entryOffset + 0x04u, 24u);
+        if (!animLooksLikeUsefulString(name)) break;
 
-        uint32_t validChannels = 0;
+        uint32_t channelCount = animReadU16(data, entryOffset + 0x1Cu);
+        uint32_t entryFlags = animReadU16(data, entryOffset + 0x1Eu);
+        float clipDuration = animReadF32(data, entryOffset + 0x20u);
+        if (channelCount == 0u || channelCount > 512u) break;
+        if (uint64_t(channelTableOffset) + uint64_t(channelCount) * 12ull > logicalSize) break;
+        if (!std::isfinite(clipDuration) || clipDuration < 0.0f || clipDuration > 600.0f) break;
+
+        bool descriptorTableSafe = true;
         for (uint32_t channelIndex = 0; channelIndex < channelCount; ++channelIndex) {
-            size_t descriptorOffset = size_t(channelTableOffset) + size_t(channelIndex) * 12u;
-            uint32_t keyCount = animReadU16(data, descriptorOffset + 2);
-            uint32_t keyOffset = animReadU32(data, descriptorOffset + 4);
-            if (keyCount > 0 && keyCount < 1000 && animValidPointer(data, keyOffset)) validChannels++;
+            uint32_t descriptorOffset = channelTableOffset + channelIndex * 12u;
+            uint32_t frameCount = animReadU16(data, descriptorOffset + 2u);
+            uint32_t framesOffset = animReadU32(data, descriptorOffset + 4u);
+            if (frameCount > 0u && (framesOffset < 0x20u || framesOffset >= logicalSize)) {
+                descriptorTableSafe = false;
+                break;
+            }
         }
-        if (validChannels == 0) continue;
+        if (!descriptorTableSafe) break;
 
         StorylandAnimClip clip;
         clip.index = uint32_t(clipRows.size());
         clip.entryOffset = entryOffset;
         clip.channelTableOffset = channelTableOffset;
         clip.channelCount = channelCount;
-        clip.flags = flags;
+        clip.flags = entryFlags;
         clip.duration = clipDuration;
         clip.name = name;
         clipRows.push_back(clip);
 
         StorylandAnimField field;
-        field.group = "Animation clip table";
+        field.group = "CAnimBlendTree";
         field.name = name;
         field.offset = entryOffset;
         field.value = channelTableOffset;
         std::ostringstream note;
-        note << "channels=" << channelCount
-             << " flags=" << animHex32(flags)
-             << " duration=" << clipDuration
-             << " table=" << animHexOffset(channelTableOffset);
-        if (flags == 0xAAAAu) note << " / LCS PS2 retail clip-entry marker";
+        note << "bones=" << channelCount << " unk0=0x" << std::uppercase << std::hex << entryFlags << std::dec
+             << " duration=" << clipDuration << " bone_table=" << animHexOffset(channelTableOffset);
         field.note = note.str();
         fieldRows.push_back(field);
     }
 
-    std::sort(clipRows.begin(), clipRows.end(), [](const StorylandAnimClip& a, const StorylandAnimClip& b) {
-        return a.entryOffset < b.entryOffset;
-    });
-    for (uint32_t index = 0; index < clipRows.size(); ++index) clipRows[index].index = index;
-
-    if (clipRows.empty()) return;
-
-    activeClip = 0;
-    rebuildActiveClipTracks();
+    if (!clipRows.empty()) {
+        activeClip = 0u;
+        rebuildActiveClipTracks();
+    }
 }
 
 void StorylandAnimFile::rebuildActiveClipTracks() {
@@ -695,144 +720,86 @@ void StorylandAnimFile::rebuildActiveClipTracks() {
     hasCandidates = false;
 
     if (clipRows.empty()) {
-        frames = 1;
+        frames = 1u;
         duration = 1.0f / fps;
         return;
     }
-
-    if (activeClip >= clipRows.size()) {
-        activeClip = 0;
-    }
+    if (activeClip >= clipRows.size()) activeClip = 0u;
 
     const StorylandAnimClip& clip = clipRows[activeClip];
     duration = clip.duration;
+    uint32_t logicalSize = animReadU32(data, 0x08u);
+    if (logicalSize < 0x20u || logicalSize > data.size()) logicalSize = uint32_t(data.size());
 
-    struct RawDescriptor {
-        uint32_t channelIndex = 0;
-        uint32_t descriptorOffset = 0;
-        uint32_t boneId = 0;
-        uint32_t keyCount = 0;
-        uint32_t keyOffset = 0;
-        uint32_t tag = 0;
-    };
-
-    std::vector<RawDescriptor> descriptors;
-    descriptors.reserve(clip.channelCount);
     for (uint32_t channelIndex = 0; channelIndex < clip.channelCount; ++channelIndex) {
         uint32_t descriptorOffset = clip.channelTableOffset + channelIndex * 12u;
-        RawDescriptor descriptor;
-        descriptor.channelIndex = channelIndex;
-        descriptor.descriptorOffset = descriptorOffset;
-        uint32_t channelType = animReadU16(data, descriptorOffset + 0);
-        descriptor.keyCount = animReadU16(data, descriptorOffset + 2);
-        descriptor.keyOffset = animReadU32(data, descriptorOffset + 4);
-        descriptor.tag = animReadU32(data, descriptorOffset + 8);
-        descriptor.boneId = animBoneIdFromChannelTag(descriptor.tag);
+        if (descriptorOffset + 12u > logicalSize) break;
 
-        // Known Leeds channel types observed so far:
-        // 0x01 / 0x09 = 10-byte compressed rotation key stream.
-        // 0x03 / 0x0B = 16-byte compressed rotation + translation key stream.
-        if (!animChannelTypeIsKnown(channelType)) continue;
+        uint32_t flags = animReadU16(data, descriptorOffset + 0u);
+        uint32_t frameCount = animReadU16(data, descriptorOffset + 2u);
+        uint32_t framesOffset = animReadU32(data, descriptorOffset + 4u);
+        uint32_t boneKey = animReadU32(data, descriptorOffset + 8u);
 
-        if (descriptor.keyCount == 0 || descriptor.keyCount > 1000) continue;
-        if (!animValidPointer(data, descriptor.keyOffset)) continue;
-        descriptors.push_back(descriptor);
-    }
+        if ((flags & 0x0007u) == 0u || (flags & ~0x001Fu) != 0u) continue;
+        if (frameCount == 0u || frameCount > 4096u) continue;
+        uint32_t stride = animStrideForChannelType(flags);
+        if (stride <= 2u) continue;
+        if (framesOffset < 0x20u || uint64_t(framesOffset) + uint64_t(frameCount) * stride > logicalSize) continue;
 
-    std::vector<uint32_t> keyOffsets;
-    keyOffsets.reserve(descriptors.size() + 1);
-    for (const auto& descriptor : descriptors) keyOffsets.push_back(descriptor.keyOffset);
-    uint32_t dataEnd = animDataEndGuess(data);
-    keyOffsets.push_back(dataEnd);
-    std::sort(keyOffsets.begin(), keyOffsets.end());
-    keyOffsets.erase(std::unique(keyOffsets.begin(), keyOffsets.end()), keyOffsets.end());
-
-    auto nextKeyOffsetAfter = [&](uint32_t keyOffset) -> uint32_t {
-        for (uint32_t candidate : keyOffsets) {
-            if (candidate > keyOffset) return candidate;
+        uint32_t low16 = boneKey & 0xFFFFu;
+        uint32_t boneId = 0xFFFFFFFFu;
+        if ((flags & 0x0010u) != 0u) {
+            boneId = low16;
+        } else {
+            // Hash-keyed Leeds channels: resolve only the known stable high-word
+            // mapping; do not mistake arbitrary low-word channel data for a bone id.
+            boneId = animBoneIdFromChannelTag(boneKey & 0xFFFF0000u);
         }
-        return uint32_t(data.size());
-    };
-
-    for (const auto& descriptor : descriptors) {
-        uint32_t nextOffset = nextKeyOffsetAfter(descriptor.keyOffset);
-        if (nextOffset <= descriptor.keyOffset) continue;
-
-        uint32_t available = std::min<uint32_t>(nextOffset - descriptor.keyOffset, uint32_t(data.size() - descriptor.keyOffset));
-        uint32_t channelType = animReadU16(data, descriptor.descriptorOffset + 0);
-        uint32_t stride = animStrideForChannelType(channelType);
-        if (available < descriptor.keyCount * stride) continue;
 
         StorylandAnimTrack track;
         track.index = uint32_t(trackRows.size());
         track.clipIndex = activeClip;
-        track.channelIndex = descriptor.channelIndex;
-        track.offset = descriptor.descriptorOffset;
-        track.keyDataOffset = descriptor.keyOffset;
+        track.channelIndex = channelIndex;
+        track.offset = descriptorOffset;
+        track.keyDataOffset = framesOffset;
         track.keyStride = stride;
-        track.boneId = descriptor.boneId;
-        uint32_t canonicalIndex = animCanonicalIndexForBoneId(descriptor.boneId);
-        track.boneIndex = canonicalIndex != 0xFFFFFFFFu ? canonicalIndex : descriptor.channelIndex;
+        track.channelFlags = flags;
+        track.boneId = boneId;
+        uint32_t canonicalIndex = animCanonicalIndexForBoneId(boneId);
+        track.boneIndex = canonicalIndex != 0xFFFFFFFFu ? canonicalIndex : channelIndex;
         track.parentIndex = animCanonicalParent(track.boneIndex);
-        track.tag = descriptor.tag;
-        track.name = animNameForBoneId(descriptor.boneId, track.boneIndex);
+        track.tag = boneKey;
+        track.name = animNameForBoneId(boneId, track.boneIndex);
 
         std::ostringstream source;
-        uint32_t sourceChannelType = animReadU16(data, descriptor.descriptorOffset + 0);
-        source << "clip '" << clip.name << "' channel=" << descriptor.channelIndex
-               << " flags=0x" << std::uppercase << std::hex << std::setw(4) << std::setfill('0') << sourceChannelType << std::dec
-               << " boneId=" << descriptor.boneId
-               << " keys=" << descriptor.keyCount
-               << " stride=" << stride
-               << " desc=" << animHexOffset(descriptor.descriptorOffset)
-               << " keyData=" << animHexOffset(descriptor.keyOffset)
-               << " tag=" << animHex32(descriptor.tag);
-        if ((sourceChannelType & 0x0010u) != 0) source << " LCS_PS2_extra10";
-        if ((sourceChannelType & 0x0008u) != 0) source << " VCS_or_PSP_extra08";
+        source << "clip '" << clip.name << "' channel=" << channelIndex
+               << " flags=0x" << std::uppercase << std::hex << std::setw(4) << std::setfill('0') << flags << std::dec
+               << " boneKey=" << animHex32(boneKey)
+               << " target=" << (boneId == 0xFFFFFFFFu ? std::string("hash/unresolved") : std::to_string(boneId))
+               << " frames=" << frameCount << " stride=" << stride
+               << (((flags & 0x0010u) != 0u) ? " direct-id" : " hash-keyed");
         track.source = source.str();
 
-        track.keys.reserve(descriptor.keyCount);
-        float accumulatedTime = 0.0f;
-        for (uint32_t keyIndex = 0; keyIndex < descriptor.keyCount; ++keyIndex) {
-            uint32_t keyOffset = descriptor.keyOffset + keyIndex * stride;
-            if (keyOffset + stride > data.size()) break;
-
-            StorylandAnimKey key = decodeAnimKeyWithFlags(data, keyOffset, channelType);
-            float deltaSeconds = key.time;
-            if (!std::isfinite(deltaSeconds) || deltaSeconds < 0.0f) deltaSeconds = 0.0f;
-
-            accumulatedTime += deltaSeconds;
-            key.time = accumulatedTime;
-            if (keyIndex == 0) key.time = 0.0f;
-
+        float absoluteTime = 0.0f;
+        track.keys.reserve(frameCount);
+        for (uint32_t frameIndex = 0; frameIndex < frameCount; ++frameIndex) {
+            uint32_t frameOffset = framesOffset + frameIndex * stride;
+            StorylandAnimKey key = decodeAnimKeyWithFlags(data, frameOffset, flags);
+            float delta = key.time;
+            if (!std::isfinite(delta) || delta < 0.0f) delta = 0.0f;
+            absoluteTime += delta;
+            key.time = absoluteTime;
             track.keys.push_back(key);
         }
 
-        if (track.keys.size() > 1 && clip.duration > 0.0f && accumulatedTime > 0.0001f) {
-            if (accumulatedTime < clip.duration * 0.50f || accumulatedTime > clip.duration * 1.50f) {
-                float scale = clip.duration / accumulatedTime;
-                for (auto& key : track.keys) {
-                    key.time *= scale;
-                }
-            }
-        }
-
-        if (!track.keys.empty()) trackRows.push_back(track);
+        if (!track.keys.empty()) trackRows.push_back(std::move(track));
     }
 
-    if (!trackRows.empty()) hasCandidates = true;
-
-    uint32_t maxKeys = 1;
-    for (const auto& track : trackRows) {
-        maxKeys = std::max<uint32_t>(maxKeys, uint32_t(track.keys.size()));
-    }
-
-    frames = std::max<uint32_t>(1, maxKeys);
-    if (clip.duration > 0.0f) {
-        duration = clip.duration;
-    } else {
-        duration = std::max(1.0f / fps, float(std::max<uint32_t>(1, frames - 1)) / fps);
-    }
+    hasCandidates = !trackRows.empty();
+    uint32_t maxKeys = 1u;
+    for (const auto& track : trackRows) maxKeys = std::max<uint32_t>(maxKeys, uint32_t(track.keys.size()));
+    frames = maxKeys;
+    if (duration <= 0.0f) duration = std::max(1.0f / fps, float(std::max<uint32_t>(1u, frames - 1u)) / fps);
 }
 
 void StorylandAnimFile::buildStaticInspectionTracks() {
@@ -957,15 +924,15 @@ std::string StorylandAnimFile::summaryLine() const {
        << " duration=" << std::fixed << std::setprecision(2) << duration << "s";
     if (!clipRows.empty()) ss << " activeClip='" << clipRows[activeClip].name << "'";
     if (hasCandidates) {
-        bool hasLcs10 = false;
-        bool hasVcs08 = false;
+        bool hasDirectIds = false;
+        bool hasExtra08 = false;
         for (const auto& track : trackRows) {
-            if (track.source.find("LCS_PS2_extra10") != std::string::npos) hasLcs10 = true;
-            if (track.source.find("VCS_or_PSP_extra08") != std::string::npos) hasVcs08 = true;
+            if ((track.channelFlags & 0x0010u) != 0u) hasDirectIds = true;
+            if ((track.channelFlags & 0x0008u) != 0u) hasExtra08 = true;
         }
-        ss << " Leeds compressed transform channels=yes";
-        if (hasLcs10) ss << " format=LCS_PS2_0x10";
-        else if (hasVcs08) ss << " format=VCS_or_PSP_0x08";
+        ss << " Leeds CAnimBlendTree channels=yes";
+        if (hasDirectIds) ss << " direct-id=yes";
+        if (hasExtra08) ss << " extra-flag-0x08=yes";
     } else {
         ss << " transform channels=no, static inspection only";
     }

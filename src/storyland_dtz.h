@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <map>
 
 struct StorylandDtzHeaderField {
     std::string name;
@@ -30,11 +31,23 @@ struct StorylandDtzResourceHint {
 
 struct StorylandDtzDirEntry {
     uint32_t dirIndex = 0;
+    uint32_t streamingIndex = 0xFFFFFFFFu;
     uint32_t startSector = 0;
     uint32_t sectorCount = 0;
     uint32_t matchedDtzSectorCount = 0;
+    uint64_t byteOffset = 0;
+    uint64_t byteLength = 0;
+    uint64_t availableBytes = 0;
     bool countDiffersFromCompanionDir = false;
+    bool fullyBackedByImg = false;
+    std::string detectedExtension;
     std::string name;
+    uint32_t startStorageOffset = 0xFFFFFFFFu;
+    uint32_t countStorageOffset = 0xFFFFFFFFu;
+    uint32_t nameStorageOffset = 0xFFFFFFFFu;
+    uint32_t nameStorageLength = 0u;
+    bool nameStoredAsHash = false;
+    bool nameStoredAsSplitExtension = false;
     std::vector<size_t> matchingRecordIndices;
 };
 
@@ -159,7 +172,9 @@ public:
     bool patchDataField(size_t fieldIndex, const std::string& newValueText, std::string& report, std::string& errorMessage);
     bool patchRawBytes(uint32_t absoluteOffset, const std::vector<uint8_t>& bytes, std::string& report, std::string& errorMessage);
     bool replaceDirEntryBytes(size_t dirEntryIndex, const std::vector<uint8_t>& replacementBytes, bool shiftLaterStarts, std::string& report, std::string& errorMessage);
+    bool renameDirEntry(size_t dirEntryIndex, const std::string& requestedName, std::string& report, std::string& errorMessage);
     bool extractDirEntryBytes(size_t dirEntryIndex, std::vector<uint8_t>& bytes, std::string& errorMessage) const;
+    bool findModelDirEntryByModelId(uint32_t modelId, size_t& outIndex, std::string& outName) const;
     bool findDirEntryByStemAndExtension(const std::wstring& stem, const std::vector<std::wstring>& extensions, size_t& outIndex) const;
 
     const std::vector<StorylandDtzHeaderField>& headerFields() const;
@@ -196,6 +211,7 @@ private:
     std::vector<uint8_t> dirRawData;
     std::vector<uint8_t> imgRawData;
     bool compressedInput = false;
+    std::map<uint32_t, std::string> explicitStreamNames;
 
     bool writePatchedCompanionDir(const std::wstring& savedDtzPath, std::string& errorMessage) const;
     bool writePatchedCompanionImg(const std::wstring& savedDtzPath, std::string& errorMessage) const;
@@ -207,6 +223,5 @@ private:
     void rebuildDirMatches();
     void rebuildDataBlocksAndFields();
     void rebuildLeeds2dfxEffects();
-    void tryAutoLoadCompanionDir();
     void tryAutoLoadCompanionImg();
 };

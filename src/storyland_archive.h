@@ -126,6 +126,8 @@ struct StorylandResourceResolution {
 class StorylandArchiveBrowser {
 public:
     bool loadImgFromFile(const std::wstring& imgPath, std::string& errorMessage);
+    bool loadDirWithCompanionImg(const std::wstring& dirPath, std::string& errorMessage);
+    bool loadZmgFromFile(const std::wstring& zmgPath, std::string& errorMessage);
     bool loadLvzWithCompanionImg(const std::wstring& lvzPath, std::string& errorMessage);
 
     const std::vector<StorylandArchiveEntry>& entries() const;
@@ -175,6 +177,7 @@ private:
     bool writeWholeFile(const std::wstring& path, const std::vector<uint8_t>& bytes, std::string& errorMessage) const;
     bool rebuildParsedCaches(std::string& errorMessage);
     bool buildEntriesFromLvzAndImg(std::string& errorMessage);
+    bool buildEntriesFromClassicDir(const std::vector<uint8_t>& dirBytes, std::string& errorMessage);
     bool buildEntriesFromMobileLcsImg(std::string& errorMessage);
     void buildWorldSectorsAndPlacements();
     void buildWorldMeshes();

@@ -23,9 +23,14 @@ struct StorylandDmaTlbReport {
     size_t byteSize = 0;
     uint32_t dmaTags = 0;
     uint32_t dmaChains = 0;
+    uint64_t dmaPayloadBytes = 0;
     uint32_t vifStreams = 0;
     uint32_t vifCommands = 0;
     uint32_t vifUnpacks = 0;
+    uint32_t directTransfers = 0;
+    uint32_t gifTags = 0;
+    uint32_t gifPackets = 0;
+    uint64_t gifPayloadBytes = 0;
     uint32_t warnings = 0;
     uint32_t fatals = 0;
     std::vector<StorylandDmaIssue> issues;
@@ -34,7 +39,4 @@ struct StorylandDmaTlbReport {
     std::string text() const;
 };
 
-StorylandDmaTlbReport storylandValidatePs2DmaTlb(
-    const std::vector<uint8_t>& bytes,
-    const std::string& label
-);
+StorylandDmaTlbReport storylandValidatePs2DmaTlb(const std::vector<uint8_t>& bytes, const std::string& label);

@@ -113,6 +113,7 @@ struct StorylandModelBone {
 class StorylandModelFile {
 public:
     bool loadFromFile(const std::wstring& filePath, std::string& errorMessage);
+    bool loadFromMemory(const std::vector<uint8_t>& bytes, const std::wstring& displayPath, std::string& errorMessage);
     const std::vector<StorylandModelLine>& lines() const;
     const std::vector<StorylandModelPoint>& previewPoints() const;
     const std::vector<StorylandModelTriangle>& previewTriangles() const;
@@ -127,8 +128,24 @@ public:
     std::string modelKindName() const;
     const std::wstring& sourcePath() const;
     size_t fileSize() const;
+    const std::vector<uint8_t>& rawBytes() const;
     bool isMobileLcsDff() const;
+    bool isPmlcMdl() const;
+    bool isPspNativeDff() const;
+    bool isGtaSaDff() const;
+    bool saveToFile(const std::wstring& outputPath, std::string& errorMessage) const;
     bool exportMobileLcsDffLossless(const std::wstring& outputPath, std::string& errorMessage) const;
+    void createEmptyDraft(const std::wstring& displayPath);
+    void createEmptyDraft(
+        const std::wstring& displayPath,
+        StorylandModelKind desiredKind,
+        bool pspTarget);
+    void createEmptyDffDraft(const std::wstring& displayPath);
+    void createEmptyDffDraft(
+        const std::wstring& displayPath,
+        StorylandModelKind desiredKind);
+    bool importMdlDataFromFile(const std::wstring& filePath, std::string& errorMessage);
+    bool isEmptyDraft() const;
 
 private:
     std::wstring path;
@@ -146,9 +163,17 @@ private:
     StorylandModelKind kind = StorylandModelKind::Unknown;
     bool previewUsesPspNativeSkinPalette = false;
     bool mobileLcsDff = false;
+    bool pmlcMdl = false;
+    bool pspNativeDff = false;
+    bool gtaSaDff = false;
+    bool emptyDraft = false;
 
     void parse();
     bool parseMobileLcsDff();
+    bool parsePmlcMdl();
+    bool parsePspStandardDff();
+    bool parseGtaSaDff();
+    bool parsePspNativeDff();
     void collectRenderWare2dfxLights();
     void collectPreviewPoints();
     void collectArmatureBones();

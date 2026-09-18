@@ -4,8 +4,8 @@ IDI_STORYLAND ICON "resources/storyland_icon.ico"
 IDR_VCS_TIMECYC RCDATA "../data/timecyc.dat"
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 1,0,3,0
- PRODUCTVERSION 1,0,3,0
+ FILEVERSION 1,1,5,0
+ PRODUCTVERSION 1,1,5,0
  FILEFLAGSMASK 0x3fL
 #ifdef _DEBUG
  FILEFLAGS 0x1L
@@ -22,12 +22,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Reigns Studios\0"
             VALUE "FileDescription", "Storyland - GTA Stories file analyzer, editor, and viewer\0"
-            VALUE "FileVersion", "1.0.3\0"
+            VALUE "FileVersion", "1.1.5\0"
             VALUE "InternalName", "Storyland\0"
             VALUE "LegalCopyright", "Storyland contributors\0"
             VALUE "OriginalFilename", "Storyland.exe\0"
             VALUE "ProductName", "Storyland\0"
-            VALUE "ProductVersion", "1.0.3\0"
+            VALUE "ProductVersion", "1.1.5\0"
         END
     END
     BLOCK "VarFileInfo"

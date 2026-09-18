@@ -57,19 +57,24 @@ static bool wblReadWholeFile(const std::wstring& path, std::vector<uint8_t>& out
     }
 
     file.seekg(0, std::ios::end);
-    std::streamoff size = file.tellg();
-    if (size < 0) {
-        errorMessage = "Could not get file size.";
+    const std::streamoff size = file.tellg();
+    constexpr uint64_t kMaxWblBytes = 1024ull * 1024ull * 1024ull;
+    if (size < 0 || uint64_t(size) > kMaxWblBytes ||
+        uint64_t(size) > uint64_t((std::numeric_limits<size_t>::max)()) ||
+        uint64_t(size) > uint64_t((std::numeric_limits<std::streamsize>::max)())) {
+        errorMessage = "WBL file is too large to load safely.";
         return false;
     }
     file.seekg(0, std::ios::beg);
 
     outBytes.resize(size_t(size));
-    if (!outBytes.empty()) file.read(reinterpret_cast<char*>(outBytes.data()), std::streamsize(outBytes.size()));
-    if (!file && !outBytes.empty()) {
-        errorMessage = "Could not read full file.";
-        outBytes.clear();
-        return false;
+    if (!outBytes.empty()) {
+        file.read(reinterpret_cast<char*>(outBytes.data()), std::streamsize(outBytes.size()));
+        if (size_t(file.gcount()) != outBytes.size()) {
+            errorMessage = "Could not read full file.";
+            outBytes.clear();
+            return false;
+        }
     }
     return true;
 }

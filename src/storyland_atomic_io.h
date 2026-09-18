@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <chrono>
 #include <cwctype>
 #include <filesystem>
 #include <fstream>
@@ -30,12 +31,56 @@ inline bool writeAndVerify(const std::filesystem::path& path, const std::vector<
         std::filesystem::create_directories(path.parent_path(), ec);
         if (ec) { error = "Could not create output directory: " + ec.message(); return false; }
     }
+#ifdef _WIN32
+    // Do not follow reparse points for staged output. A junction/symlink in an
+    // output path can redirect a supposedly local transaction somewhere else.
+    if (!path.parent_path().empty()) {
+        const DWORD parentAttrs = GetFileAttributesW(path.parent_path().c_str());
+        if (parentAttrs != INVALID_FILE_ATTRIBUTES && (parentAttrs & FILE_ATTRIBUTE_REPARSE_POINT)) {
+            error = "Refusing to write through a reparse-point output directory.";
+            return false;
+        }
+    }
+    // Use Win32 directly for rebuilt IMG/DTZ output.  std::ofstream only reports a
+    // generic failbit here, which made perfectly ordinary Windows failures (full
+    // disk, AV/Controlled Folder Access, sharing/permission errors) look like a
+    // Storyland rebuild bug.  Write in bounded chunks and report the real error.
+    HANDLE handle = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        error = "Could not create staged output file (Windows error " + std::to_string(GetLastError()) + "): " + path.string();
+        return false;
+    }
+    size_t writtenTotal = 0;
+    while (writtenTotal < bytes.size()) {
+        const DWORD request = static_cast<DWORD>(std::min<size_t>(bytes.size() - writtenTotal, 8u * 1024u * 1024u));
+        DWORD wrote = 0;
+        if (!WriteFile(handle, bytes.data() + writtenTotal, request, &wrote, nullptr) || wrote != request) {
+            const DWORD winerr = GetLastError();
+            CloseHandle(handle);
+            DeleteFileW(path.c_str());
+            error = "Could not completely write staged output file after " + std::to_string(writtenTotal + wrote) +
+                    " of " + std::to_string(bytes.size()) + " bytes (Windows error " + std::to_string(winerr) + "): " + path.string();
+            return false;
+        }
+        writtenTotal += size_t(wrote);
+    }
+    if (!FlushFileBuffers(handle)) {
+        const DWORD winerr = GetLastError();
+        CloseHandle(handle);
+        DeleteFileW(path.c_str());
+        error = "Could not flush staged output file (Windows error " + std::to_string(winerr) + "): " + path.string();
+        return false;
+    }
+    CloseHandle(handle);
+#else
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
-    if (!output) { error = "Could not create staged output file."; return false; }
+    if (!output) { error = "Could not create staged output file: " + path.string(); return false; }
     if (!bytes.empty()) output.write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
     output.flush();
-    if (!output) { error = "Could not completely write staged output file."; return false; }
+    if (!output) { error = "Could not completely write staged output file: " + path.string(); return false; }
     output.close();
+#endif
 
     std::ifstream verify(path, std::ios::binary);
     if (!verify) { error = "Could not reopen staged output for verification."; return false; }
@@ -125,13 +170,39 @@ inline bool storylandWriteFilesTransaction(const std::vector<StorylandOutputFile
     std::vector<std::filesystem::path> backupPaths;
     for (const StorylandOutputFile& file : files) {
         if (file.path.empty() || file.bytes == nullptr) { error = "An output path or byte buffer is missing."; return false; }
+        std::error_code pathError;
+        if (std::filesystem::exists(file.path, pathError) && !pathError && std::filesystem::is_directory(file.path, pathError)) {
+            error = "The output path is a directory, not a file.";
+            return false;
+        }
+        pathError.clear();
+        const std::filesystem::file_status outputStatus = std::filesystem::symlink_status(file.path, pathError);
+        if (!pathError && std::filesystem::is_symlink(outputStatus)) {
+            error = "Refusing to overwrite a symbolic link.";
+            return false;
+        }
+#ifdef _WIN32
+        const DWORD outputAttrs = GetFileAttributesW(file.path.c_str());
+        if (outputAttrs != INVALID_FILE_ATTRIBUTES && (outputAttrs & FILE_ATTRIBUTE_REPARSE_POINT)) {
+            error = "Refusing to overwrite a Windows reparse point.";
+            return false;
+        }
+#endif
         std::wstring key = file.path.lexically_normal().wstring();
 #ifdef _WIN32
         std::transform(key.begin(), key.end(), key.begin(), [](wchar_t c) { return wchar_t(std::towlower(c)); });
 #endif
         if (!uniquePaths.insert(key).second) { error = "Two outputs resolve to the same path."; return false; }
-        std::filesystem::path staged = file.path; staged += L".storyland_tmp";
-        std::filesystem::path backup = file.path; backup += L".storyland_bak";
+        const auto nonce = static_cast<unsigned long long>(
+            std::chrono::high_resolution_clock::now().time_since_epoch().count()) ^
+#ifdef _WIN32
+            static_cast<unsigned long long>(GetCurrentProcessId());
+#else
+            static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(file.bytes));
+#endif
+        const std::wstring suffix = L"." + std::to_wstring(nonce);
+        std::filesystem::path staged = file.path; staged += suffix + L".storyland_tmp";
+        std::filesystem::path backup = file.path; backup += suffix + L".storyland_bak";
         std::error_code ignored;
         std::filesystem::remove(staged, ignored);
         std::filesystem::remove(backup, ignored);

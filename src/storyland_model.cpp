@@ -1,4 +1,5 @@
 #include "storyland_model.h"
+#include "storyland_atomic_io.h"
 
 #include <algorithm>
 #include <array>
@@ -10,6 +11,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <map>
+#include <limits>
 #include <set>
 #include <sstream>
 
@@ -317,8 +319,23 @@ void StorylandModelFile::detectModelKind() {
     else kind = StorylandModelKind::Unknown;
 }
 
+bool StorylandModelFile::loadFromMemory(const std::vector<uint8_t>& bytes, const std::wstring& displayPath, std::string& errorMessage) {
+    constexpr uint64_t maxModelBytes = 1024ull * 1024ull * 1024ull;
+    if (uint64_t(bytes.size()) > maxModelBytes) {
+        errorMessage = "Model data is too large to inspect safely.";
+        return false;
+    }
+    path = displayPath;
+    data = bytes;
+    emptyDraft = false;
+    parse();
+    errorMessage.clear();
+    return true;
+}
+
 bool StorylandModelFile::loadFromFile(const std::wstring& filePath, std::string& errorMessage) {
     path = filePath;
+    emptyDraft = false;
     std::ifstream file(std::filesystem::path(filePath), std::ios::binary);
     if (!file) {
         errorMessage = "Could not open MDL file.";
@@ -328,11 +345,16 @@ bool StorylandModelFile::loadFromFile(const std::wstring& filePath, std::string&
     std::streamoff size = file.tellg();
     file.seekg(0, std::ios::beg);
     if (size < 0) {
-        errorMessage = "Could not determine MDL file size.";
+        errorMessage = "Could not determine model file size.";
+        return false;
+    }
+    constexpr uint64_t maxModelBytes = 1024ull * 1024ull * 1024ull;
+    if (uint64_t(size) > maxModelBytes || uint64_t(size) > uint64_t((std::numeric_limits<std::streamsize>::max)())) {
+        errorMessage = "Model file is too large to inspect safely.";
         return false;
     }
     data.resize(size_t(size));
-    if (!data.empty()) file.read(reinterpret_cast<char*>(data.data()), size);
+    if (!data.empty()) file.read(reinterpret_cast<char*>(data.data()), std::streamsize(size));
     if (!file && size != 0) {
         errorMessage = "Could not read full MDL file.";
         return false;
@@ -363,9 +385,11 @@ struct StorylandGeometryPartEntry {
 struct StorylandGeometryLayout {
     bool valid = false;
     uint32_t atomicOffset = 0;
+    uint32_t frameOffset = 0;
     uint32_t geometryOffset = 0;
     uint32_t geoStart = 0;
     uint32_t materialCount = 0;
+    std::string frameName;
     StorylandPreviewTransform transform;
     std::vector<std::string> materialTextureNames;
     std::vector<StorylandGeometryPartEntry> parts;
@@ -443,6 +467,15 @@ static StorylandModelMatrix multiplyModelMatrix(const StorylandModelMatrix& pare
 
 static StorylandModelPoint matrixModelPosition(const StorylandModelMatrix& matrix) {
     return StorylandModelPoint{matrix.m[12], matrix.m[13], matrix.m[14]};
+}
+
+static StorylandModelPoint transformModelPoint(const StorylandModelMatrix& matrix, const StorylandModelPoint& point) {
+    if (!matrix.valid) return point;
+    StorylandModelPoint out;
+    out.x = matrix.m[0] * point.x + matrix.m[4] * point.y + matrix.m[8] * point.z + matrix.m[12];
+    out.y = matrix.m[1] * point.x + matrix.m[5] * point.y + matrix.m[9] * point.z + matrix.m[13];
+    out.z = matrix.m[2] * point.x + matrix.m[6] * point.y + matrix.m[10] * point.z + matrix.m[14];
+    return out;
 }
 
 static bool matrixModelRotationToQuat(const StorylandModelMatrix& matrix, float& x, float& y, float& z, float& w) {
@@ -708,6 +741,140 @@ static bool findLeedsGeometryLayout(const std::vector<uint8_t>& data, StorylandG
         return true;
     }
 
+    return false;
+}
+
+
+static std::vector<StorylandGeometryLayout> collectLeedsGeometryLayouts(const std::vector<uint8_t>& data) {
+    std::vector<StorylandGeometryLayout> layouts;
+    std::set<std::pair<uint32_t, uint32_t>> seenFrameGeometry;
+
+    for (size_t atomicOffset = 0; atomicOffset + 0x38 <= data.size(); atomicOffset += 4) {
+        uint32_t sectionId = modelReadU32(data, atomicOffset);
+        if (sectionId != 0x0004AA01u && sectionId != 0x0000AA01u && sectionId != 0x01050001u &&
+            ((sectionId & 0xFFFF00FFu) != 0x00040001u)) {
+            continue;
+        }
+
+        uint32_t framePointer = modelReadU32(data, atomicOffset + 0x04u);
+        uint32_t geometryPointer = modelReadU32(data, atomicOffset + 0x14u);
+        if (!modelPointerLooksValid(data, geometryPointer) || size_t(geometryPointer) + 0x60u > data.size()) continue;
+
+        uint32_t materialListPointer = modelReadU32(data, size_t(geometryPointer) + 0x0Cu);
+        uint32_t materialCount = modelReadU32(data, size_t(geometryPointer) + 0x10u);
+        if (materialCount == 0u || materialCount > 512u) continue;
+        if (!modelPointerLooksValid(data, materialListPointer) ||
+            size_t(materialListPointer) + size_t(materialCount) * 4u > data.size()) {
+            continue;
+        }
+
+        if (!seenFrameGeometry.insert({framePointer, geometryPointer}).second) continue;
+
+        StorylandGeometryLayout candidate;
+        candidate.valid = true;
+        candidate.atomicOffset = uint32_t(atomicOffset);
+        candidate.frameOffset = framePointer;
+        candidate.geometryOffset = geometryPointer;
+        candidate.materialCount = materialCount;
+
+        if (modelPointerLooksValid(data, framePointer) && size_t(framePointer) + 0xACu <= data.size()) {
+            uint32_t frameNamePointer = modelReadU32(data, size_t(framePointer) + 0xA8u);
+            candidate.frameName = modelLowerAscii(readModelCStringAt(data, frameNamePointer));
+        }
+
+        candidate.materialTextureNames.reserve(materialCount);
+        for (uint32_t materialIndex = 0; materialIndex < materialCount; ++materialIndex) {
+            uint32_t materialPointer = modelReadU32(data, size_t(materialListPointer) + size_t(materialIndex) * 4u);
+            std::string textureName;
+            if (modelPointerLooksValid(data, materialPointer) && size_t(materialPointer) + 0x10u <= data.size()) {
+                uint32_t textureNamePointer = modelReadU32(data, size_t(materialPointer));
+                textureName = readModelCStringAt(data, textureNamePointer);
+            }
+            candidate.materialTextureNames.push_back(modelLowerAscii(textureName));
+        }
+
+        float sx = modelReadF32(data, size_t(geometryPointer) + 0x48u);
+        float sy = modelReadF32(data, size_t(geometryPointer) + 0x4Cu);
+        float sz = modelReadF32(data, size_t(geometryPointer) + 0x50u);
+        float tx = modelReadF32(data, size_t(geometryPointer) + 0x54u);
+        float ty = modelReadF32(data, size_t(geometryPointer) + 0x58u);
+        float tz = modelReadF32(data, size_t(geometryPointer) + 0x5Cu);
+        if (previewFiniteReasonable(sx, 1000.0f) && previewFiniteReasonable(sy, 1000.0f) &&
+            previewFiniteReasonable(sz, 1000.0f) && std::fabs(sx) >= 0.000001f &&
+            std::fabs(sy) >= 0.000001f && std::fabs(sz) >= 0.000001f &&
+            previewFiniteReasonable(tx, 1000.0f) && previewFiniteReasonable(ty, 1000.0f) &&
+            previewFiniteReasonable(tz, 1000.0f)) {
+            candidate.transform.valid = true;
+            candidate.transform.sx = sx;
+            candidate.transform.sy = sy;
+            candidate.transform.sz = sz;
+            candidate.transform.tx = tx;
+            candidate.transform.ty = ty;
+            candidate.transform.tz = tz;
+        }
+
+        size_t partTableOffset = size_t(geometryPointer) + 0x60u;
+        size_t rowOffset = partTableOffset;
+        const size_t maxPartRows = 2048u;
+        for (size_t rowIndex = 0; rowIndex < maxPartRows && rowOffset + 0x30u <= data.size();
+             ++rowIndex, rowOffset += 0x30u) {
+            uint32_t markerOrTemp = modelReadU32(data, rowOffset);
+            if (isLeedsDmaPacketWord(markerOrTemp)) {
+                candidate.geoStart = uint32_t(rowOffset);
+                break;
+            }
+
+            uint32_t stripOffset = modelReadU32(data, rowOffset + 0x1Cu);
+            uint16_t materialIndex = uint16_t(modelReadI16(data, rowOffset + 0x22u));
+            if (stripOffset < data.size() && materialIndex < materialCount) {
+                candidate.parts.push_back({stripOffset, materialIndex});
+            }
+        }
+
+        if (candidate.geoStart == 0u) {
+            for (size_t scan = partTableOffset; scan + 0x14u <= data.size(); scan += 4u) {
+                uint32_t value = modelReadU32(data, scan);
+                if (isLeedsDmaPacketWord(value) && modelReadU32(data, scan + 0x10u) == 0x6C018000u) {
+                    candidate.geoStart = uint32_t(scan);
+                    break;
+                }
+            }
+        }
+
+        if (candidate.geoStart == 0u) continue;
+        if (candidate.parts.empty()) candidate.parts.push_back({0u, 0u});
+
+        std::sort(candidate.parts.begin(), candidate.parts.end(),
+                  [](const StorylandGeometryPartEntry& a, const StorylandGeometryPartEntry& b) {
+                      if (a.stripOffset != b.stripOffset) return a.stripOffset < b.stripOffset;
+                      return a.materialIndex < b.materialIndex;
+                  });
+        candidate.parts.erase(
+            std::unique(candidate.parts.begin(), candidate.parts.end(),
+                        [](const StorylandGeometryPartEntry& a, const StorylandGeometryPartEntry& b) {
+                            return a.stripOffset == b.stripOffset && a.materialIndex == b.materialIndex;
+                        }),
+            candidate.parts.end());
+
+        layouts.push_back(std::move(candidate));
+    }
+
+    return layouts;
+}
+
+static bool vehicleFrameIsAlternatePreviewGeometry(const std::string& frameName) {
+    if (frameName.empty()) return false;
+    const std::string lower = modelLowerAscii(frameName);
+    if (lower.find("moving_rotor") != std::string::npos ||
+        lower.find("moving_prop") != std::string::npos ||
+        lower.find("rotor_blur") != std::string::npos ||
+        lower.find("prop_blur") != std::string::npos) {
+        return true;
+    }
+    if (lower == "chassis_vlo" || lower == "chassis_lo" ||
+        lower.find("_vlo") != std::string::npos) {
+        return true;
+    }
     return false;
 }
 
@@ -2025,6 +2192,118 @@ static bool appendPspNativeGeometry(
     return decodedAnyGeometry && points.size() >= 3u && !triangles.empty();
 }
 
+
+static bool appendLeedsVehicleAtomicGeometry(
+    const std::vector<uint8_t>& data,
+    std::vector<StorylandModelPoint>& points,
+    std::vector<StorylandModelTriangle>& triangles,
+    std::vector<StorylandModelTexcoord>& texcoords,
+    std::vector<StorylandModelSkinWeights>& skinWeights,
+    std::vector<std::string>& materialTextureNames,
+    uint32_t& stripCount,
+    uint32_t& rejectedMarkerCount,
+    uint32_t& partCount,
+    bool& usedHeaderTransform
+) {
+    std::vector<StorylandGeometryLayout> layouts = collectLeedsGeometryLayouts(data);
+    if (layouts.empty()) return false;
+
+    std::vector<uint32_t> geometryStarts;
+    geometryStarts.reserve(layouts.size());
+    for (const StorylandGeometryLayout& layout : layouts) {
+        if (layout.geoStart != 0u) geometryStarts.push_back(layout.geoStart);
+    }
+    std::sort(geometryStarts.begin(), geometryStarts.end());
+    geometryStarts.erase(std::unique(geometryStarts.begin(), geometryStarts.end()), geometryStarts.end());
+
+    const size_t maximumPreviewPoints = 250000u;
+    const size_t maximumPreviewTriangles = 250000u;
+    bool decodedAny = false;
+
+    for (const StorylandGeometryLayout& layout : layouts) {
+        if (vehicleFrameIsAlternatePreviewGeometry(layout.frameName)) continue;
+
+        size_t geometryEnd = std::min(data.size(), size_t(layout.geoStart) + size_t(0x10000u));
+        auto nextStart = std::upper_bound(geometryStarts.begin(), geometryStarts.end(), layout.geoStart);
+        if (nextStart != geometryStarts.end()) geometryEnd = std::min(geometryEnd, size_t(*nextStart));
+        if (geometryEnd <= layout.geoStart) continue;
+
+        const uint32_t materialBase = uint32_t(materialTextureNames.size());
+        materialTextureNames.insert(
+            materialTextureNames.end(),
+            layout.materialTextureNames.begin(),
+            layout.materialTextureNames.end());
+
+        StorylandModelMatrix frameMatrix;
+        if (modelPointerLooksValid(data, layout.frameOffset) && size_t(layout.frameOffset) + 0x90u <= data.size()) {
+            frameMatrix = readModelMatrix(data, layout.frameOffset + 0x50u);
+        }
+
+        bool layoutDecoded = false;
+        for (size_t partIndex = 0; partIndex < layout.parts.size(); ++partIndex) {
+            const StorylandGeometryPartEntry& part = layout.parts[partIndex];
+            size_t partStart = size_t(layout.geoStart) + size_t(part.stripOffset);
+            if (partStart >= geometryEnd || partStart >= data.size()) {
+                ++rejectedMarkerCount;
+                continue;
+            }
+
+            size_t partEnd = geometryEnd;
+            if (partIndex + 1u < layout.parts.size()) {
+                size_t nextPart = size_t(layout.geoStart) + size_t(layout.parts[partIndex + 1u].stripOffset);
+                if (nextPart > partStart && nextPart < partEnd) partEnd = nextPart;
+            }
+            if (partEnd <= partStart) {
+                ++rejectedMarkerCount;
+                continue;
+            }
+
+            bool partHadPacket = false;
+            for (size_t markerOffset = partStart; markerOffset + 0x34u <= partEnd; markerOffset += 4u) {
+                if (modelReadU32(data, markerOffset) != 0x6C018000u) continue;
+
+                const size_t beforePointCount = points.size();
+                const size_t beforeTriangleCount = triangles.size();
+                const size_t beforeSkinWeightCount = skinWeights.size();
+                const uint32_t materialIndex = materialBase + part.materialIndex;
+
+                if (appendExactLeedsSplitMarker(
+                        data, markerOffset, partEnd, materialIndex, layout.transform,
+                        points, triangles, texcoords, skinWeights)) {
+                    for (size_t vertexIndex = beforePointCount; vertexIndex < points.size(); ++vertexIndex) {
+                        points[vertexIndex] = transformModelPoint(frameMatrix, points[vertexIndex]);
+                    }
+                    partHadPacket = true;
+                    layoutDecoded = true;
+                    decodedAny = true;
+                    ++stripCount;
+                } else {
+                    points.resize(beforePointCount);
+                    texcoords.resize(beforePointCount);
+                    skinWeights.resize(beforeSkinWeightCount);
+                    triangles.resize(beforeTriangleCount);
+                    ++rejectedMarkerCount;
+                }
+
+                if (points.size() >= maximumPreviewPoints || triangles.size() >= maximumPreviewTriangles) break;
+            }
+
+            ++partCount;
+            if (!partHadPacket) ++rejectedMarkerCount;
+            if (points.size() >= maximumPreviewPoints || triangles.size() >= maximumPreviewTriangles) break;
+        }
+
+        if (!layoutDecoded) {
+            materialTextureNames.resize(materialBase);
+        }
+
+        if (points.size() >= maximumPreviewPoints || triangles.size() >= maximumPreviewTriangles) break;
+    }
+
+    usedHeaderTransform = decodedAny;
+    return decodedAny && points.size() >= 3u && !triangles.empty();
+}
+
 static bool appendExactLeedsStripGeometry(
     const std::vector<uint8_t>& data,
     std::vector<StorylandModelPoint>& points,
@@ -2036,7 +2315,8 @@ static bool appendExactLeedsStripGeometry(
     uint32_t& rejectedMarkerCount,
     uint32_t& partCount,
     bool& usedHeaderTransform,
-    bool& usedPspNativeSkinPalette
+    bool& usedPspNativeSkinPalette,
+    bool preferVehicleAtomicLayout
 ) {
     points.clear();
     triangles.clear();
@@ -2051,6 +2331,13 @@ static bool appendExactLeedsStripGeometry(
 
     if (data.size() >= 4 && data[0] == 'M' && data[1] == 'G' && data[2] == 0 && data[3] == 0) {
         return appendMgVehicleRawPreviewGeometry(data, points, triangles, texcoords, skinWeights, materialTextureNames, stripCount, rejectedMarkerCount, partCount, usedHeaderTransform);
+    }
+
+    if (preferVehicleAtomicLayout &&
+        appendLeedsVehicleAtomicGeometry(
+            data, points, triangles, texcoords, skinWeights, materialTextureNames,
+            stripCount, rejectedMarkerCount, partCount, usedHeaderTransform)) {
+        return true;
     }
 
     if (appendPspNativeGeometry(data, points, triangles, texcoords, skinWeights, materialTextureNames, stripCount, rejectedMarkerCount, partCount, usedHeaderTransform)) {
@@ -2154,13 +2441,18 @@ void StorylandModelFile::collectPreviewPoints() {
     uint32_t rejectedMarkerCount = 0;
     uint32_t partCount = 0;
     bool usedHeaderTransform = false;
-    if (appendExactLeedsStripGeometry(data, points, triangles, texcoords, skinWeights, materialTextureNames, stripCount, rejectedMarkerCount, partCount, usedHeaderTransform, previewUsesPspNativeSkinPalette)) {
+    if (appendExactLeedsStripGeometry(
+            data, points, triangles, texcoords, skinWeights, materialTextureNames,
+            stripCount, rejectedMarkerCount, partCount, usedHeaderTransform,
+            previewUsesPspNativeSkinPalette, kind == StorylandModelKind::VehicleModel)) {
         std::ostringstream line;
         line << "Preview: " << points.size() << " vertices, " << triangles.size()
              << " triangles, strips=" << stripCount << ", parts=" << partCount;
         line << (usedHeaderTransform ? ", header transform=yes" : ", header transform=no");
         if (data.size() >= 4 && data[0] == 'M' && data[1] == 'G' && data[2] == 0 && data[3] == 0) {
             line << ", MG compact path";
+        } else if (kind == StorylandModelKind::VehicleModel) {
+            line << ", vehicle atomic frames";
         } else if (partCount > 0 && materialTextureNames.size() == 1 && materialTextureNames[0] == "<global-scan>") {
             line << ", global scan";
         }
@@ -2456,6 +2748,30 @@ void StorylandModelFile::collectArmatureBones() {
         return 0xFFFFFFFFu;
     };
 
+    // VCS PS2 PEDs can carry valid frame-name pointers even when RslNode +0x9C
+    // is zero.  The HAnim table node index is NOT a reliable allocation-order
+    // index: PLR allocates arm frames before the HAnim anchor and leg frames
+    // after it.  Mapping HAnim rows to a wrapped allocation list therefore
+    // attaches arm IDs to leg frames and vice versa.  Resolve named frames to
+    // direct Leeds bone ids first; this is the same authority BLeeds uses when
+    // constructing the imported armature.
+    std::map<uint32_t, uint32_t> namedDirectBoneIdToNodeOffset;
+    for (const NodeCandidate& node : nodes) {
+        std::string frameName;
+        for (uint32_t relative : {0xA8u, 0xA4u}) {
+            if (size_t(node.offset) + relative + 4u > data.size()) continue;
+            uint32_t namePtr = modelReadU32(data, size_t(node.offset) + relative);
+            if (!modelPointerLooksValid(data, namePtr)) continue;
+            std::string candidate = readModelCStringAt(data, namePtr);
+            if (!candidate.empty()) { frameName = candidate; break; }
+        }
+        if (frameName.empty()) continue;
+        uint32_t directId = bleedsDirectIdForHierarchyName(frameName);
+        if (directId != 0xFFFFFFFFu) {
+            namedDirectBoneIdToNodeOffset[directId] = node.offset;
+        }
+    }
+
     auto hierarchyNameForDirectBoneId = [](uint32_t boneId) -> std::string {
         switch (boneId) {
         case 0: return "root";
@@ -2634,11 +2950,20 @@ void StorylandModelFile::collectArmatureBones() {
             entry.nodeIndex = candidateNodeIndex;
             entry.boneType = (packed >> 16) & 0xFFu;
 
-            auto directFrameIt = directBoneIdToNodeOffset.find(entry.boneId);
-            if (directFrameIt != directBoneIdToNodeOffset.end()) {
-                entry.frameOffset = directFrameIt->second;
-            } else if (entry.nodeIndex < traversalOrder.size()) {
-                entry.frameOffset = traversalOrder[entry.nodeIndex];
+            // Prefer the actual frame name -> Leeds direct-id mapping.  On VCS
+            // PS2 PLR, +0x9C is zero for the named frames, while the HAnim table
+            // still contains the correct direct IDs.  Allocation-order fallback
+            // is only for stripped files without usable names.
+            auto namedFrameIt = namedDirectBoneIdToNodeOffset.find(entry.boneId);
+            if (namedFrameIt != namedDirectBoneIdToNodeOffset.end()) {
+                entry.frameOffset = namedFrameIt->second;
+            } else {
+                auto directFrameIt = directBoneIdToNodeOffset.find(entry.boneId);
+                if (directFrameIt != directBoneIdToNodeOffset.end()) {
+                    entry.frameOffset = directFrameIt->second;
+                } else if (entry.nodeIndex < traversalOrder.size()) {
+                    entry.frameOffset = traversalOrder[entry.nodeIndex];
+                }
             }
             if (entry.frameOffset != 0 && nodeExists(entry.frameOffset)) {
                 hierarchyEntries.push_back(entry);
@@ -2753,27 +3078,25 @@ void StorylandModelFile::collectArmatureBones() {
                 continue;
             }
 
-            // Retail LCS/PS2 PED frames carry the real parent link in the RslNode
-            // frame header.  Do not override that with the generic common-bone
-            // table.  Several LCS peds attach thighs under spine and clavicles
-            // under neck in the real frame tree; forcing the table's pelvis /
-            // spine1 parents makes the viewport armature and ANIM LBS solve look
-            // like the legs/arms are connected to the wrong bones.
+            // Once a normal PED bone has a recognized semantic name/direct id,
+            // use the canonical Leeds PED parent relationship.  This mirrors
+            // BLeeds' commonBoneParentsVCS fallback and prevents frame-allocation
+            // artifacts from turning fingers into clavicle parents or arms into
+            // leg chains.  Preserve raw frame parenting only for unknown/custom
+            // nodes that Storyland cannot classify semantically.
+            std::string parentName = canonicalPedParentName(bone.name);
+            auto canonicalParentIt = canonicalNameToBone.find(parentName);
+            if (!parentName.empty() && canonicalParentIt != canonicalNameToBone.end() && canonicalParentIt->second != bone.index) {
+                bone.parentIndex = canonicalParentIt->second;
+                bone.parentOffset = bones[canonicalParentIt->second].offset;
+                continue;
+            }
+
             const NodeCandidate& node = nodes[offsetToNode[bone.offset]];
             auto parentIt = offsetToBone.find(node.parentPtr);
             if (parentIt != offsetToBone.end() && parentIt->second != bone.index) {
                 bone.parentIndex = parentIt->second;
                 bone.parentOffset = node.parentPtr;
-                continue;
-            }
-
-            // Fallback for stripped/custom skeletons whose frame links are absent
-            // or whose parent is a non-palette scene/root helper.
-            std::string parentName = canonicalPedParentName(bone.name);
-            auto canonicalParentIt = canonicalNameToBone.find(parentName);
-            if (canonicalParentIt != canonicalNameToBone.end() && canonicalParentIt->second != bone.index) {
-                bone.parentIndex = canonicalParentIt->second;
-                bone.parentOffset = bones[canonicalParentIt->second].offset;
                 continue;
             }
         }
@@ -3514,6 +3837,173 @@ void StorylandModelFile::collectRenderWare2dfxLights() {
     appendRenderWare2dfxLights(data, 0u, data.size(), nullptr, lights2dfx);
 }
 
+static bool appendMobileLcsF00dMeshPacket(
+    const std::vector<uint8_t>& bytes,
+    size_t packetOffset,
+    size_t packetLimit,
+    uint32_t storiesFlags,
+    float uvScaleU,
+    float uvScaleV,
+    uint32_t materialIndex,
+    const StorylandPreviewTransform& transform,
+    std::vector<StorylandModelPoint>& points,
+    std::vector<StorylandModelTriangle>& triangles,
+    std::vector<StorylandModelTexcoord>& texcoords,
+    std::vector<StorylandModelSkinWeights>& skinWeights,
+    uint32_t& batchCountOut
+) {
+    batchCountOut = 0u;
+    if (packetLimit > bytes.size() || packetOffset + 16u > packetLimit) return false;
+
+    uint32_t packetHeader = modelReadU32(bytes, packetOffset);
+    size_t packetSize = size_t((packetHeader & 0xFFFFu) + 1u) * 16u;
+    if (packetSize < 16u || packetOffset + packetSize > packetLimit) return false;
+    size_t packetEnd = packetOffset + packetSize;
+
+    auto skipControl = [&](size_t& cursor, uint32_t expected) -> bool {
+        if (cursor + 4u > packetEnd || modelReadU32(bytes, cursor) != expected) return false;
+        if (expected == 0x20000000u) {
+            if (cursor + 8u > packetEnd) return false;
+            cursor += 8u;
+        } else if (expected == 0x30000000u) {
+            if (cursor + 20u > packetEnd) return false;
+            cursor += 20u;
+        } else {
+            cursor += 4u;
+        }
+        return true;
+    };
+
+    auto vifUnpackElementSize = [](uint32_t command) -> size_t {
+        if ((command & 0x6F000000u) == 0x6F000000u) return 2u;
+        static const uint32_t componentBits[4] = {32u, 16u, 8u, 16u};
+        uint32_t componentCount = ((command >> 26u) & 0x03u) + 1u;
+        uint32_t bits = componentBits[(command >> 24u) & 0x03u];
+        return size_t(componentCount * bits / 8u);
+    };
+
+    auto skipUnpack = [&](size_t& cursor, uint32_t& commandOut, size_t& payloadOut) -> bool {
+        if (cursor + 4u > packetEnd) return false;
+        uint32_t command = modelReadU32(bytes, cursor);
+        uint32_t count = (command >> 16u) & 0xFFu;
+        size_t elementSize = vifUnpackElementSize(command);
+        size_t payloadSize = size_t(count) * elementSize;
+        size_t alignedSize = alignModelOffset4(payloadSize);
+        if (elementSize == 0u || cursor + 4u + alignedSize > packetEnd) return false;
+        commandOut = command;
+        payloadOut = cursor + 4u;
+        cursor += 4u + alignedSize;
+        return true;
+    };
+
+    std::vector<StorylandModelPoint> packetPoints;
+    std::vector<StorylandModelTexcoord> packetTexcoords;
+    std::vector<StorylandModelSkinWeights> packetSkinWeights;
+
+    size_t cursor = packetOffset + 16u;
+    bool firstBatch = true;
+
+    while (cursor < packetEnd) {
+        while (cursor + 4u <= packetEnd && modelReadU32(bytes, cursor) == 0u) cursor += 4u;
+        if (cursor >= packetEnd) break;
+        if (cursor + 20u > packetEnd || modelReadU32(bytes, cursor) != 0x6C018000u) return false;
+
+        uint32_t fullVertexCount = modelReadU32(bytes, cursor + 16u) & 0x7FFFu;
+        uint32_t skippedVertices = firstBatch ? 0u : 2u;
+        if (fullVertexCount <= skippedVertices || fullVertexCount > 128u) return false;
+        uint32_t vertexCount = fullVertexCount - skippedVertices;
+        cursor += 20u;
+
+        if (!skipControl(cursor, 0x20000000u) || !skipControl(cursor, 0x30000000u)) return false;
+        uint32_t positionCommand = 0u;
+        size_t positionPayload = 0u;
+        if (!skipUnpack(cursor, positionCommand, positionPayload) ||
+            (positionCommand & 0xFF004000u) != 0x79000000u) return false;
+
+        if (!skipControl(cursor, 0x20000000u) || !skipControl(cursor, 0x30000000u)) return false;
+        uint32_t uvCommand = 0u;
+        size_t uvPayload = 0u;
+        if (!skipUnpack(cursor, uvCommand, uvPayload) ||
+            (uvCommand & 0xFF004000u) != 0x76004000u) return false;
+
+        if (storiesFlags & 0x08u) {
+            uint32_t colorCommand = 0u;
+            size_t colorPayload = 0u;
+            if (!skipUnpack(cursor, colorCommand, colorPayload) ||
+                (colorCommand & 0xFF004000u) != 0x6F000000u) return false;
+        }
+
+        if (storiesFlags & 0x02u) {
+            uint32_t normalCommand = 0u;
+            size_t normalPayload = 0u;
+            if (!skipUnpack(cursor, normalCommand, normalPayload) ||
+                (normalCommand & 0xFF004000u) != 0x6A000000u) return false;
+        }
+
+        size_t skinPayload = 0u;
+        bool hasSkinPayload = false;
+        if (storiesFlags & 0x10u) {
+            uint32_t skinCommand = 0u;
+            size_t fullSkinPayload = 0u;
+            if (!skipUnpack(cursor, skinCommand, fullSkinPayload) ||
+                (skinCommand & 0xFF004000u) != 0x6C000000u) return false;
+            skinPayload = fullSkinPayload + size_t(skippedVertices) * 16u;
+            hasSkinPayload = true;
+        }
+
+        if (cursor + 4u > packetEnd || modelReadU32(bytes, cursor) != 0x14000006u) return false;
+        cursor += 4u;
+
+        size_t positionData = positionPayload + size_t(skippedVertices) * 6u;
+        size_t uvData = uvPayload + size_t(skippedVertices) * 2u;
+        if (positionData + size_t(vertexCount) * 6u > packetEnd ||
+            uvData + size_t(vertexCount) * 2u > packetEnd) return false;
+
+        std::vector<StorylandModelSkinWeights> batchSkinWeights;
+        if (hasSkinPayload) {
+            if (!decodeSkinWeightsFromPedPayload(
+                    bytes,
+                    skinPayload,
+                    uint8_t(vertexCount),
+                    uint8_t(vertexCount),
+                    batchSkinWeights)) return false;
+        } else {
+            batchSkinWeights.assign(vertexCount, StorylandModelSkinWeights{});
+        }
+
+        for (uint32_t vertexIndex = 0u; vertexIndex < vertexCount; ++vertexIndex) {
+            size_t vertexOffset = positionData + size_t(vertexIndex) * 6u;
+            StorylandModelPoint point = decodeLeedsPackedPosition(
+                modelReadI16(bytes, vertexOffset + 0u),
+                modelReadI16(bytes, vertexOffset + 2u),
+                modelReadI16(bytes, vertexOffset + 4u),
+                transform
+            );
+            if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) return false;
+            packetPoints.push_back(point);
+
+            size_t textureOffset = uvData + size_t(vertexIndex) * 2u;
+            float u = (float(bytes[textureOffset + 0u]) / 127.5f) * uvScaleU;
+            float v = (float(bytes[textureOffset + 1u]) / 127.5f) * uvScaleV;
+            packetTexcoords.push_back({u, 1.0f - v});
+            packetSkinWeights.push_back(batchSkinWeights[vertexIndex]);
+        }
+
+        firstBatch = false;
+        ++batchCountOut;
+    }
+
+    if (packetPoints.size() < 3u || packetTexcoords.size() != packetPoints.size() ||
+        packetSkinWeights.size() != packetPoints.size() || !blockHasShape(packetPoints)) return false;
+
+    uint32_t baseVertex = uint32_t(points.size());
+    points.insert(points.end(), packetPoints.begin(), packetPoints.end());
+    texcoords.insert(texcoords.end(), packetTexcoords.begin(), packetTexcoords.end());
+    skinWeights.insert(skinWeights.end(), packetSkinWeights.begin(), packetSkinWeights.end());
+    appendTriangleStripPreview(baseVertex, packetPoints.size(), materialIndex, points, triangles);
+    return true;
+}
+
 bool StorylandModelFile::parseMobileLcsDff() {
     bool hasF00dGeometry = false;
     if (!mobileLcsDffSignature(data, &hasF00dGeometry)) return false;
@@ -3647,10 +4137,24 @@ bool StorylandModelFile::parseMobileLcsDff() {
             packedTransform.tx = tx; packedTransform.ty = ty; packedTransform.tz = tz;
         }
 
-        uint32_t materialListRelative = modelReadU32(data, geometryBody + 0x10u) & 0xFFFFu;
-        size_t packetEnd = geometryEnd;
-        if (materialListRelative >= 0x80u && materialListRelative < geometrySize) {
-            packetEnd = geometryBody + materialListRelative;
+        uint32_t packedLayoutSize = modelReadU32(data, geometryBody + 0x10u);
+        uint32_t nativeBodySize = packedLayoutSize & 0x000FFFFFu;
+        uint32_t nativeMeshCount = packedLayoutSize >> 20u;
+        uint32_t storiesFlags = modelReadU32(data, geometryBody + 0x14u);
+        uint32_t declaredVertexCount = modelReadU16(data, geometryBody + 0x18u);
+        uint32_t dmaOffset = modelReadU16(data, geometryBody + 0x1Au);
+
+        bool exactLayoutValid =
+            nativeMeshCount > 0u && nativeMeshCount <= 4095u &&
+            nativeBodySize >= 64u + nativeMeshCount * 48u &&
+            nativeBodySize <= geometrySize &&
+            dmaOffset >= 64u + nativeMeshCount * 48u &&
+            dmaOffset < nativeBodySize &&
+            uint64_t(geometryBody) + uint64_t(nativeBodySize) <= uint64_t(geometryEnd);
+
+        size_t packetEnd = exactLayoutValid ? geometryBody + size_t(nativeBodySize) : geometryEnd;
+        size_t materialBase = materialTextureNames.size();
+        if (packetEnd < geometryEnd) {
             std::vector<std::string> names = mobileRwMaterialNames(data, packetEnd, geometryEnd);
             for (const std::string& name : names) materialTextureNames.push_back(name);
         }
@@ -3659,18 +4163,103 @@ bool StorylandModelFile::parseMobileLcsDff() {
         // them to the atomic's composed frame before presenting them in Storyland.
         appendRenderWare2dfxLights(data, geometryBody, geometryEnd, &frameMatrix, lights2dfx);
 
-        uint32_t localMaterial = 0u;
-        for (size_t marker = geometryBody; marker + 0x34u <= packetEnd; marker += 4u) {
-            if (modelReadU32(data, marker) != 0x6C018000u) continue;
-            size_t beforePoints = points.size();
-            size_t beforeTriangles = triangles.size();
-            if (!appendExactLeedsSplitMarker(data, marker, packetEnd, localMaterial, packedTransform,
-                                             points, triangles, texcoords, skinWeights)) continue;
-            for (size_t vertexIndex = beforePoints; vertexIndex < points.size(); ++vertexIndex) {
-                points[vertexIndex] = transformMobileRwPoint(frameMatrix, points[vertexIndex]);
+        bool decodedExactLayout = false;
+        if (exactLayoutValid) {
+            std::vector<StorylandModelPoint> atomicPoints;
+            std::vector<StorylandModelTriangle> atomicTriangles;
+            std::vector<StorylandModelTexcoord> atomicTexcoords;
+            std::vector<StorylandModelSkinWeights> atomicSkinWeights;
+            uint32_t atomicBatchCount = 0u;
+            bool allMeshesDecoded = true;
+
+            size_t dmaBase = geometryBody + size_t(dmaOffset);
+            for (uint32_t meshIndex = 0u; meshIndex < nativeMeshCount; ++meshIndex) {
+                size_t meshHeader = geometryBody + 64u + size_t(meshIndex) * 48u;
+                if (meshHeader + 48u > packetEnd) {
+                    allMeshesDecoded = false;
+                    break;
+                }
+
+                float uvScaleU = modelReadF32(data, meshHeader + 16u);
+                float uvScaleV = modelReadF32(data, meshHeader + 20u);
+                uint32_t packetRelative = modelReadU32(data, meshHeader + 28u);
+                uint32_t declaredStripTriangles = modelReadU16(data, meshHeader + 32u);
+                int16_t signedMaterialIndex = modelReadI16(data, meshHeader + 34u);
+                uint32_t materialIndex = uint32_t(materialBase) +
+                    uint32_t(std::max<int>(0, int(signedMaterialIndex)));
+
+                if (!std::isfinite(uvScaleU) || !std::isfinite(uvScaleV) ||
+                    std::fabs(uvScaleU) > 64.0f || std::fabs(uvScaleV) > 64.0f ||
+                    packetRelative >= nativeBodySize || dmaBase + size_t(packetRelative) >= packetEnd) {
+                    allMeshesDecoded = false;
+                    break;
+                }
+
+                size_t beforeMeshPoints = atomicPoints.size();
+                uint32_t meshBatchCount = 0u;
+                if (!appendMobileLcsF00dMeshPacket(
+                        data,
+                        dmaBase + size_t(packetRelative),
+                        packetEnd,
+                        storiesFlags,
+                        uvScaleU,
+                        uvScaleV,
+                        materialIndex,
+                        packedTransform,
+                        atomicPoints,
+                        atomicTriangles,
+                        atomicTexcoords,
+                        atomicSkinWeights,
+                        meshBatchCount)) {
+                    allMeshesDecoded = false;
+                    break;
+                }
+
+                size_t decodedMeshPoints = atomicPoints.size() - beforeMeshPoints;
+                if (decodedMeshPoints != size_t(declaredStripTriangles) + 2u) {
+                    allMeshesDecoded = false;
+                    break;
+                }
+                atomicBatchCount += meshBatchCount;
             }
-            if (triangles.size() > beforeTriangles) ++localMaterial;
-            ++stripCount;
+
+            if (allMeshesDecoded && !atomicPoints.empty() &&
+                atomicTexcoords.size() == atomicPoints.size() &&
+                atomicSkinWeights.size() == atomicPoints.size()) {
+                for (StorylandModelPoint& point : atomicPoints) {
+                    point = transformMobileRwPoint(frameMatrix, point);
+                }
+
+                uint32_t globalBase = uint32_t(points.size());
+                points.insert(points.end(), atomicPoints.begin(), atomicPoints.end());
+                texcoords.insert(texcoords.end(), atomicTexcoords.begin(), atomicTexcoords.end());
+                skinWeights.insert(skinWeights.end(), atomicSkinWeights.begin(), atomicSkinWeights.end());
+                for (StorylandModelTriangle triangle : atomicTriangles) {
+                    triangle.a += globalBase;
+                    triangle.b += globalBase;
+                    triangle.c += globalBase;
+                    triangles.push_back(triangle);
+                }
+                stripCount += atomicBatchCount;
+                decodedExactLayout = true;
+            }
+        }
+
+        if (!decodedExactLayout) {
+            uint32_t localMaterial = 0u;
+            for (size_t marker = geometryBody; marker + 0x34u <= packetEnd; marker += 4u) {
+                if (modelReadU32(data, marker) != 0x6C018000u) continue;
+                size_t beforePoints = points.size();
+                size_t beforeTriangles = triangles.size();
+                uint32_t materialIndex = uint32_t(materialBase) + localMaterial;
+                if (!appendExactLeedsSplitMarker(data, marker, packetEnd, materialIndex, packedTransform,
+                                                 points, triangles, texcoords, skinWeights)) continue;
+                for (size_t vertexIndex = beforePoints; vertexIndex < points.size(); ++vertexIndex) {
+                    points[vertexIndex] = transformMobileRwPoint(frameMatrix, points[vertexIndex]);
+                }
+                if (triangles.size() > beforeTriangles) ++localMaterial;
+                ++stripCount;
+            }
         }
 
         std::ostringstream group;
@@ -3681,6 +4270,12 @@ bool StorylandModelFile::parseMobileLcsDff() {
         addField(fieldRows, group.str(), "geometry_version", uint32_t(geometryOffset + 8u), 0x0000F00Du,
                  "War Drum/Mobile LCS embedded PS2-native geometry marker; not a III/VC/SA desktop DFF geometry.");
         addField(fieldRows, group.str(), "geometry_size", uint32_t(geometryOffset + 4u), uint32_t(geometrySize), "F00D geometry payload size.");
+        if (exactLayoutValid) {
+            addField(fieldRows, group.str(), "native_mesh_count", uint32_t(geometryBody + 0x10u), nativeMeshCount,
+                     "Upper 12 bits of the packed F00D body-size/mesh-count field.");
+            addField(fieldRows, group.str(), "declared_vertex_count", uint32_t(geometryBody + 0x18u), declaredVertexCount,
+                     "Exact combined F00D mesh vertex count; continuation batches repeat two strip vertices that are removed during decode.");
+        }
         ++atomicCount;
         atomicOffset = geometryEnd > atomicOffset ? geometryEnd - 1u : atomicOffset;
     }
@@ -3705,13 +4300,1381 @@ bool StorylandModelFile::parseMobileLcsDff() {
     return true;
 }
 
+
+static std::string modelReadBoundedAscii(const std::vector<uint8_t>& bytes, size_t offset, size_t maximumLength) {
+    if (offset >= bytes.size()) return std::string();
+    std::string value;
+    for (size_t index = 0; index < maximumLength && offset + index < bytes.size(); ++index) {
+        const uint8_t ch = bytes[offset + index];
+        if (ch == 0u) break;
+        if (ch < 0x20u || ch > 0x7Eu) return std::string();
+        value.push_back(char(ch));
+    }
+    return value;
+}
+
+static bool modelRangeFits(size_t offset, size_t length, size_t limit) {
+    return offset <= limit && length <= limit - offset;
+}
+
+static StorylandModelPoint transformMh2Point(const StorylandModelPoint& point, const float* matrix) {
+    StorylandModelPoint result;
+    result.x = point.x * matrix[0] + point.y * matrix[4] + point.z * matrix[8] + matrix[12];
+    result.y = point.x * matrix[1] + point.y * matrix[5] + point.z * matrix[9] + matrix[13];
+    result.z = point.x * matrix[2] + point.y * matrix[6] + point.z * matrix[10] + matrix[14];
+    return result;
+}
+
+bool StorylandModelFile::parsePmlcMdl() {
+    if (data.size() < 0x28u || std::memcmp(data.data(), "PMLC", 4u) != 0) return false;
+
+    const uint32_t declaredFileSize = modelReadU32(data, 0x08u);
+    const uint32_t firstEntryOffset = modelReadU32(data, 0x20u);
+    if (declaredFileSize != 0u && declaredFileSize > data.size()) return false;
+    if (!modelRangeFits(firstEntryOffset, 16u, data.size())) return false;
+
+    const uint32_t entryDataOffset = modelReadU32(data, size_t(firstEntryOffset) + 0x08u);
+    if (!modelRangeFits(entryDataOffset, 0x1Cu, data.size())) return false;
+
+    const uint32_t rootBoneOffset = modelReadU32(data, size_t(entryDataOffset) + 0x00u);
+    const uint32_t firstObjectInfoOffset = modelReadU32(data, size_t(entryDataOffset) + 0x10u);
+    const uint32_t lastObjectInfoOffset = modelReadU32(data, size_t(entryDataOffset) + 0x14u);
+
+    points.clear();
+    triangles.clear();
+    texcoords.clear();
+    skinWeights.clear();
+    bones.clear();
+    materialTextureNames.clear();
+    fieldRows.clear();
+    lights2dfx.clear();
+    previewUsesPspNativeSkinPalette = false;
+
+    std::map<uint32_t, std::array<float, 16>> boneMatrices;
+    std::map<uint32_t, uint32_t> boneIndexByOffset;
+    std::set<uint32_t> visitedBones;
+    std::vector<uint32_t> pendingBones;
+    if (rootBoneOffset != 0u) pendingBones.push_back(rootBoneOffset);
+
+    while (!pendingBones.empty() && bones.size() < 4096u) {
+        const uint32_t boneOffset = pendingBones.back();
+        pendingBones.pop_back();
+        if (boneOffset == 0u || !visitedBones.insert(boneOffset).second) continue;
+        if (!modelRangeFits(boneOffset, 192u, data.size())) continue;
+
+        const uint32_t siblingOffset = modelReadU32(data, size_t(boneOffset) + 0x04u);
+        const uint32_t parentOffset = modelReadU32(data, size_t(boneOffset) + 0x08u);
+        const uint32_t childOffset = modelReadU32(data, size_t(boneOffset) + 0x10u);
+        std::array<float, 16> matrix{};
+        for (size_t index = 0; index < matrix.size(); ++index) {
+            matrix[index] = modelReadF32(data, size_t(boneOffset) + 0x80u + index * 4u);
+        }
+        bool finiteMatrix = true;
+        for (float value : matrix) finiteMatrix = finiteMatrix && std::isfinite(value);
+        if (!finiteMatrix) {
+            matrix = {1.0f, 0.0f, 0.0f, 0.0f,
+                      0.0f, 1.0f, 0.0f, 0.0f,
+                      0.0f, 0.0f, 1.0f, 0.0f,
+                      0.0f, 0.0f, 0.0f, 1.0f};
+        }
+
+        StorylandModelBone bone;
+        bone.index = uint32_t(bones.size());
+        bone.offset = boneOffset;
+        bone.parentOffset = parentOffset;
+        bone.nameOffset = boneOffset + 0x18u;
+        bone.name = modelReadBoundedAscii(data, size_t(boneOffset) + 0x18u, 40u);
+        if (bone.name.empty()) bone.name = "Bone_" + modelHexOffset(boneOffset);
+        bone.sectionKind = "Skeleton";
+        bone.hasWorldPosition = true;
+        bone.hasPreviewPosition = true;
+        bone.worldPosition = {matrix[12], matrix[13], matrix[14]};
+        bone.previewPosition = bone.worldPosition;
+        bone.previewPositionSource = "world matrix";
+        boneIndexByOffset[boneOffset] = bone.index;
+        boneMatrices[boneOffset] = matrix;
+        bones.push_back(bone);
+
+        if (siblingOffset != 0u) pendingBones.push_back(siblingOffset);
+        if (childOffset != 0u) pendingBones.push_back(childOffset);
+    }
+
+    for (StorylandModelBone& bone : bones) {
+        auto parent = boneIndexByOffset.find(bone.parentOffset);
+        if (parent != boneIndexByOffset.end()) bone.parentIndex = parent->second;
+    }
+
+    struct Mh2ObjectInfo {
+        uint32_t parentBoneOffset = 0u;
+        uint32_t objectDataOffset = 0u;
+    };
+    std::vector<Mh2ObjectInfo> objectInfos;
+    std::set<uint32_t> visitedObjectInfos;
+    uint32_t objectInfoOffset = firstObjectInfoOffset != 0u ? firstObjectInfoOffset : lastObjectInfoOffset;
+    while (objectInfoOffset != 0u && objectInfos.size() < 4096u && visitedObjectInfos.insert(objectInfoOffset).second) {
+        if (!modelRangeFits(objectInfoOffset, 28u, data.size())) break;
+        const uint32_t nextOffset = modelReadU32(data, size_t(objectInfoOffset) + 0x00u);
+        const uint32_t parentBoneOffset = modelReadU32(data, size_t(objectInfoOffset) + 0x08u);
+        const uint32_t objectDataOffset = modelReadU32(data, size_t(objectInfoOffset) + 0x0Cu);
+        if (modelRangeFits(objectDataOffset, 180u, data.size())) objectInfos.push_back({parentBoneOffset, objectDataOffset});
+        if (nextOffset == objectInfoOffset || !modelRangeFits(nextOffset, 28u, data.size())) break;
+        objectInfoOffset = nextOffset;
+    }
+
+    uint32_t rejectedObjects = 0u;
+    for (const Mh2ObjectInfo& info : objectInfos) {
+        const size_t objectOffset = info.objectDataOffset;
+        const uint32_t materialOffset = modelReadU32(data, objectOffset + 0x00u);
+        const uint32_t materialCount = modelReadU32(data, objectOffset + 0x04u);
+        const uint32_t materialIdCount = modelReadU32(data, objectOffset + 0x2Cu);
+        const uint32_t faceIndexCount = modelReadU32(data, objectOffset + 0x30u);
+        const uint32_t vertexCount = modelReadU32(data, objectOffset + 0x50u);
+        const uint32_t declaredStride = modelReadU32(data, objectOffset + 0x60u);
+        const uint32_t vertexType = modelReadU32(data, objectOffset + 0x90u);
+
+        if (materialIdCount > 65536u || faceIndexCount > 16u * 1024u * 1024u || vertexCount > 4u * 1024u * 1024u) {
+            ++rejectedObjects;
+            continue;
+        }
+
+        uint32_t canonicalStride = 0u;
+        size_t uvOffset = SIZE_MAX;
+        switch (vertexType) {
+        case 0x52u: canonicalStride = 24u; break;
+        case 0x152u: canonicalStride = 32u; uvOffset = 22u; break;
+        case 0x115Eu: canonicalStride = 52u; uvOffset = 42u; break;
+        case 0x125Eu: canonicalStride = 60u; uvOffset = 42u; break;
+        case 0x252u: canonicalStride = 40u; uvOffset = 22u; break;
+        default:
+            ++rejectedObjects;
+            continue;
+        }
+        uint32_t stride = canonicalStride;
+        if (declaredStride >= canonicalStride && declaredStride <= 256u) stride = declaredStride;
+
+        const uint64_t faceStart64 = uint64_t(objectOffset) + 180ull + uint64_t(materialIdCount) * 44ull;
+        const uint64_t vertexStart64 = faceStart64 + uint64_t(faceIndexCount) * 2ull;
+        const uint64_t vertexEnd64 = vertexStart64 + uint64_t(vertexCount) * uint64_t(stride);
+        if (faceStart64 > data.size() || vertexStart64 > data.size() || vertexEnd64 > data.size()) {
+            ++rejectedObjects;
+            continue;
+        }
+
+        const uint32_t materialBase = uint32_t(materialTextureNames.size());
+        if (materialOffset != 0u && materialCount <= 4096u && modelRangeFits(materialOffset, size_t(materialCount) * 16u, data.size())) {
+            for (uint32_t materialIndex = 0; materialIndex < materialCount; ++materialIndex) {
+                const size_t row = size_t(materialOffset) + size_t(materialIndex) * 16u;
+                const uint32_t textureNameOffset = modelReadU32(data, row);
+                std::string textureName = modelLowerAscii(modelReadBoundedAscii(data, textureNameOffset, 128u));
+                materialTextureNames.push_back(textureName.empty() ? "<material>" : textureName);
+            }
+        }
+        if (materialTextureNames.size() == materialBase) materialTextureNames.push_back("<material>");
+
+        const uint32_t baseVertex = uint32_t(points.size());
+        const auto matrixIt = boneMatrices.find(info.parentBoneOffset);
+        for (uint32_t vertexIndex = 0u; vertexIndex < vertexCount; ++vertexIndex) {
+            const size_t vertexOffset = size_t(vertexStart64) + size_t(vertexIndex) * stride;
+            StorylandModelPoint point{modelReadF32(data, vertexOffset + 0u), modelReadF32(data, vertexOffset + 4u), modelReadF32(data, vertexOffset + 8u)};
+            if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) {
+                point = {};
+            }
+            if (matrixIt != boneMatrices.end()) point = transformMh2Point(point, matrixIt->second.data());
+            points.push_back(point);
+
+            StorylandModelTexcoord uv;
+            if (uvOffset != SIZE_MAX && uvOffset + 8u <= stride) {
+                uv.u = modelReadF32(data, vertexOffset + uvOffset + 0u);
+                uv.v = modelReadF32(data, vertexOffset + uvOffset + 4u);
+                if (!std::isfinite(uv.u)) uv.u = 0.0f;
+                if (!std::isfinite(uv.v)) uv.v = 0.0f;
+            }
+            texcoords.push_back(uv);
+            skinWeights.push_back({});
+        }
+
+        const size_t faceStart = size_t(faceStart64);
+        const uint32_t triangleCount = faceIndexCount / 3u;
+        for (uint32_t triangleIndex = 0u; triangleIndex < triangleCount; ++triangleIndex) {
+            const size_t triangleOffset = faceStart + size_t(triangleIndex) * 6u;
+            const uint32_t a = modelReadU16(data, triangleOffset + 0u);
+            const uint32_t b = modelReadU16(data, triangleOffset + 2u);
+            const uint32_t c = modelReadU16(data, triangleOffset + 4u);
+            if (a >= vertexCount || b >= vertexCount || c >= vertexCount || a == b || a == c || b == c) continue;
+            triangles.push_back({baseVertex + a, baseVertex + b, baseVertex + c, materialBase});
+        }
+
+        std::ostringstream group;
+        group << "Geometry @ " << modelHexOffset(objectOffset);
+        addField(fieldRows, group.str(), "material_count", uint32_t(objectOffset + 0x04u), materialCount, "Material rows referenced by this geometry.");
+        addField(fieldRows, group.str(), "material_id_count", uint32_t(objectOffset + 0x2Cu), materialIdCount, "44-byte material ranges preceding the face index stream.");
+        addField(fieldRows, group.str(), "face_index_count", uint32_t(objectOffset + 0x30u), faceIndexCount, "16-bit triangle-list indices.");
+        addField(fieldRows, group.str(), "vertex_count", uint32_t(objectOffset + 0x50u), vertexCount, "Vertex rows.");
+        addField(fieldRows, group.str(), "vertex_stride", uint32_t(objectOffset + 0x60u), stride, "Validated vertex stride.");
+        addField(fieldRows, group.str(), "vertex_format", uint32_t(objectOffset + 0x90u), vertexType, "Vertex layout selector.");
+    }
+
+    if (points.empty() || triangles.empty()) return false;
+    kind = bones.empty() ? StorylandModelKind::SimpleModel : StorylandModelKind::PedModel;
+    collectTextureNameHints();
+    outputLines.push_back({"Model geometry loaded."});
+    outputLines.push_back({"Objects: " + std::to_string(objectInfos.size()) + ", bones: " + std::to_string(bones.size()) + "."});
+    outputLines.push_back({"Geometry: " + std::to_string(points.size()) + " vertices, " + std::to_string(triangles.size()) + " triangles."});
+    if (rejectedObjects != 0u) outputLines.push_back({"Skipped unsupported or truncated geometry blocks: " + std::to_string(rejectedObjects) + "."});
+    pmlcMdl = true;
+    return true;
+}
+
+struct StorylandRwChunkView {
+    uint32_t type = 0u;
+    uint32_t size = 0u;
+    uint32_t version = 0u;
+    size_t offset = 0u;
+    size_t payload = 0u;
+    size_t end = 0u;
+};
+
+static bool readStorylandRwChunk(const std::vector<uint8_t>& bytes, size_t offset, size_t limit, StorylandRwChunkView& chunk) {
+    if (limit > bytes.size() || !modelRangeFits(offset, 12u, limit)) return false;
+    chunk.type = modelReadU32(bytes, offset + 0u);
+    chunk.size = modelReadU32(bytes, offset + 4u);
+    chunk.version = modelReadU32(bytes, offset + 8u);
+    chunk.offset = offset;
+    chunk.payload = offset + 12u;
+    if (uint64_t(chunk.payload) + uint64_t(chunk.size) > uint64_t(limit)) return false;
+    chunk.end = chunk.payload + size_t(chunk.size);
+    return true;
+}
+
+static std::vector<StorylandRwChunkView> storylandRwChildren(const std::vector<uint8_t>& bytes, const StorylandRwChunkView& parent) {
+    std::vector<StorylandRwChunkView> children;
+    size_t cursor = parent.payload;
+    while (cursor < parent.end) {
+        StorylandRwChunkView child;
+        if (!readStorylandRwChunk(bytes, cursor, parent.end, child)) break;
+        children.push_back(child);
+        if (child.end <= cursor) break;
+        cursor = child.end;
+    }
+    return children;
+}
+
+static std::vector<std::string> storylandRwGeometryMaterials(const std::vector<uint8_t>& bytes, const StorylandRwChunkView& geometry) {
+    std::vector<std::string> materials;
+    for (const StorylandRwChunkView& child : storylandRwChildren(bytes, geometry)) {
+        if (child.type != 8u) continue;
+        for (const StorylandRwChunkView& material : storylandRwChildren(bytes, child)) {
+            if (material.type != 7u) continue;
+            std::string textureName;
+            for (const StorylandRwChunkView& materialChild : storylandRwChildren(bytes, material)) {
+                if (materialChild.type != 6u) continue;
+                for (const StorylandRwChunkView& textureChild : storylandRwChildren(bytes, materialChild)) {
+                    if (textureChild.type == 2u) {
+                        textureName = modelLowerAscii(modelReadBoundedAscii(bytes, textureChild.payload, textureChild.size));
+                        break;
+                    }
+                }
+                if (!textureName.empty()) break;
+            }
+            materials.push_back(textureName.empty() ? "<material>" : textureName);
+        }
+    }
+    if (materials.empty()) materials.push_back("<material>");
+    return materials;
+}
+
+struct StorylandPspSplitHeader {
+    uint32_t indexCount = 0u;
+    uint32_t material = 0u;
+};
+
+static std::vector<StorylandPspSplitHeader> storylandReadBinMeshSplits(const std::vector<uint8_t>& bytes, const StorylandRwChunkView& geometry) {
+    std::vector<StorylandPspSplitHeader> splits;
+    for (const StorylandRwChunkView& child : storylandRwChildren(bytes, geometry)) {
+        if (child.type != 3u) continue;
+        for (const StorylandRwChunkView& plugin : storylandRwChildren(bytes, child)) {
+            if (plugin.type != 0x50Eu || plugin.size < 12u) continue;
+
+            const uint32_t meshFlags = modelReadU32(bytes, plugin.payload + 0u);
+            const uint32_t meshCount = modelReadU32(bytes, plugin.payload + 4u);
+            const uint32_t totalIndices = modelReadU32(bytes, plugin.payload + 8u);
+            if (meshCount == 0u || meshCount > 65536u) continue;
+
+            const uint64_t headerOnlySize = 12ull + uint64_t(meshCount) * 8ull;
+            if (headerOnlySize > plugin.size) continue;
+            const bool hasIndices = uint64_t(plugin.size) > headerOnlySize;
+            const uint64_t compact16Size = headerOnlySize + uint64_t(totalIndices) * 2ull;
+            const bool compact16 = compact16Size >= plugin.size;
+            const bool triangleStrip = meshFlags == 1u;
+
+            size_t cursor = plugin.payload + 12u;
+            splits.clear();
+            splits.reserve(meshCount);
+            bool valid = true;
+            for (uint32_t index = 0u; index < meshCount; ++index) {
+                if (!modelRangeFits(cursor, 8u, plugin.end)) {
+                    valid = false;
+                    break;
+                }
+
+                const uint32_t indexCount = modelReadU32(bytes, cursor + 0u);
+                const uint32_t material = modelReadU32(bytes, cursor + 4u);
+                splits.push_back({indexCount, material});
+                cursor += 8u;
+
+                if (!hasIndices) continue;
+
+                uint64_t indexBytes = 0u;
+                if (triangleStrip) {
+                    indexBytes = uint64_t(indexCount) * (compact16 ? 2ull : 4ull);
+                } else {
+                    const uint64_t triangleCount = uint64_t(indexCount) / 3ull;
+                    indexBytes = triangleCount * (compact16 ? 6ull : 12ull);
+                }
+                if (indexBytes > uint64_t(plugin.end - cursor)) {
+                    valid = false;
+                    break;
+                }
+                cursor += static_cast<size_t>(indexBytes);
+            }
+            if (valid && splits.size() == meshCount) return splits;
+            splits.clear();
+        }
+    }
+    return splits;
+}
+
+static bool storylandDecodePspNativeVertices(
+    const std::vector<uint8_t>& bytes,
+    size_t rawBase,
+    size_t rawSize,
+    uint32_t geometryFlags,
+    const std::vector<StorylandPspSplitHeader>& binSplits,
+    uint32_t materialBase,
+    std::vector<StorylandModelPoint>& points,
+    std::vector<StorylandModelTriangle>& triangles,
+    std::vector<StorylandModelTexcoord>& texcoords,
+    std::vector<StorylandModelSkinWeights>& skinWeights,
+    uint32_t& splitCountOut
+) {
+    (void)geometryFlags;
+    if (!modelRangeFits(rawBase, rawSize, bytes.size()) || rawSize < 24u) return false;
+    const size_t rawEnd = rawBase + rawSize;
+    const uint32_t nativeChunkSize = modelReadU32(bytes, rawBase + 0u);
+    const uint32_t splitCount = modelReadU16(bytes, rawBase + 6u);
+    if (splitCount == 0u || splitCount > 4096u) return false;
+    if (nativeChunkSize != 0u && nativeChunkSize > rawSize) return false;
+
+    uint64_t descriptorStart64 = uint64_t(rawBase) + 8ull + uint64_t(splitCount) * 32ull + 16ull;
+    if (descriptorStart64 > rawEnd) return false;
+    size_t descriptorOffset = size_t(descriptorStart64);
+    std::map<int32_t, std::pair<uint32_t, uint32_t>> streamCache;
+    const uint32_t geometryBase = uint32_t(points.size());
+
+    for (uint32_t splitIndex = 0u; splitIndex < splitCount; ++splitIndex) {
+        if (!modelRangeFits(descriptorOffset, 64u, rawEnd)) return false;
+        const size_t header = descriptorOffset;
+        const uint32_t format = modelReadU32(bytes, header + 16u);
+        const uint32_t indexMapLength = modelReadU32(bytes, header + 20u);
+        const uint32_t indexCount = modelReadU32(bytes, header + 24u);
+        const int32_t indicesOffset = static_cast<int32_t>(modelReadU32(bytes, header + 28u));
+        const int32_t indexMapOffset = static_cast<int32_t>(modelReadU32(bytes, header + 32u));
+        const uint32_t stride = modelReadU32(bytes, header + 52u);
+        const uint32_t matrixOffset = modelReadU32(bytes, header + 56u);
+        descriptorOffset += 64u;
+
+        if (indexCount == 0u || indexCount > 4u * 1024u * 1024u || indicesOffset < 0) return false;
+        if (uint64_t(matrixOffset) + 64ull > rawSize || uint64_t(indicesOffset) >= rawSize) return false;
+        const size_t matrix = rawBase + matrixOffset;
+        const float scaleX = modelReadF32(bytes, matrix + 0u);
+        const float scaleY = modelReadF32(bytes, matrix + 20u);
+        const float scaleZ = modelReadF32(bytes, matrix + 40u);
+        if (!std::isfinite(scaleX) || !std::isfinite(scaleY) || !std::isfinite(scaleZ)) return false;
+
+        uint32_t streamBaseVertex = 0u;
+        auto cached = streamCache.find(indicesOffset);
+        if (cached == streamCache.end()) {
+            streamBaseVertex = uint32_t(points.size());
+            size_t cursor = rawBase + size_t(indicesOffset);
+            const uint32_t uvFormat = format & 3u;
+            const uint32_t colorFormat = (format >> 2u) & 7u;
+            const uint32_t normalFormat = (format >> 5u) & 3u;
+            const uint32_t positionFormat = (format >> 7u) & 3u;
+            const uint32_t weightFormat = (format >> 9u) & 3u;
+            const uint32_t weightCount = ((format >> 14u) & 7u) + 1u;
+            if (uvFormat > 3u || normalFormat > 3u || positionFormat == 0u || positionFormat > 3u || weightFormat > 1u) return false;
+
+            for (uint32_t vertexIndex = 0u; vertexIndex < indexCount; ++vertexIndex) {
+                const size_t vertexStart = cursor;
+                StorylandModelSkinWeights weights;
+                if (weightFormat == 1u) {
+                    const uint32_t paddedWeights = ((weightCount + 3u) / 4u) * 4u;
+                    if (!modelRangeFits(cursor, paddedWeights, rawEnd)) return false;
+                    std::vector<std::pair<uint8_t, uint32_t>> ordered;
+                    for (uint32_t weightIndex = 0u; weightIndex < weightCount; ++weightIndex) ordered.push_back({bytes[cursor + weightIndex], weightIndex});
+                    std::sort(ordered.begin(), ordered.end(), [](const auto& left, const auto& right) { return left.first > right.first; });
+                    float total = 0.0f;
+                    for (const auto& item : ordered) {
+                        if (item.first == 0u || weights.influenceCount >= 4u) continue;
+                        StorylandModelSkinInfluence& influence = weights.influences[weights.influenceCount++];
+                        influence.rawMatrixIndex = item.second;
+                        influence.rawPackedWord = item.first;
+                        influence.weight = item.first == 128u ? 1.0f : float(item.first) / 127.0f;
+                        total += influence.weight;
+                    }
+                    if (total > 0.0f) {
+                        for (uint32_t i = 0u; i < weights.influenceCount; ++i) weights.influences[i].weight /= total;
+                        weights.valid = true;
+                    }
+                    cursor += paddedWeights;
+                }
+
+                StorylandModelTexcoord uv;
+                if (uvFormat == 1u) {
+                    if (!modelRangeFits(cursor, 2u, rawEnd)) return false;
+                    uv.u = float(static_cast<int8_t>(bytes[cursor + 0u])) / 127.0f;
+                    uv.v = float(static_cast<int8_t>(bytes[cursor + 1u])) / 127.0f;
+                    cursor += 2u;
+                } else if (uvFormat == 2u) {
+                    if (!modelRangeFits(cursor, 4u, rawEnd)) return false;
+                    uv.u = float(modelReadI16(bytes, cursor + 0u)) / 32767.0f;
+                    uv.v = float(modelReadI16(bytes, cursor + 2u)) / 32767.0f;
+                    cursor += 4u;
+                } else if (uvFormat == 3u) {
+                    if (!modelRangeFits(cursor, 8u, rawEnd)) return false;
+                    uv.u = modelReadF32(bytes, cursor + 0u);
+                    uv.v = modelReadF32(bytes, cursor + 4u);
+                    cursor += 8u;
+                }
+
+                if (colorFormat == 6u) cursor += 2u;
+                else if (colorFormat == 7u) cursor += 4u;
+                if (cursor > rawEnd) return false;
+
+                if (normalFormat == 1u) cursor += 4u;
+                else if (normalFormat == 2u) cursor += 6u;
+                else if (normalFormat == 3u) cursor += 12u;
+                if (cursor > rawEnd) return false;
+
+                StorylandModelPoint point;
+                if (positionFormat == 1u) {
+                    if (!modelRangeFits(cursor, 4u, rawEnd)) return false;
+                    point.x = float(static_cast<int8_t>(bytes[cursor + 0u])) / 127.0f * scaleX;
+                    point.y = float(static_cast<int8_t>(bytes[cursor + 1u])) / 127.0f * scaleY;
+                    point.z = float(static_cast<int8_t>(bytes[cursor + 2u])) / 127.0f * scaleZ;
+                    cursor += 4u;
+                } else if (positionFormat == 2u) {
+                    if (!modelRangeFits(cursor, 6u, rawEnd)) return false;
+                    point.x = float(modelReadI16(bytes, cursor + 0u)) / 32767.0f * scaleX;
+                    point.y = float(modelReadI16(bytes, cursor + 2u)) / 32767.0f * scaleY;
+                    point.z = float(modelReadI16(bytes, cursor + 4u)) / 32767.0f * scaleZ;
+                    cursor += 6u;
+                } else {
+                    if (!modelRangeFits(cursor, 12u, rawEnd)) return false;
+                    point.x = modelReadF32(bytes, cursor + 0u) * scaleX;
+                    point.y = modelReadF32(bytes, cursor + 4u) * scaleY;
+                    point.z = modelReadF32(bytes, cursor + 8u) * scaleZ;
+                    cursor += 12u;
+                }
+                if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) return false;
+
+                const size_t consumed = cursor - vertexStart;
+                if (stride != 0u && stride >= consumed && stride <= 1024u) {
+                    if (!modelRangeFits(vertexStart, stride, rawEnd)) return false;
+                    cursor = vertexStart + stride;
+                }
+                points.push_back(point);
+                texcoords.push_back(uv);
+                skinWeights.push_back(weights);
+            }
+            streamCache[indicesOffset] = {streamBaseVertex, indexCount};
+        } else {
+            streamBaseVertex = cached->second.first;
+        }
+
+        std::vector<uint32_t> indices;
+        const uint32_t indexFormat = (format >> 11u) & 3u;
+        if (indexFormat == 2u) {
+            if (indexMapOffset < 0 || indexMapLength == 0u || uint64_t(indexMapOffset) + uint64_t(indexMapLength) * 2ull > rawSize) return false;
+            const size_t mapBase = rawBase + size_t(indexMapOffset);
+            indices.reserve(indexMapLength);
+            for (uint32_t index = 0u; index < indexMapLength; ++index) {
+                indices.push_back(geometryBase + modelReadU16(bytes, mapBase + size_t(index) * 2u));
+            }
+        } else if (indexFormat == 0u) {
+            indices.reserve(indexCount);
+            for (uint32_t index = 0u; index < indexCount; ++index) indices.push_back(streamBaseVertex + index);
+        } else {
+            return false;
+        }
+
+        uint32_t wantedIndices = indexCount;
+        uint32_t material = splitIndex < binSplits.size() ? binSplits[splitIndex].material : 0u;
+        if (splitIndex < binSplits.size() && binSplits[splitIndex].indexCount != 0u) wantedIndices = binSplits[splitIndex].indexCount;
+        wantedIndices = std::min<uint32_t>(wantedIndices, uint32_t(indices.size()));
+        for (uint32_t index = 0u; index + 2u < wantedIndices; ++index) {
+            uint32_t a = indices[index + 0u];
+            uint32_t b = indices[index + 1u];
+            uint32_t c = indices[index + 2u];
+            if ((index & 1u) == 0u) std::swap(a, b);
+            if (a == b || a == c || b == c || a >= points.size() || b >= points.size() || c >= points.size()) continue;
+            triangles.push_back({a, b, c, materialBase + material});
+        }
+    }
+
+    splitCountOut += splitCount;
+    return points.size() > geometryBase && !triangles.empty();
+}
+
+
+
+static bool storylandDecodeRwFrameHierarchy(
+    const std::vector<uint8_t>& bytes,
+    const StorylandRwChunkView& clump,
+    std::vector<StorylandModelBone>& bonesOut,
+    uint32_t& hanimFrameCountOut,
+    uint32_t& namedFrameCountOut,
+    uint32_t& hierarchyNodeCountOut
+) {
+    bonesOut.clear();
+    hanimFrameCountOut = 0u;
+    namedFrameCountOut = 0u;
+    hierarchyNodeCountOut = 0u;
+
+    StorylandRwChunkView frameList;
+    bool foundFrameList = false;
+    for (const StorylandRwChunkView& child : storylandRwChildren(bytes, clump)) {
+        if (child.type == 0x0Eu) {
+            frameList = child;
+            foundFrameList = true;
+            break;
+        }
+    }
+    if (!foundFrameList) return false;
+
+    const auto frameChildren = storylandRwChildren(bytes, frameList);
+    if (frameChildren.empty() || frameChildren.front().type != 1u ||
+        frameChildren.front().size < 4u) {
+        return false;
+    }
+
+    const StorylandRwChunkView& frameStruct = frameChildren.front();
+    const uint32_t frameCount = modelReadU32(bytes, frameStruct.payload);
+    if (frameCount == 0u || frameCount > 4096u) return false;
+
+    const uint64_t requiredBytes = 4ull + uint64_t(frameCount) * 56ull;
+    if (requiredBytes > frameStruct.size) return false;
+
+    bonesOut.resize(frameCount);
+    std::vector<StorylandModelMatrix> localMatrices(frameCount);
+    std::vector<StorylandModelMatrix> worldMatrices(frameCount);
+
+    for (uint32_t index = 0u; index < frameCount; ++index) {
+        const size_t row = frameStruct.payload + 4u + size_t(index) * 56u;
+
+        StorylandModelMatrix local = identityModelMatrix();
+        local.m[0]  = modelReadF32(bytes, row + 0u);
+        local.m[1]  = modelReadF32(bytes, row + 4u);
+        local.m[2]  = modelReadF32(bytes, row + 8u);
+        local.m[4]  = modelReadF32(bytes, row + 12u);
+        local.m[5]  = modelReadF32(bytes, row + 16u);
+        local.m[6]  = modelReadF32(bytes, row + 20u);
+        local.m[8]  = modelReadF32(bytes, row + 24u);
+        local.m[9]  = modelReadF32(bytes, row + 28u);
+        local.m[10] = modelReadF32(bytes, row + 32u);
+        local.m[12] = modelReadF32(bytes, row + 36u);
+        local.m[13] = modelReadF32(bytes, row + 40u);
+        local.m[14] = modelReadF32(bytes, row + 44u);
+
+        bool finiteMatrix = true;
+        for (float value : local.m) {
+            if (!std::isfinite(value) || std::fabs(value) > 100000.0f) {
+                finiteMatrix = false;
+                break;
+            }
+        }
+        if (!finiteMatrix) return false;
+
+        const int32_t parentSigned = static_cast<int32_t>(modelReadU32(bytes, row + 48u));
+        const uint32_t parentIndex =
+            parentSigned >= 0 && uint32_t(parentSigned) < frameCount
+                ? uint32_t(parentSigned)
+                : 0xFFFFFFFFu;
+
+        StorylandModelBone& bone = bonesOut[index];
+        bone.index = index;
+        bone.offset = uint32_t(row);
+        bone.parentIndex = parentIndex;
+        bone.parentOffset =
+            parentIndex != 0xFFFFFFFFu
+                ? uint32_t(frameStruct.payload + 4u + size_t(parentIndex) * 56u)
+                : 0u;
+        bone.nodeId = index;
+        bone.boneId = 0xFFFFFFFFu;
+        bone.name = "frame_" + std::to_string(index);
+        bone.sectionKind = "RenderWare Frame";
+        bone.localPosition = {local.m[12], local.m[13], local.m[14]};
+        bone.hasLocalPosition =
+            std::isfinite(bone.localPosition.x) &&
+            std::isfinite(bone.localPosition.y) &&
+            std::isfinite(bone.localPosition.z);
+
+        bone.hasLocalRotation = matrixModelRotationToQuat(
+            local,
+            bone.localRotationX,
+            bone.localRotationY,
+            bone.localRotationZ,
+            bone.localRotationW);
+
+        localMatrices[index] = local;
+        if (parentIndex != 0xFFFFFFFFu && parentIndex < index && worldMatrices[parentIndex].valid) {
+            worldMatrices[index] = multiplyModelMatrix(worldMatrices[parentIndex], local);
+        } else {
+            worldMatrices[index] = local;
+        }
+
+        bone.worldPosition = matrixModelPosition(worldMatrices[index]);
+        bone.hasWorldPosition = worldMatrices[index].valid;
+        bone.composedPosition = bone.worldPosition;
+        bone.hasComposedPosition = bone.hasWorldPosition;
+        bone.previewPosition = bone.worldPosition;
+        bone.hasPreviewPosition = bone.hasWorldPosition;
+        bone.previewPositionSource = "RenderWare FrameList parent-composed matrix";
+        bone.hasWorldRotation = matrixModelRotationToQuat(
+            worldMatrices[index],
+            bone.worldRotationX,
+            bone.worldRotationY,
+            bone.worldRotationZ,
+            bone.worldRotationW);
+    }
+
+    uint32_t extensionIndex = 0u;
+    for (size_t childIndex = 1u;
+         childIndex < frameChildren.size() && extensionIndex < frameCount;
+         ++childIndex) {
+        const StorylandRwChunkView& extension = frameChildren[childIndex];
+        if (extension.type != 3u) continue;
+
+        StorylandModelBone& bone = bonesOut[extensionIndex];
+        for (const StorylandRwChunkView& plugin : storylandRwChildren(bytes, extension)) {
+            if (plugin.type == 0x11Eu && plugin.size >= 12u) {
+                const uint32_t hierarchyId = modelReadU32(bytes, plugin.payload + 4u);
+                const uint32_t hierarchyNodes = modelReadU32(bytes, plugin.payload + 8u);
+                if (hierarchyId != 0xFFFFFFFFu) {
+                    bone.boneId = hierarchyId;
+                    bone.sectionKind = "RenderWare Frame + HAnim";
+                    ++hanimFrameCountOut;
+                }
+                if (hierarchyNodes > hierarchyNodeCountOut && hierarchyNodes <= 4096u) {
+                    hierarchyNodeCountOut = hierarchyNodes;
+                }
+            } else if (plugin.type == 0x0253F2FEu && plugin.size != 0u) {
+                const std::string name =
+                    modelReadBoundedAscii(bytes, plugin.payload, plugin.size);
+                if (!name.empty()) {
+                    bone.name = name;
+                    bone.nameOffset = uint32_t(plugin.payload);
+                    ++namedFrameCountOut;
+                }
+            }
+        }
+        ++extensionIndex;
+    }
+
+    return !bonesOut.empty();
+}
+
+static bool storylandDecodeRwSkinWeights(
+    const std::vector<uint8_t>& bytes,
+    const StorylandRwChunkView& geometry,
+    uint32_t vertexCount,
+    uint32_t baseVertex,
+    std::vector<StorylandModelSkinWeights>& skinWeights,
+    uint32_t& skinBoneCountOut,
+    uint32_t& usedBoneCountOut,
+    uint32_t& maxWeightsOut,
+    uint32_t& weightedVerticesOut
+) {
+    skinBoneCountOut = 0u;
+    usedBoneCountOut = 0u;
+    maxWeightsOut = 0u;
+    weightedVerticesOut = 0u;
+
+    StorylandRwChunkView skinPlugin;
+    bool foundSkin = false;
+    for (const StorylandRwChunkView& child : storylandRwChildren(bytes, geometry)) {
+        if (child.type != 3u) continue;
+        for (const StorylandRwChunkView& plugin : storylandRwChildren(bytes, child)) {
+            if (plugin.type == 0x116u && plugin.size >= 4u) {
+                skinPlugin = plugin;
+                foundSkin = true;
+                break;
+            }
+        }
+        if (foundSkin) break;
+    }
+    if (!foundSkin) return false;
+
+    const size_t payload = skinPlugin.payload;
+    const uint32_t boneCount = bytes[payload + 0u];
+    const uint32_t usedBoneCount = bytes[payload + 1u];
+    const uint32_t maxWeights = bytes[payload + 2u];
+
+    if (boneCount == 0u || boneCount > 255u ||
+        usedBoneCount > boneCount ||
+        maxWeights == 0u || maxWeights > 4u) {
+        return false;
+    }
+
+    const uint64_t indicesOffset64 =
+        uint64_t(payload) + 4ull + uint64_t(usedBoneCount);
+    const uint64_t weightsOffset64 =
+        indicesOffset64 + uint64_t(vertexCount) * 4ull;
+    const uint64_t matricesOffset64 =
+        weightsOffset64 + uint64_t(vertexCount) * 16ull;
+    const uint64_t matricesEnd64 =
+        matricesOffset64 + uint64_t(boneCount) * 64ull;
+
+    if (matricesEnd64 > skinPlugin.end) return false;
+    if (baseVertex > skinWeights.size() ||
+        vertexCount > skinWeights.size() - baseVertex) {
+        return false;
+    }
+
+    const size_t indicesOffset = size_t(indicesOffset64);
+    const size_t weightsOffset = size_t(weightsOffset64);
+
+    uint32_t weightedVertices = 0u;
+    for (uint32_t vertex = 0u; vertex < vertexCount; ++vertex) {
+        StorylandModelSkinWeights& out = skinWeights[size_t(baseVertex) + vertex];
+        out = {};
+
+        float totalWeight = 0.0f;
+        uint32_t influenceCount = 0u;
+        for (uint32_t slot = 0u; slot < 4u; ++slot) {
+            const uint32_t matrixIndex = bytes[indicesOffset + size_t(vertex) * 4u + slot];
+            float weight = modelReadF32(
+                bytes,
+                weightsOffset + size_t(vertex) * 16u + size_t(slot) * 4u);
+            if (!std::isfinite(weight) || weight <= 0.000001f) continue;
+            if (matrixIndex >= boneCount || influenceCount >= 4u) continue;
+
+            StorylandModelSkinInfluence& influence = out.influences[influenceCount++];
+            influence.rawMatrixIndex = matrixIndex;
+            influence.boneIndex = matrixIndex;
+            influence.rawPackedWord = matrixIndex;
+            influence.weight = weight;
+            totalWeight += weight;
+        }
+
+        if (influenceCount == 0u || totalWeight <= 0.000001f) continue;
+        for (uint32_t slot = 0u; slot < influenceCount; ++slot) {
+            out.influences[slot].weight /= totalWeight;
+        }
+        out.valid = true;
+        out.influenceCount = influenceCount;
+        ++weightedVertices;
+    }
+
+    skinBoneCountOut = boneCount;
+    usedBoneCountOut = usedBoneCount;
+    maxWeightsOut = maxWeights;
+    weightedVerticesOut = weightedVertices;
+    return true;
+}
+
+static void storylandResolveRwSkinBoneIndices(
+    std::vector<StorylandModelSkinWeights>& skinWeights,
+    const std::vector<StorylandModelBone>& bones
+) {
+    if (skinWeights.empty() || bones.empty()) return;
+
+    std::map<uint32_t, uint32_t> byHAnimId;
+    for (uint32_t index = 0u; index < bones.size(); ++index) {
+        const StorylandModelBone& bone = bones[index];
+        if (bone.boneId != 0xFFFFFFFFu) {
+            byHAnimId.emplace(bone.boneId, index);
+        }
+    }
+
+    for (StorylandModelSkinWeights& weights : skinWeights) {
+        if (!weights.valid) continue;
+        const uint32_t count = std::min<uint32_t>(weights.influenceCount, 4u);
+        for (uint32_t slot = 0u; slot < count; ++slot) {
+            StorylandModelSkinInfluence& influence = weights.influences[slot];
+            const auto found = byHAnimId.find(influence.rawMatrixIndex);
+            if (found != byHAnimId.end()) {
+                influence.boneIndex = found->second;
+            } else if (influence.rawMatrixIndex < bones.size()) {
+                influence.boneIndex = influence.rawMatrixIndex;
+            } else {
+                influence.boneIndex = 0xFFFFFFFFu;
+            }
+        }
+    }
+}
+
+static bool storylandDecodePspStandardGeometry(
+    const std::vector<uint8_t>& bytes,
+    const StorylandRwChunkView& geometry,
+    uint32_t materialBase,
+    std::vector<StorylandModelPoint>& points,
+    std::vector<StorylandModelTriangle>& triangles,
+    std::vector<StorylandModelTexcoord>& texcoords,
+    std::vector<StorylandModelSkinWeights>& skinWeights,
+    uint32_t& triangleCountOut,
+    uint32_t& vertexCountOut
+) {
+    const auto children = storylandRwChildren(bytes, geometry);
+    if (children.empty() || children.front().type != 1u || children.front().size < 16u) return false;
+
+    const StorylandRwChunkView& geometryStruct = children.front();
+    const uint32_t flags = modelReadU32(bytes, geometryStruct.payload + 0u);
+    const uint32_t triangleCount = modelReadU32(bytes, geometryStruct.payload + 4u);
+    const uint32_t vertexCount = modelReadU32(bytes, geometryStruct.payload + 8u);
+    const uint32_t morphTargetCount = modelReadU32(bytes, geometryStruct.payload + 12u);
+
+    // rpGEOMETRYNATIVE belongs to the separate native decoder below.
+    if ((flags & 0x01000000u) != 0u) return false;
+    if (vertexCount == 0u || vertexCount > 4u * 1024u * 1024u ||
+        triangleCount > 16u * 1024u * 1024u ||
+        morphTargetCount == 0u || morphTargetCount > 4096u) {
+        return false;
+    }
+
+    size_t cursor = geometryStruct.payload + 16u;
+
+    // RenderWare 3.x Geometry flags.
+    constexpr uint32_t kRwGeometryTextured  = 0x00000004u;
+    constexpr uint32_t kRwGeometryPrelit    = 0x00000008u;
+    constexpr uint32_t kRwGeometryTextured2 = 0x00000080u;
+
+    if ((flags & kRwGeometryPrelit) != 0u) {
+        const uint64_t colorBytes = uint64_t(vertexCount) * 4ull;
+        if (colorBytes > uint64_t(geometryStruct.end - cursor)) return false;
+        cursor += size_t(colorBytes);
+    }
+
+    uint32_t texcoordSets = (flags >> 16u) & 0xFFu;
+    if (texcoordSets == 0u) {
+        if ((flags & kRwGeometryTextured2) != 0u) texcoordSets = 2u;
+        else if ((flags & kRwGeometryTextured) != 0u) texcoordSets = 1u;
+    }
+    if (texcoordSets > 8u) return false;
+
+    std::vector<StorylandModelTexcoord> firstUvSet;
+    firstUvSet.resize(vertexCount);
+    for (uint32_t setIndex = 0u; setIndex < texcoordSets; ++setIndex) {
+        const uint64_t uvBytes = uint64_t(vertexCount) * 8ull;
+        if (uvBytes > uint64_t(geometryStruct.end - cursor)) return false;
+        if (setIndex == 0u) {
+            for (uint32_t vertexIndex = 0u; vertexIndex < vertexCount; ++vertexIndex) {
+                const size_t uvOffset = cursor + size_t(vertexIndex) * 8u;
+                float u = modelReadF32(bytes, uvOffset + 0u);
+                float v = modelReadF32(bytes, uvOffset + 4u);
+                if (!std::isfinite(u)) u = 0.0f;
+                if (!std::isfinite(v)) v = 0.0f;
+                firstUvSet[vertexIndex] = {u, v};
+            }
+        }
+        cursor += size_t(uvBytes);
+    }
+
+    // RpTriangle disk order is vertex2, vertex1, material, vertex0.
+    const size_t triangleTable = cursor;
+    const uint64_t triangleBytes = uint64_t(triangleCount) * 8ull;
+    if (triangleBytes > uint64_t(geometryStruct.end - cursor)) return false;
+    cursor += size_t(triangleBytes);
+
+    // The first morph target containing positions is the bind/static preview
+    // geometry. A target begins with sphere[4], hasVertices, hasNormals.
+    std::vector<StorylandModelPoint> geometryPoints;
+    geometryPoints.reserve(vertexCount);
+    bool foundPositions = false;
+
+    for (uint32_t morphIndex = 0u; morphIndex < morphTargetCount; ++morphIndex) {
+        if (!modelRangeFits(cursor, 24u, geometryStruct.end)) return false;
+        const uint32_t hasVertices = modelReadU32(bytes, cursor + 16u);
+        const uint32_t hasNormals = modelReadU32(bytes, cursor + 20u);
+        cursor += 24u;
+
+        if (hasVertices != 0u) {
+            const uint64_t positionBytes = uint64_t(vertexCount) * 12ull;
+            if (positionBytes > uint64_t(geometryStruct.end - cursor)) return false;
+            if (!foundPositions) {
+                geometryPoints.resize(vertexCount);
+                for (uint32_t vertexIndex = 0u; vertexIndex < vertexCount; ++vertexIndex) {
+                    const size_t pointOffset = cursor + size_t(vertexIndex) * 12u;
+                    StorylandModelPoint point{
+                        modelReadF32(bytes, pointOffset + 0u),
+                        modelReadF32(bytes, pointOffset + 4u),
+                        modelReadF32(bytes, pointOffset + 8u)
+                    };
+                    if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) return false;
+                    geometryPoints[vertexIndex] = point;
+                }
+                foundPositions = true;
+            }
+            cursor += size_t(positionBytes);
+        }
+
+        if (hasNormals != 0u) {
+            const uint64_t normalBytes = uint64_t(vertexCount) * 12ull;
+            if (normalBytes > uint64_t(geometryStruct.end - cursor)) return false;
+            cursor += size_t(normalBytes);
+        }
+    }
+
+    if (!foundPositions || geometryPoints.size() != vertexCount) return false;
+
+    const uint32_t baseVertex = uint32_t(points.size());
+    points.insert(points.end(), geometryPoints.begin(), geometryPoints.end());
+
+    if (texcoordSets != 0u) {
+        texcoords.insert(texcoords.end(), firstUvSet.begin(), firstUvSet.end());
+    } else {
+        texcoords.resize(texcoords.size() + vertexCount);
+    }
+    skinWeights.resize(skinWeights.size() + vertexCount);
+
+    uint32_t acceptedTriangles = 0u;
+    for (uint32_t triangleIndex = 0u; triangleIndex < triangleCount; ++triangleIndex) {
+        const size_t triOffset = triangleTable + size_t(triangleIndex) * 8u;
+        const uint32_t vertex2 = modelReadU16(bytes, triOffset + 0u);
+        const uint32_t vertex1 = modelReadU16(bytes, triOffset + 2u);
+        const uint32_t material = modelReadU16(bytes, triOffset + 4u);
+        const uint32_t vertex0 = modelReadU16(bytes, triOffset + 6u);
+        if (vertex0 >= vertexCount || vertex1 >= vertexCount || vertex2 >= vertexCount) continue;
+        if (vertex0 == vertex1 || vertex0 == vertex2 || vertex1 == vertex2) continue;
+        triangles.push_back({
+            baseVertex + vertex0,
+            baseVertex + vertex1,
+            baseVertex + vertex2,
+            materialBase + material
+        });
+        ++acceptedTriangles;
+    }
+
+    if (acceptedTriangles == 0u) return false;
+    triangleCountOut += acceptedTriangles;
+    vertexCountOut += vertexCount;
+    return true;
+}
+
+bool StorylandModelFile::parsePspStandardDff() {
+    if (data.size() < 24u || modelReadU32(data, 0u) != 0x10u) return false;
+
+    StorylandRwChunkView root;
+    if (!readStorylandRwChunk(data, 0u, data.size(), root) || root.type != 0x10u) return false;
+
+    // PSP/LCS retail DFFs supplied for this pipeline use Rockstar's 0x1003FFFF
+    // RenderWare build stamp and ordinary non-native Geometry Struct payloads.
+    if (root.version != 0x1003FFFFu) return false;
+
+    std::vector<StorylandModelPoint> decodedPoints;
+    std::vector<StorylandModelTriangle> decodedTriangles;
+    std::vector<StorylandModelTexcoord> decodedTexcoords;
+    std::vector<StorylandModelSkinWeights> decodedSkinWeights;
+    std::vector<std::string> decodedMaterials;
+    uint32_t decodedGeometries = 0u;
+    uint32_t decodedTrianglesCount = 0u;
+    uint32_t decodedVerticesCount = 0u;
+    uint32_t skinBoneCount = 0u;
+    uint32_t skinUsedBoneCount = 0u;
+    uint32_t skinMaxWeights = 0u;
+    uint32_t skinWeightedVertices = 0u;
+    bool hasSkinPlugin = false;
+
+    // GeometryList is a direct child of the Clump.
+    for (const StorylandRwChunkView& child : storylandRwChildren(data, root)) {
+        if (child.type != 0x1Au) continue;
+
+        for (const StorylandRwChunkView& geometry : storylandRwChildren(data, child)) {
+            if (geometry.type != 0x0Fu) continue;
+            const auto geometryChildren = storylandRwChildren(data, geometry);
+            if (geometryChildren.empty() || geometryChildren.front().type != 1u ||
+                geometryChildren.front().size < 16u) {
+                continue;
+            }
+
+            const uint32_t geometryFlags = modelReadU32(data, geometryChildren.front().payload + 0u);
+            if ((geometryFlags & 0x01000000u) != 0u) continue;
+
+            const std::vector<std::string> localMaterials = storylandRwGeometryMaterials(data, geometry);
+            const uint32_t materialBase = uint32_t(decodedMaterials.size());
+            decodedMaterials.insert(decodedMaterials.end(), localMaterials.begin(), localMaterials.end());
+
+            for (const StorylandRwChunkView& geometryChild : geometryChildren) {
+                if (geometryChild.type != 3u) continue;
+                for (const StorylandRwChunkView& plugin : storylandRwChildren(data, geometryChild)) {
+                    if (plugin.type == 0x116u) hasSkinPlugin = true;
+                }
+            }
+
+            const uint32_t geometryVertexCount =
+                modelReadU32(data, geometryChildren.front().payload + 8u);
+            const uint32_t baseVertex = uint32_t(decodedPoints.size());
+
+            if (storylandDecodePspStandardGeometry(
+                    data, geometry, materialBase,
+                    decodedPoints, decodedTriangles, decodedTexcoords, decodedSkinWeights,
+                    decodedTrianglesCount, decodedVerticesCount)) {
+                ++decodedGeometries;
+
+                uint32_t geometrySkinBones = 0u;
+                uint32_t geometryUsedBones = 0u;
+                uint32_t geometryMaxWeights = 0u;
+                uint32_t geometryWeightedVertices = 0u;
+                if (storylandDecodeRwSkinWeights(
+                        data, geometry, geometryVertexCount, baseVertex,
+                        decodedSkinWeights,
+                        geometrySkinBones, geometryUsedBones,
+                        geometryMaxWeights, geometryWeightedVertices)) {
+                    skinBoneCount = std::max(skinBoneCount, geometrySkinBones);
+                    skinUsedBoneCount = std::max(skinUsedBoneCount, geometryUsedBones);
+                    skinMaxWeights = std::max(skinMaxWeights, geometryMaxWeights);
+                    skinWeightedVertices += geometryWeightedVertices;
+                }
+            }
+        }
+    }
+
+    if (decodedGeometries == 0u || decodedPoints.empty() || decodedTriangles.empty()) return false;
+
+    points = std::move(decodedPoints);
+    triangles = std::move(decodedTriangles);
+    texcoords = std::move(decodedTexcoords);
+    skinWeights = std::move(decodedSkinWeights);
+    materialTextureNames = std::move(decodedMaterials);
+    fieldRows.clear();
+    lights2dfx.clear();
+
+    uint32_t hanimFrames = 0u;
+    uint32_t namedFrames = 0u;
+    uint32_t hierarchyNodes = 0u;
+    storylandDecodeRwFrameHierarchy(
+        data, root, bones, hanimFrames, namedFrames, hierarchyNodes);
+    storylandResolveRwSkinBoneIndices(skinWeights, bones);
+
+    previewUsesPspNativeSkinPalette = false;
+    kind = hasSkinPlugin ? StorylandModelKind::PedModel : StorylandModelKind::SimpleModel;
+    pspNativeDff = true;
+    collectTextureNameHints();
+
+    outputLines.push_back({"Format: Liberty City Stories PSP beta RenderWare DFF (standard Geometry Struct)."});
+    outputLines.push_back({"RenderWare build stamp: 0x1003FFFF."});
+    outputLines.push_back({"Geometry blocks: " + std::to_string(decodedGeometries) + "."});
+    outputLines.push_back({"Geometry: " + std::to_string(decodedVerticesCount) +
+                           " vertices, " + std::to_string(decodedTrianglesCount) + " triangles."});
+    outputLines.push_back({"Materials: " + std::to_string(materialTextureNames.size()) +
+                           " decoded material/texture references."});
+    outputLines.push_back({"FrameList: " + std::to_string(bones.size()) +
+                           " frames, " + std::to_string(namedFrames) +
+                           " named frames, " + std::to_string(hanimFrames) +
+                           " frames with HAnim IDs."});
+    if (hierarchyNodes != 0u) {
+        outputLines.push_back({"HAnim hierarchy: " + std::to_string(hierarchyNodes) +
+                               " node records declared by the hierarchy plugin."});
+    }
+    if (hasSkinPlugin) {
+        outputLines.push_back({"Skin PLG: bones=" + std::to_string(skinBoneCount) +
+                               ", used=" + std::to_string(skinUsedBoneCount) +
+                               ", max weights/vertex=" + std::to_string(skinMaxWeights) +
+                               ", weighted vertices=" + std::to_string(skinWeightedVertices) +
+                               "/" + std::to_string(skinWeights.size()) + "."});
+    }
+    return true;
+}
+
+bool StorylandModelFile::parsePspNativeDff() {
+    if (data.size() < 24u || modelReadU32(data, 0u) != 0x10u) return false;
+    StorylandRwChunkView root;
+    if (!readStorylandRwChunk(data, 0u, data.size(), root) || root.type != 0x10u) return false;
+
+    std::vector<StorylandModelPoint> decodedPoints;
+    std::vector<StorylandModelTriangle> decodedTriangles;
+    std::vector<StorylandModelTexcoord> decodedTexcoords;
+    std::vector<StorylandModelSkinWeights> decodedSkinWeights;
+    std::vector<std::string> decodedMaterials;
+    uint32_t decodedGeometries = 0u;
+    uint32_t decodedSplits = 0u;
+
+    for (size_t offset = 0u; offset + 12u <= data.size(); offset += 4u) {
+        if (modelReadU32(data, offset) != 0x0Fu) continue;
+        StorylandRwChunkView geometry;
+        if (!readStorylandRwChunk(data, offset, data.size(), geometry) || geometry.type != 0x0Fu) continue;
+        const auto children = storylandRwChildren(data, geometry);
+        if (children.empty() || children.front().type != 1u || children.front().size < 16u) continue;
+        const uint32_t geometryFlags = modelReadU32(data, children.front().payload);
+        if ((geometryFlags & 0x01000000u) == 0u) continue;
+
+        const std::vector<std::string> localMaterials = storylandRwGeometryMaterials(data, geometry);
+        const uint32_t materialBase = uint32_t(decodedMaterials.size());
+        decodedMaterials.insert(decodedMaterials.end(), localMaterials.begin(), localMaterials.end());
+        const std::vector<StorylandPspSplitHeader> splits = storylandReadBinMeshSplits(data, geometry);
+
+        bool decodedGeometry = false;
+        for (const StorylandRwChunkView& child : children) {
+            if (child.type != 3u) continue;
+            for (const StorylandRwChunkView& plugin : storylandRwChildren(data, child)) {
+                if (plugin.type != 0x510u || plugin.size < 16u) continue;
+                StorylandRwChunkView nativeStruct;
+                if (!readStorylandRwChunk(data, plugin.payload, plugin.end, nativeStruct) || nativeStruct.type != 1u || nativeStruct.size < 4u) continue;
+                const uint32_t platform = modelReadU32(data, nativeStruct.payload);
+                if (platform != 0x0Au) continue;
+                const size_t rawBase = nativeStruct.payload + 4u;
+                const size_t rawSize = nativeStruct.end - rawBase;
+                if (storylandDecodePspNativeVertices(data, rawBase, rawSize, geometryFlags, splits, materialBase,
+                                                     decodedPoints, decodedTriangles, decodedTexcoords, decodedSkinWeights, decodedSplits)) {
+                    decodedGeometry = true;
+                    break;
+                }
+            }
+            if (decodedGeometry) break;
+        }
+        if (decodedGeometry) ++decodedGeometries;
+    }
+
+    if (decodedGeometries == 0u || decodedPoints.empty() || decodedTriangles.empty()) return false;
+    points = std::move(decodedPoints);
+    triangles = std::move(decodedTriangles);
+    texcoords = std::move(decodedTexcoords);
+    skinWeights = std::move(decodedSkinWeights);
+    materialTextureNames = std::move(decodedMaterials);
+    fieldRows.clear();
+    lights2dfx.clear();
+
+    uint32_t hanimFrames = 0u;
+    uint32_t namedFrames = 0u;
+    uint32_t hierarchyNodes = 0u;
+    storylandDecodeRwFrameHierarchy(
+        data, root, bones, hanimFrames, namedFrames, hierarchyNodes);
+    storylandResolveRwSkinBoneIndices(skinWeights, bones);
+
+    size_t weightedVertices = 0u;
+    for (const StorylandModelSkinWeights& weights : skinWeights) {
+        if (weights.valid) ++weightedVertices;
+    }
+
+    previewUsesPspNativeSkinPalette = weightedVertices != 0u;
+    kind = weightedVertices != 0u
+        ? StorylandModelKind::PedModel
+        : StorylandModelKind::SimpleModel;
+    pspNativeDff = true;
+    collectTextureNameHints();
+
+    outputLines.push_back({"Format: Liberty City Stories PSP beta native RenderWare DFF."});
+    outputLines.push_back({"Native geometry blocks: " + std::to_string(decodedGeometries) +
+                           ", strips: " + std::to_string(decodedSplits) + "."});
+    outputLines.push_back({"Geometry: " + std::to_string(points.size()) +
+                           " vertices, " + std::to_string(triangles.size()) + " triangles."});
+    outputLines.push_back({"Materials: " + std::to_string(materialTextureNames.size()) +
+                           " decoded material/texture references."});
+    outputLines.push_back({"FrameList: " + std::to_string(bones.size()) +
+                           " frames, " + std::to_string(namedFrames) +
+                           " named frames, " + std::to_string(hanimFrames) +
+                           " frames with HAnim IDs."});
+    if (hierarchyNodes != 0u) {
+        outputLines.push_back({"HAnim hierarchy: " + std::to_string(hierarchyNodes) +
+                               " node records declared."});
+    }
+    outputLines.push_back({"Skin/weights: " + std::to_string(weightedVertices) +
+                           "/" + std::to_string(skinWeights.size()) +
+                           " vertices carry decoded influences."});
+    return true;
+}
+
+
+bool StorylandModelFile::parseGtaSaDff() {
+    if (data.size() < 24u || modelReadU32(data, 0u) != 0x10u) return false;
+
+    StorylandRwChunkView root;
+    if (!readStorylandRwChunk(data, 0u, data.size(), root) || root.type != 0x10u) {
+        return false;
+    }
+
+    // GTA San Andreas PC DFFs use the RenderWare 3.6 build stamp commonly
+    // serialized as 0x1803FFFF. Keep this path separate from the LCS PSP
+    // 0x1003FFFF parser so SA files are never mistaken for Stories assets.
+    if (root.version != 0x1803FFFFu) return false;
+
+    std::vector<StorylandModelPoint> decodedPoints;
+    std::vector<StorylandModelTriangle> decodedTriangles;
+    std::vector<StorylandModelTexcoord> decodedTexcoords;
+    std::vector<StorylandModelSkinWeights> decodedSkinWeights;
+    std::vector<std::string> decodedMaterials;
+
+    uint32_t decodedGeometries = 0u;
+    uint32_t decodedTrianglesCount = 0u;
+    uint32_t decodedVerticesCount = 0u;
+    uint32_t skinBoneCount = 0u;
+    uint32_t skinUsedBoneCount = 0u;
+    uint32_t skinMaxWeights = 0u;
+    uint32_t skinWeightedVertices = 0u;
+    bool hasSkinPlugin = false;
+
+    for (const StorylandRwChunkView& child : storylandRwChildren(data, root)) {
+        if (child.type != 0x1Au) continue; // Geometry List
+
+        for (const StorylandRwChunkView& geometry : storylandRwChildren(data, child)) {
+            if (geometry.type != 0x0Fu) continue;
+
+            const auto geometryChildren = storylandRwChildren(data, geometry);
+            if (geometryChildren.empty() ||
+                geometryChildren.front().type != 1u ||
+                geometryChildren.front().size < 16u) {
+                continue;
+            }
+
+            const uint32_t geometryFlags =
+                modelReadU32(data, geometryChildren.front().payload + 0u);
+
+            // SA PC DFF geometry is ordinary RenderWare geometry, not the PSP
+            // native 0x510 stream handled by the Stories parser.
+            if ((geometryFlags & 0x01000000u) != 0u) continue;
+
+            const std::vector<std::string> localMaterials =
+                storylandRwGeometryMaterials(data, geometry);
+            const uint32_t materialBase =
+                uint32_t(decodedMaterials.size());
+            decodedMaterials.insert(
+                decodedMaterials.end(),
+                localMaterials.begin(),
+                localMaterials.end());
+
+            for (const StorylandRwChunkView& geometryChild : geometryChildren) {
+                if (geometryChild.type != 3u) continue;
+                for (const StorylandRwChunkView& plugin :
+                     storylandRwChildren(data, geometryChild)) {
+                    if (plugin.type == 0x116u) hasSkinPlugin = true;
+                }
+            }
+
+            const uint32_t geometryVertexCount =
+                modelReadU32(
+                    data,
+                    geometryChildren.front().payload + 8u);
+            const uint32_t baseVertex =
+                uint32_t(decodedPoints.size());
+
+            if (!storylandDecodePspStandardGeometry(
+                    data,
+                    geometry,
+                    materialBase,
+                    decodedPoints,
+                    decodedTriangles,
+                    decodedTexcoords,
+                    decodedSkinWeights,
+                    decodedTrianglesCount,
+                    decodedVerticesCount)) {
+                continue;
+            }
+
+            ++decodedGeometries;
+
+            uint32_t geometrySkinBones = 0u;
+            uint32_t geometryUsedBones = 0u;
+            uint32_t geometryMaxWeights = 0u;
+            uint32_t geometryWeightedVertices = 0u;
+            if (storylandDecodeRwSkinWeights(
+                    data,
+                    geometry,
+                    geometryVertexCount,
+                    baseVertex,
+                    decodedSkinWeights,
+                    geometrySkinBones,
+                    geometryUsedBones,
+                    geometryMaxWeights,
+                    geometryWeightedVertices)) {
+                skinBoneCount =
+                    std::max(skinBoneCount, geometrySkinBones);
+                skinUsedBoneCount =
+                    std::max(skinUsedBoneCount, geometryUsedBones);
+                skinMaxWeights =
+                    std::max(skinMaxWeights, geometryMaxWeights);
+                skinWeightedVertices += geometryWeightedVertices;
+            }
+        }
+    }
+
+    if (decodedGeometries == 0u ||
+        decodedPoints.empty() ||
+        decodedTriangles.empty()) {
+        return false;
+    }
+
+    points = std::move(decodedPoints);
+    triangles = std::move(decodedTriangles);
+    texcoords = std::move(decodedTexcoords);
+    skinWeights = std::move(decodedSkinWeights);
+    materialTextureNames = std::move(decodedMaterials);
+    fieldRows.clear();
+    lights2dfx.clear();
+
+    uint32_t hanimFrames = 0u;
+    uint32_t namedFrames = 0u;
+    uint32_t hierarchyNodes = 0u;
+    storylandDecodeRwFrameHierarchy(
+        data,
+        root,
+        bones,
+        hanimFrames,
+        namedFrames,
+        hierarchyNodes);
+    storylandResolveRwSkinBoneIndices(skinWeights, bones);
+
+    previewUsesPspNativeSkinPalette = false;
+    kind = hasSkinPlugin
+        ? StorylandModelKind::PedModel
+        : StorylandModelKind::SimpleModel;
+    gtaSaDff = true;
+    collectTextureNameHints();
+
+    outputLines.push_back({"Format: GTA San Andreas RenderWare DFF."});
+    outputLines.push_back({"RenderWare build: 0x1803FFFF."});
+    outputLines.push_back({"Geometry: " +
+                           std::to_string(decodedVerticesCount) +
+                           " vertices, " +
+                           std::to_string(decodedTrianglesCount) +
+                           " triangles."});
+    outputLines.push_back({"Materials: " +
+                           std::to_string(materialTextureNames.size()) +
+                           " texture references."});
+    outputLines.push_back({"Frames: " +
+                           std::to_string(bones.size()) +
+                           ", named=" +
+                           std::to_string(namedFrames) +
+                           ", HAnim=" +
+                           std::to_string(hanimFrames) + "."});
+    if (hasSkinPlugin) {
+        outputLines.push_back({"Skin: bones=" +
+                               std::to_string(skinBoneCount) +
+                               ", used=" +
+                               std::to_string(skinUsedBoneCount) +
+                               ", max weights=" +
+                               std::to_string(skinMaxWeights) +
+                               ", weighted vertices=" +
+                               std::to_string(skinWeightedVertices) +
+                               "/" +
+                               std::to_string(skinWeights.size()) + "."});
+    }
+    return true;
+}
+
 void StorylandModelFile::parse() {
     outputLines.clear();
     fieldRows.clear();
     textureHints.clear();
     mobileLcsDff = false;
+    pmlcMdl = false;
+    pspNativeDff = false;
+    gtaSaDff = false;
     lights2dfx.clear();
+    if (parsePmlcMdl()) return;
     if (parseMobileLcsDff()) return;
+    if (parsePspStandardDff()) return;
+    if (parsePspNativeDff()) return;
+    if (parseGtaSaDff()) return;
     collectRenderWare2dfxLights();
     detectModelKind();
     collectTextureNameHints();
@@ -4187,6 +6150,173 @@ void StorylandModelFile::parse() {
 
 const std::vector<StorylandModelLine>& StorylandModelFile::lines() const { return outputLines; }
 const std::vector<StorylandModelPoint>& StorylandModelFile::previewPoints() const { return points; }
+
+void StorylandModelFile::createEmptyDraft(
+    const std::wstring& displayPath
+) {
+    createEmptyDraft(
+        displayPath,
+        StorylandModelKind::Unknown,
+        false);
+}
+
+void StorylandModelFile::createEmptyDraft(
+    const std::wstring& displayPath,
+    StorylandModelKind desiredKind,
+    bool pspTarget
+) {
+    path = displayPath.empty() ? L"untitled.mdl" : displayPath;
+    data.clear();
+    outputLines.clear();
+    points.clear();
+    triangles.clear();
+    texcoords.clear();
+    skinWeights.clear();
+    bones.clear();
+    lights2dfx.clear();
+    materialTextureNames.clear();
+    textureHints.clear();
+    fieldRows.clear();
+
+    kind = desiredKind;
+    previewUsesPspNativeSkinPalette = false;
+    mobileLcsDff = false;
+    pmlcMdl = false;
+    pspNativeDff = false;
+    gtaSaDff = false;
+    emptyDraft = true;
+
+    const std::string platform = pspTarget ? "PSP" : "PS2";
+    outputLines.push_back({
+        "Empty " + platform + " " + modelKindName() +
+        " MDL draft. Right-click the model tree and choose Import MDL data..."
+    });
+    outputLines.push_back({
+        "Target platform: " + platform +
+        ". Intended model class: " + modelKindName() + "."
+    });
+    outputLines.push_back({
+        "Storyland will parse imported Stories MDL data and replace the draft metadata with the actual resource structure."
+    });
+}
+
+void StorylandModelFile::createEmptyDffDraft(const std::wstring& displayPath) {
+    createEmptyDffDraft(displayPath, StorylandModelKind::Unknown);
+}
+
+void StorylandModelFile::createEmptyDffDraft(
+    const std::wstring& displayPath,
+    StorylandModelKind desiredKind
+) {
+    path = displayPath.empty() ? L"untitled.dff" : displayPath;
+    data.clear();
+
+    auto appendU32Local = [&](uint32_t value) {
+        data.push_back(uint8_t(value & 0xFFu));
+        data.push_back(uint8_t((value >> 8u) & 0xFFu));
+        data.push_back(uint8_t((value >> 16u) & 0xFFu));
+        data.push_back(uint8_t((value >> 24u) & 0xFFu));
+    };
+    auto appendF32Local = [&](float value) {
+        uint32_t bits = 0u;
+        static_assert(sizeof(bits) == sizeof(value), "float size");
+        std::memcpy(&bits, &value, sizeof(bits));
+        appendU32Local(bits);
+    };
+    auto appendChunkHeader = [&](uint32_t type, uint32_t size, uint32_t version) {
+        appendU32Local(type);
+        appendU32Local(size);
+        appendU32Local(version);
+    };
+
+    // Minimal valid Mobile LCS RenderWare 3.1 frame-only clump.  Storyland
+    // already supports these no-geometry DFFs, so New > Model > DFF produces
+    // a real parseable resource rather than a fake extension or empty file.
+    std::vector<uint8_t> payload;
+    std::swap(payload, data);
+
+    // Build directly into data after reserving the top-level header.
+    data.clear();
+    appendChunkHeader(0x10u, 132u, 0x00000310u); // Clump
+
+    appendChunkHeader(0x01u, 4u, 0x00000310u); // Clump Struct
+    appendU32Local(0u);                         // atomics
+
+    appendChunkHeader(0x0Eu, 104u, 0x00000310u); // FrameList
+    appendChunkHeader(0x01u, 60u, 0x00000310u);  // FrameList Struct
+    appendU32Local(1u);                           // frame count
+    appendF32Local(1.0f); appendF32Local(0.0f); appendF32Local(0.0f);
+    appendF32Local(0.0f); appendF32Local(1.0f); appendF32Local(0.0f);
+    appendF32Local(0.0f); appendF32Local(0.0f); appendF32Local(1.0f);
+    appendF32Local(0.0f); appendF32Local(0.0f); appendF32Local(0.0f);
+    appendU32Local(0xFFFFFFFFu);                  // parent
+    appendU32Local(0u);                           // matrix flags
+
+    appendChunkHeader(0x03u, 20u, 0x00000310u);  // frame Extension
+    appendChunkHeader(0x0253F2FEu, 8u, 0x00000310u);
+    const char rootName[8] = {'r','o','o','t',0,0,0,0};
+    data.insert(data.end(), rootName, rootName + 8);
+
+    outputLines.clear();
+    points.clear();
+    triangles.clear();
+    texcoords.clear();
+    skinWeights.clear();
+    bones.clear();
+    lights2dfx.clear();
+    materialTextureNames.clear();
+    textureHints.clear();
+    fieldRows.clear();
+    kind = StorylandModelKind::Unknown;
+    previewUsesPspNativeSkinPalette = false;
+    mobileLcsDff = true;
+    pmlcMdl = false;
+    pspNativeDff = false;
+    gtaSaDff = false;
+    emptyDraft = false;
+    parse();
+    if (desiredKind != StorylandModelKind::Unknown) {
+        kind = desiredKind;
+        outputLines.insert(
+            outputLines.begin(),
+            {"New LCS PSP beta DFF draft: " + modelKindName() + "."});
+    }
+}
+
+
+bool StorylandModelFile::importMdlDataFromFile(const std::wstring& filePath, std::string& errorMessage) {
+    std::ifstream file(std::filesystem::path(filePath), std::ios::binary);
+    if (!file) { errorMessage = "Could not open MDL data file."; return false; }
+    file.seekg(0, std::ios::end);
+    const std::streamoff size = file.tellg();
+    file.seekg(0, std::ios::beg);
+    if (size < 0 || uint64_t(size) > 1024ull * 1024ull * 1024ull) {
+        errorMessage = "MDL data file size is invalid.";
+        return false;
+    }
+    std::vector<uint8_t> imported(static_cast<size_t>(size));
+    if (!imported.empty()) file.read(reinterpret_cast<char*>(imported.data()), std::streamsize(size));
+    if (!file && size != 0) { errorMessage = "Could not read complete MDL data file."; return false; }
+    if (imported.size() < 0x30u || modelReadU32(imported, 0u) != 0x006D646Cu) {
+        errorMessage = "The selected file is not a Leeds Stories MDL container (missing 0x006D646C signature).";
+        return false;
+    }
+    const std::wstring targetPath = path.empty() ? L"untitled.mdl" : path;
+    data = std::move(imported);
+    path = targetPath;
+    emptyDraft = false;
+    parse();
+    if (kind == StorylandModelKind::Unknown && points.empty() && fieldRows.empty()) {
+        errorMessage = "The selected MDL did not contain a model structure Storyland can classify safely.";
+        createEmptyDraft(targetPath);
+        return false;
+    }
+    errorMessage.clear();
+    return true;
+}
+
+bool StorylandModelFile::isEmptyDraft() const { return emptyDraft; }
+
 const std::vector<StorylandModelTriangle>& StorylandModelFile::previewTriangles() const { return triangles; }
 const std::vector<StorylandModelTexcoord>& StorylandModelFile::previewTexcoords() const { return texcoords; }
 const std::vector<StorylandModelSkinWeights>& StorylandModelFile::previewSkinWeights() const { return skinWeights; }
@@ -4196,24 +6326,22 @@ const std::vector<std::string>& StorylandModelFile::previewMaterialTextureNames(
 const std::vector<std::string>& StorylandModelFile::textureNameHints() const { return textureHints; }
 const std::wstring& StorylandModelFile::sourcePath() const { return path; }
 size_t StorylandModelFile::fileSize() const { return data.size(); }
+const std::vector<uint8_t>& StorylandModelFile::rawBytes() const { return data; }
 bool StorylandModelFile::isMobileLcsDff() const { return mobileLcsDff; }
+bool StorylandModelFile::isPmlcMdl() const { return pmlcMdl; }
+bool StorylandModelFile::isPspNativeDff() const { return pspNativeDff; }
+bool StorylandModelFile::isGtaSaDff() const { return gtaSaDff; }
+bool StorylandModelFile::saveToFile(const std::wstring& outputPath, std::string& errorMessage) const {
+    if (outputPath.empty()) { errorMessage = "Output path is empty."; return false; }
+    if (emptyDraft || data.empty()) { errorMessage = "The new MDL is still empty. Right-click and import valid MDL data before exporting."; return false; }
+    return storylandWriteFilesTransaction({{std::filesystem::path(outputPath), &data}}, errorMessage);
+}
 bool StorylandModelFile::exportMobileLcsDffLossless(const std::wstring& outputPath, std::string& errorMessage) const {
     if (!mobileLcsDff || !mobileLcsDffSignature(data)) {
-        errorMessage = "Export rejected: the loaded model is not a supported Mobile LCS RenderWare 3.1 F00D or frame-only DFF. Storyland will not write GTA III, Vice City, or San Andreas desktop Geometry variants through this command.";
+        errorMessage = "Export rejected: the loaded model is not a supported Mobile LCS RenderWare 3.1 DFF.";
         return false;
     }
-    std::ofstream file(std::filesystem::path(outputPath), std::ios::binary | std::ios::trunc);
-    if (!file) {
-        errorMessage = "Could not create the Mobile LCS DFF output file.";
-        return false;
-    }
-    if (!data.empty()) file.write(reinterpret_cast<const char*>(data.data()), std::streamsize(data.size()));
-    if (!file) {
-        errorMessage = "Could not write the complete Mobile LCS DFF output file.";
-        return false;
-    }
-    errorMessage.clear();
-    return true;
+    return saveToFile(outputPath, errorMessage);
 }
 const std::vector<StorylandModelField>& StorylandModelFile::fields() const { return fieldRows; }
 StorylandModelKind StorylandModelFile::modelKind() const { return kind; }

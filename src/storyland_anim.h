@@ -30,6 +30,7 @@ struct StorylandAnimTrack {
     uint32_t offset = 0;
     uint32_t keyDataOffset = 0;
     uint32_t keyStride = 0;
+    uint32_t channelFlags = 0;
     uint32_t boneId = 0xFFFFFFFFu;
     uint32_t boneIndex = 0xFFFFFFFFu;
     uint32_t parentIndex = 0xFFFFFFFFu;
@@ -63,6 +64,7 @@ struct StorylandAnimPoseBone {
 class StorylandAnimFile {
 public:
     bool loadFromFile(const std::wstring& filePath, std::string& errorMessage);
+    bool loadFromMemory(const std::vector<uint8_t>& bytes, const std::wstring& displayPath, std::string& errorMessage);
 
     const std::wstring& sourcePath() const;
     const std::vector<uint8_t>& rawBytes() const;

@@ -43,6 +43,8 @@ static constexpr uint32_t WRLD_IDENT = 0x57524C44; // "DLRW"
 static constexpr uint32_t AREA_IDENT = 0x41455241; // "AREA"
 static constexpr uint32_t AERA_IDENT = 0x41524541; // "AERA" fallback for reversed/debug dumps
 static constexpr uint32_t GTAG_IDENT = 0x47544147;
+static constexpr uint64_t STORYLAND_MAX_ARCHIVE_FILE_BYTES = 2ull * 1024ull * 1024ull * 1024ull;
+static constexpr size_t STORYLAND_MAX_LVZ_INFLATED_BYTES = 1024ull * 1024ull * 1024ull;
 
 static std::string narrowForMessage(const std::wstring& text) {
     std::string out;
@@ -183,7 +185,7 @@ static bool mobileLcsRwChunkHeaderValid(const std::vector<uint8_t>& bytes, size_
     uint32_t size = readU32(bytes, offset + 4u);
     uint32_t version = readU32(bytes, offset + 8u);
     if (expectedType != 0xFFFFFFFFu && type != expectedType) return false;
-    if (version != 0x00000310u) return false;
+    if (version != 0x00000310u && version != 0x1003FFFFu) return false;
     if (size > limit - offset - 12u) return false;
     return true;
 }
@@ -1750,33 +1752,50 @@ bool StorylandArchiveBrowser::readWholeFile(const std::wstring& path, std::vecto
         errorMessage = "Could not open file.";
         return false;
     }
+    if (_fseeki64(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        errorMessage = "Could not seek file.";
+        return false;
+    }
+    const __int64 signedFileSize = _ftelli64(file);
+    if (signedFileSize < 0 || _fseeki64(file, 0, SEEK_SET) != 0) {
+        fclose(file);
+        errorMessage = "Could not read file size.";
+        return false;
+    }
+    const uint64_t fileSize = static_cast<uint64_t>(signedFileSize);
 #else
     file = fopen(std::string(path.begin(), path.end()).c_str(), "rb");
     if (file == nullptr) {
         errorMessage = "Could not open file.";
         return false;
     }
-#endif
-
     if (fseek(file, 0, SEEK_END) != 0) {
         fclose(file);
         errorMessage = "Could not seek file.";
         return false;
     }
-
-    long fileSize = ftell(file);
-    if (fileSize < 0) {
+    const long signedFileSize = ftell(file);
+    if (signedFileSize < 0 || fseek(file, 0, SEEK_SET) != 0) {
         fclose(file);
         errorMessage = "Could not read file size.";
         return false;
     }
+    const uint64_t fileSize = static_cast<uint64_t>(signedFileSize);
+#endif
 
-    rewind(file);
-    outBytes.resize(size_t(fileSize));
+    if (fileSize > STORYLAND_MAX_ARCHIVE_FILE_BYTES || fileSize > uint64_t((std::numeric_limits<size_t>::max)())) {
+        fclose(file);
+        errorMessage = "File is too large to load safely.";
+        return false;
+    }
+
+    outBytes.assign(static_cast<size_t>(fileSize), uint8_t(0));
     if (!outBytes.empty()) {
-        size_t readCount = fread(outBytes.data(), 1, outBytes.size(), file);
+        const size_t readCount = fread(outBytes.data(), 1, outBytes.size(), file);
         if (readCount != outBytes.size()) {
             fclose(file);
+            outBytes.clear();
             errorMessage = "Could not read complete file.";
             return false;
         }
@@ -1905,6 +1924,10 @@ bool StorylandArchiveBrowser::writeWholeFile(const std::wstring& path, const std
 
 bool StorylandArchiveBrowser::inflateLvzBytes(const std::vector<uint8_t>& packed, std::vector<uint8_t>& unpacked, std::string& errorMessage) const {
     unpacked.clear();
+    if (packed.empty()) {
+        errorMessage = "LVZ zlib stream is empty.";
+        return false;
+    }
 
     z_stream stream = {};
     int status = inflateInit(&stream);
@@ -1913,27 +1936,44 @@ bool StorylandArchiveBrowser::inflateLvzBytes(const std::vector<uint8_t>& packed
         return false;
     }
 
-    stream.next_in = const_cast<Bytef*>(reinterpret_cast<const Bytef*>(packed.data()));
-    stream.avail_in = static_cast<uInt>(packed.size());
+    std::array<uint8_t, 65536> temp{};
+    size_t inputOffset = 0;
+    while (status != Z_STREAM_END) {
+        if (stream.avail_in == 0u && inputOffset < packed.size()) {
+            const size_t feed = std::min<size_t>(packed.size() - inputOffset, (std::numeric_limits<uInt>::max)());
+            stream.next_in = const_cast<Bytef*>(reinterpret_cast<const Bytef*>(packed.data() + inputOffset));
+            stream.avail_in = static_cast<uInt>(feed);
+            inputOffset += feed;
+        }
 
-    std::array<uint8_t, 65536> temp {};
-    for (;;) {
         stream.next_out = reinterpret_cast<Bytef*>(temp.data());
         stream.avail_out = static_cast<uInt>(temp.size());
-
+        const uLong previousIn = stream.total_in;
+        const uLong previousOut = stream.total_out;
         status = inflate(&stream, Z_NO_FLUSH);
         if (status != Z_OK && status != Z_STREAM_END) {
             inflateEnd(&stream);
+            unpacked.clear();
             errorMessage = "Could not inflate LVZ zlib stream.";
             return false;
         }
 
-        size_t produced = temp.size() - stream.avail_out;
-        unpacked.insert(unpacked.end(), temp.data(), temp.data() + produced);
+        const size_t produced = temp.size() - static_cast<size_t>(stream.avail_out);
+        if (produced != 0u) {
+            if (produced > STORYLAND_MAX_LVZ_INFLATED_BYTES ||
+                unpacked.size() > STORYLAND_MAX_LVZ_INFLATED_BYTES - produced) {
+                inflateEnd(&stream);
+                unpacked.clear();
+                errorMessage = "Inflated LVZ exceeds the safe 1 GiB limit.";
+                return false;
+            }
+            unpacked.insert(unpacked.end(), temp.data(), temp.data() + produced);
+        }
 
-        if (status == Z_STREAM_END) break;
-        if (produced == 0 && stream.avail_in == 0) {
+        const bool progressed = stream.total_in != previousIn || stream.total_out != previousOut;
+        if (status != Z_STREAM_END && !progressed && stream.avail_in == 0u && inputOffset >= packed.size()) {
             inflateEnd(&stream);
+            unpacked.clear();
             errorMessage = "LVZ inflate stopped before stream end.";
             return false;
         }
@@ -1949,6 +1989,14 @@ bool StorylandArchiveBrowser::inflateLvzBytes(const std::vector<uint8_t>& packed
 
 bool StorylandArchiveBrowser::deflateLvzBytes(const std::vector<uint8_t>& unpacked, std::vector<uint8_t>& packed, std::string& errorMessage) const {
     packed.clear();
+    if (unpacked.empty()) {
+        errorMessage = "LVZ input is empty.";
+        return false;
+    }
+    if (unpacked.size() > STORYLAND_MAX_LVZ_INFLATED_BYTES) {
+        errorMessage = "LVZ input exceeds the safe 1 GiB limit.";
+        return false;
+    }
 
     z_stream stream = {};
     int status = deflateInit(&stream, Z_BEST_COMPRESSION);
@@ -1957,29 +2005,34 @@ bool StorylandArchiveBrowser::deflateLvzBytes(const std::vector<uint8_t>& unpack
         return false;
     }
 
-    stream.next_in = const_cast<Bytef*>(reinterpret_cast<const Bytef*>(unpacked.data()));
-    stream.avail_in = static_cast<uInt>(unpacked.size());
+    std::array<uint8_t, 65536> temp{};
+    size_t inputOffset = 0;
+    bool finishing = false;
+    while (status != Z_STREAM_END) {
+        if (!finishing && stream.avail_in == 0u && inputOffset < unpacked.size()) {
+            const size_t feed = std::min<size_t>(unpacked.size() - inputOffset, (std::numeric_limits<uInt>::max)());
+            stream.next_in = const_cast<Bytef*>(reinterpret_cast<const Bytef*>(unpacked.data() + inputOffset));
+            stream.avail_in = static_cast<uInt>(feed);
+            inputOffset += feed;
+        }
+        if (stream.avail_in == 0u && inputOffset >= unpacked.size()) finishing = true;
 
-    std::array<uint8_t, 65536> temp {};
-    for (;;) {
         stream.next_out = reinterpret_cast<Bytef*>(temp.data());
         stream.avail_out = static_cast<uInt>(temp.size());
-
-        int flush = stream.avail_in == 0 ? Z_FINISH : Z_NO_FLUSH;
-        status = deflate(&stream, flush);
+        status = deflate(&stream, finishing ? Z_FINISH : Z_NO_FLUSH);
         if (status != Z_OK && status != Z_STREAM_END) {
             deflateEnd(&stream);
+            packed.clear();
             errorMessage = "Could not deflate LVZ zlib stream.";
             return false;
         }
 
-        size_t produced = temp.size() - stream.avail_out;
-        packed.insert(packed.end(), temp.data(), temp.data() + produced);
-
-        if (status == Z_STREAM_END) break;
-        if (produced == 0 && stream.avail_in == 0) {
+        const size_t produced = temp.size() - static_cast<size_t>(stream.avail_out);
+        if (produced != 0u) packed.insert(packed.end(), temp.data(), temp.data() + produced);
+        if (packed.size() > STORYLAND_MAX_ARCHIVE_FILE_BYTES) {
             deflateEnd(&stream);
-            errorMessage = "LVZ deflate stopped before stream end.";
+            packed.clear();
+            errorMessage = "Compressed LVZ exceeds the safe file limit.";
             return false;
         }
     }
@@ -3030,9 +3083,35 @@ bool StorylandArchiveBrowser::buildEntriesFromMobileLcsImg(std::string& errorMes
     }
 
     std::map<std::string, uint32_t> duplicateNames;
+    uint32_t mdlCount = 0u;
     uint32_t dffCount = 0u;
     uint32_t txdCount = 0u;
     uint32_t textureCount = 0u;
+
+    // May-2005 PSPHR archives contain sector-aligned Leeds MDL payloads and
+    // may have no usable companion metadata at all.
+    for (size_t mdlSector = 0u; mdlSector * 2048u + 0x20u <= currentImgBytes.size(); ++mdlSector) {
+        const size_t offset = mdlSector * 2048u;
+        if (readU32(currentImgBytes, offset) != 0x006D646Cu) continue;
+        const uint32_t declaredSize = readU32(currentImgBytes, offset + 8u);
+        if (declaredSize < 0x20u || declaredSize > 0x08000000u ||
+            uint64_t(offset) + uint64_t(declaredSize) > currentImgBytes.size()) continue;
+
+        StorylandArchiveEntry entry;
+        entry.index = uint32_t(archiveEntries.size());
+        entry.startSector = uint32_t(mdlSector);
+        entry.sectorCount = uint32_t((uint64_t(declaredSize) + 2047ull) / 2048ull);
+        entry.byteOffset = uint64_t(offset);
+        entry.byteSize = declaredSize;
+        entry.chunkIdent = MDL_IDENT;
+        entry.usesLvzChunkHeader = false;
+        char name[96] = {};
+        std::snprintf(name, sizeof(name), "beta_psp_mdl_%05u.mdl", entry.startSector);
+        entry.name = name;
+        archiveEntries.push_back(std::move(entry));
+        ++mdlCount;
+    }
+
     size_t sector = 0;
     while (sector * 2048u + 12u <= currentImgBytes.size()) {
         size_t offset = sector * 2048u;
@@ -3114,10 +3193,11 @@ bool StorylandArchiveBrowser::buildEntriesFromMobileLcsImg(std::string& errorMes
     });
     for (size_t index = 0u; index < archiveEntries.size(); ++index) archiveEntries[index].index = uint32_t(index);
 
-    currentLevelSummary = "Mobile LCS raw gta3.img: " + std::to_string(dffCount) +
-        " sector-aligned RenderWare 3.1 DFF clumps, " + std::to_string(txdCount) +
+    currentLevelSummary = "LCS PSP raw IMG scan: " + std::to_string(mdlCount) +
+        " sector-aligned Leeds MDLs, " + std::to_string(dffCount) +
+        " RenderWare DFF clumps, " + std::to_string(txdCount) +
         " PSP RenderWare texture dictionaries, " + std::to_string(textureCount) +
-        " named textures; GAME.DTZ/LVZ is not required.";
+        " named textures; DIR/LVZ metadata is optional.";
     currentImgSize = currentImgBytes.size();
     errorMessage.clear();
     return true;
@@ -3284,6 +3364,223 @@ bool StorylandArchiveBrowser::buildEntriesFromLvzAndImg(std::string& errorMessag
     return true;
 }
 
+
+bool StorylandArchiveBrowser::buildEntriesFromClassicDir(
+    const std::vector<uint8_t>& dirBytes,
+    std::string& errorMessage
+) {
+    archiveEntries.clear();
+    worldPlacements.clear();
+    worldSectors.clear();
+    worldMeshCache.clear();
+    directTextureCache.clear();
+    imgResourceRowCache.clear();
+    resourceResolutionCache.clear();
+
+    if (dirBytes.empty() || (dirBytes.size() % 32u) != 0u) {
+        errorMessage = "Classic GTA DIR size is not a multiple of 32 bytes.";
+        return false;
+    }
+    if (currentImgBytes.empty()) {
+        errorMessage = "Companion IMG is empty.";
+        return false;
+    }
+
+    const size_t rowCount = dirBytes.size() / 32u;
+    if (rowCount == 0u || rowCount > 200000u) {
+        errorMessage = "Classic GTA DIR entry count is invalid.";
+        return false;
+    }
+
+    archiveEntries.reserve(rowCount);
+    size_t validRows = 0u;
+    size_t mdlRows = 0u;
+    size_t rwRows = 0u;
+
+    for (size_t rowIndex = 0u; rowIndex < rowCount; ++rowIndex) {
+        const size_t row = rowIndex * 32u;
+        const uint32_t startSector = readU32(dirBytes, row + 0u);
+        const uint32_t sectorCount = readU32(dirBytes, row + 4u);
+        if (sectorCount == 0u) continue;
+
+        const uint64_t byteOffset = uint64_t(startSector) * 2048ull;
+        const uint64_t sectorBytes = uint64_t(sectorCount) * 2048ull;
+        if (byteOffset > currentImgBytes.size() ||
+            sectorBytes > uint64_t(currentImgBytes.size()) - byteOffset) {
+            continue;
+        }
+
+        std::string name;
+        for (size_t c = 0u; c < 24u; ++c) {
+            const unsigned char ch = dirBytes[row + 8u + c];
+            if (ch == 0u) break;
+            if (ch < 32u || ch >= 127u) { name.clear(); break; }
+            name.push_back(char(ch));
+        }
+        if (name.empty()) name = "entry_" + std::to_string(rowIndex) + ".bin";
+
+        StorylandArchiveEntry entry;
+        entry.index = uint32_t(archiveEntries.size());
+        entry.startSector = startSector;
+        entry.sectorCount = sectorCount;
+        entry.byteOffset = byteOffset;
+        entry.byteSize = sectorBytes;
+        entry.usesLvzChunkHeader = false;
+        entry.name = name;
+
+        const size_t off = size_t(byteOffset);
+        if (sectorBytes >= 12u) {
+            const uint32_t magic = readU32(currentImgBytes, off + 0u);
+            const uint32_t declared = readU32(currentImgBytes, off + 4u);
+            const uint32_t version = readU32(currentImgBytes, off + 8u);
+
+            if (magic == 0x006D646Cu) { // "mdl\0"
+                const uint32_t mdlSize = declared;
+                if (mdlSize >= 0x20u && mdlSize <= sectorBytes) {
+                    entry.byteSize = mdlSize;
+                }
+                const size_t dot = entry.name.find_last_of('.');
+                if (dot != std::string::npos) entry.name.resize(dot);
+                entry.name += ".mdl";
+                entry.chunkIdent = MDL_IDENT;
+                ++mdlRows;
+            } else if ((magic == 0x10u || magic == 0x16u) &&
+                       (version == 0x00000310u || version == 0x1003FFFFu) &&
+                       uint64_t(declared) + 12ull <= sectorBytes) {
+                entry.byteSize = uint64_t(declared) + 12ull;
+                entry.chunkIdent = magic;
+                ++rwRows;
+            }
+        }
+
+        archiveEntries.push_back(std::move(entry));
+        ++validRows;
+    }
+
+    if (archiveEntries.empty()) {
+        errorMessage = "No valid IMG ranges were found in the companion DIR.";
+        return false;
+    }
+
+    currentLevelSummary =
+        "LCS beta/classic IMG+DIR: " + std::to_string(validRows) +
+        " valid directory entries, " + std::to_string(mdlRows) +
+        " MDL payloads, " + std::to_string(rwRows) +
+        " RenderWare payloads. DIR sectors use 2048-byte units.";
+    currentImgSize = currentImgBytes.size();
+    errorMessage.clear();
+    return true;
+}
+
+bool StorylandArchiveBrowser::loadDirWithCompanionImg(
+    const std::wstring& dirPath,
+    std::string& errorMessage
+) {
+    clear();
+
+    std::vector<uint8_t> dirBytes;
+    if (!readWholeFile(dirPath, dirBytes, errorMessage)) return false;
+
+    std::filesystem::path dir(dirPath);
+    std::filesystem::path folder = dir.parent_path();
+    const std::wstring stem = dir.stem().wstring();
+    std::vector<std::filesystem::path> candidates = {
+        folder / (stem + L".img"),
+        folder / (stem + L".IMG"),
+        folder / L"GTA3.IMG",
+        folder / L"gta3.img",
+        folder / L"GTA3PSPHR.IMG",
+        folder / L"gta3psphr.img"
+    };
+
+    std::error_code ec;
+    std::filesystem::path chosen;
+    for (const auto& candidate : candidates) {
+        if (std::filesystem::exists(candidate, ec) && std::filesystem::is_regular_file(candidate, ec)) {
+            chosen = candidate;
+            break;
+        }
+        ec.clear();
+    }
+    if (chosen.empty()) {
+        errorMessage = "Could not find a companion IMG for this beta/classic DIR.";
+        return false;
+    }
+
+    currentImgPath = chosen.wstring();
+    if (!readWholeFile(currentImgPath, currentImgBytes, errorMessage)) {
+        clear();
+        return false;
+    }
+    currentImgSize = currentImgBytes.size();
+
+    if (!buildEntriesFromClassicDir(dirBytes, errorMessage)) {
+        clear();
+        return false;
+    }
+    return true;
+}
+
+bool StorylandArchiveBrowser::loadZmgFromFile(
+    const std::wstring& zmgPath,
+    std::string& errorMessage
+) {
+    clear();
+
+    std::vector<uint8_t> packed;
+    if (!readWholeFile(zmgPath, packed, errorMessage)) return false;
+
+    std::vector<uint8_t> unpacked;
+    if (!inflateLvzBytes(packed, unpacked, errorMessage)) {
+        errorMessage = "ZMG is not a valid bounded zlib stream: " + errorMessage;
+        return false;
+    }
+
+    currentImgPath = zmgPath;
+    currentImgBytes = std::move(unpacked);
+    currentImgSize = currentImgBytes.size();
+
+    StorylandArchiveEntry entry;
+    entry.index = 0u;
+    entry.startSector = 0u;
+    entry.sectorCount = uint32_t((currentImgBytes.size() + 2047u) / 2048u);
+    entry.byteOffset = 0u;
+    entry.byteSize = currentImgBytes.size();
+    entry.usesLvzChunkHeader = false;
+
+    std::string stem = narrowForMessage(std::filesystem::path(zmgPath).stem().wstring());
+    if (stem.empty()) stem = "zmg";
+
+    if (currentImgBytes.size() >= 12u &&
+        readU32(currentImgBytes, 0u) == 0x006D646Cu) {
+        entry.name = stem + ".mdl";
+        entry.chunkIdent = MDL_IDENT;
+    } else if (currentImgBytes.size() >= 12u &&
+               readU32(currentImgBytes, 0u) == 0x10u &&
+               (readU32(currentImgBytes, 8u) == 0x00000310u ||
+                readU32(currentImgBytes, 8u) == 0x1003FFFFu)) {
+        entry.name = stem + ".dff";
+        entry.chunkIdent = 0x10u;
+    } else if (currentImgBytes.size() >= 12u &&
+               readU32(currentImgBytes, 0u) == 0x16u &&
+               (readU32(currentImgBytes, 8u) == 0x00000310u ||
+                readU32(currentImgBytes, 8u) == 0x1003FFFFu)) {
+        entry.name = stem + ".txd";
+        entry.chunkIdent = 0x16u;
+    } else {
+        entry.name = stem + "_inflated.bin";
+        entry.chunkIdent = 0u;
+    }
+
+    archiveEntries.push_back(std::move(entry));
+    currentLevelSummary =
+        "LCS beta ZMG: zlib decompressed " + std::to_string(packed.size()) +
+        " bytes to " + std::to_string(currentImgBytes.size()) +
+        " bytes. The inflated payload is exposed as an analyzable/exportable resource.";
+    errorMessage.clear();
+    return true;
+}
+
 bool StorylandArchiveBrowser::loadLvzWithCompanionImg(const std::wstring& lvzPath, std::string& errorMessage) {
     clear();
 
@@ -3312,6 +3609,56 @@ bool StorylandArchiveBrowser::loadLvzWithCompanionImg(const std::wstring& lvzPat
 }
 
 bool StorylandArchiveBrowser::loadImgFromFile(const std::wstring& imgPath, std::string& errorMessage) {
+    // LCS beta/classic archives use 32-byte GTA IMG v1 DIR rows. Prefer an
+    // explicit same-stem DIR; then try GTA3.DIR, which also maps GTA3PSPHR.IMG.
+    {
+        std::filesystem::path img(imgPath);
+        std::filesystem::path folder = img.parent_path();
+        std::vector<std::filesystem::path> dirCandidates = {
+            folder / (img.stem().wstring() + L".dir"),
+            folder / (img.stem().wstring() + L".DIR"),
+            folder / L"GTA3.DIR",
+            folder / L"gta3.dir"
+        };
+        std::error_code ec;
+        for (const auto& candidate : dirCandidates) {
+            if (!std::filesystem::exists(candidate, ec) || !std::filesystem::is_regular_file(candidate, ec)) {
+                ec.clear();
+                continue;
+            }
+
+            std::vector<uint8_t> dirBytes;
+            std::vector<uint8_t> imgBytes;
+            std::string probeError;
+            if (!readWholeFile(candidate.wstring(), dirBytes, probeError) ||
+                !readWholeFile(imgPath, imgBytes, probeError) ||
+                dirBytes.empty() || (dirBytes.size() % 32u) != 0u) {
+                continue;
+            }
+
+            size_t checked = 0u;
+            size_t fitting = 0u;
+            const size_t rows = std::min<size_t>(dirBytes.size() / 32u, 128u);
+            for (size_t i = 0u; i < rows; ++i) {
+                const uint32_t start = readU32(dirBytes, i * 32u + 0u);
+                const uint32_t count = readU32(dirBytes, i * 32u + 4u);
+                if (count == 0u) continue;
+                ++checked;
+                const uint64_t begin = uint64_t(start) * 2048ull;
+                const uint64_t bytes = uint64_t(count) * 2048ull;
+                if (begin <= imgBytes.size() && bytes <= uint64_t(imgBytes.size()) - begin) ++fitting;
+            }
+            if (checked >= 8u && fitting * 100u >= checked * 95u) {
+                clear();
+                currentImgPath = imgPath;
+                currentImgBytes = std::move(imgBytes);
+                currentImgSize = currentImgBytes.size();
+                if (buildEntriesFromClassicDir(dirBytes, errorMessage)) return true;
+                clear();
+            }
+        }
+    }
+
     std::wstring lvzPath;
     if (autoFindCompanionLvzForImg(imgPath, lvzPath)) {
         if (!loadLvzWithCompanionImg(lvzPath, errorMessage)) return false;
@@ -3356,65 +3703,34 @@ bool StorylandArchiveBrowser::extractEntryBytes(size_t index, std::vector<uint8_
         return false;
     }
 
-    if (currentImgPath.empty()) {
-        errorMessage = "No IMG file is currently open.";
-        return false;
-    }
-
     const StorylandArchiveEntry& entry = archiveEntries[index];
-
-    FILE* file = nullptr;
-#ifdef _WIN32
-    if (_wfopen_s(&file, currentImgPath.c_str(), L"rb") != 0 || file == nullptr) {
-        errorMessage = "Could not open IMG file for extraction.";
-        return false;
-    }
-#else
-    file = fopen(std::string(currentImgPath.begin(), currentImgPath.end()).c_str(), "rb");
-    if (file == nullptr) {
-        errorMessage = "Could not open IMG file for extraction.";
-        return false;
-    }
-#endif
-
-#ifdef _WIN32
-    const int seekResult = _fseeki64(file, static_cast<__int64>(entry.byteOffset), SEEK_SET);
-#else
-    const int seekResult = fseeko(file, static_cast<off_t>(entry.byteOffset), SEEK_SET);
-#endif
-    if (seekResult != 0) {
-        fclose(file);
-        errorMessage = "Could not seek to IMG entry.";
+    if (entry.byteOffset > currentImgBytes.size() ||
+        entry.byteSize > uint64_t(currentImgBytes.size()) - entry.byteOffset) {
+        errorMessage = "Archive entry byte range is outside the loaded IMG/ZMG buffer.";
         return false;
     }
 
-    std::vector<uint8_t> payload(static_cast<size_t>(entry.byteSize));
-    if (!payload.empty()) {
-        size_t readCount = fread(payload.data(), 1, payload.size(), file);
-        if (readCount != payload.size()) {
-            fclose(file);
-            errorMessage = "Could not read IMG entry bytes.";
-            return false;
-        }
-    }
-
-    fclose(file);
+    const size_t begin = size_t(entry.byteOffset);
+    const size_t size = size_t(entry.byteSize);
+    std::vector<uint8_t> payload(
+        currentImgBytes.begin() + begin,
+        currentImgBytes.begin() + begin + size);
 
     if (entry.usesLvzChunkHeader) {
-        if (entry.lvzHeaderOffset + 0x20 > currentLvzBytes.size()) {
+        if (entry.lvzHeaderOffset > currentLvzBytes.size() ||
+            currentLvzBytes.size() - entry.lvzHeaderOffset < 0x20u) {
             errorMessage = "LVZ chunk header offset is invalid.";
             return false;
         }
-
-        outBytes.resize(0x20 + payload.size());
+        outBytes.resize(0x20u + payload.size());
         std::copy(
             currentLvzBytes.begin() + entry.lvzHeaderOffset,
-            currentLvzBytes.begin() + entry.lvzHeaderOffset + 0x20,
-            outBytes.begin()
-        );
-
-        if (!payload.empty()) std::copy(payload.begin(), payload.end(), outBytes.begin() + 0x20);
-        writeU32(outBytes, 8, uint32_t(outBytes.size()));
+            currentLvzBytes.begin() + entry.lvzHeaderOffset + 0x20u,
+            outBytes.begin());
+        if (!payload.empty()) {
+            std::copy(payload.begin(), payload.end(), outBytes.begin() + 0x20u);
+        }
+        writeU32(outBytes, 8u, uint32_t(outBytes.size()));
         return true;
     }
 
@@ -3627,7 +3943,7 @@ bool StorylandArchiveBrowser::replaceEntryBytes(size_t index, const std::vector<
         "Delta: " + std::to_string(delta) + "\r\n"
         "Later IMG-backed LVZ records shifted: " + std::string(delta == 0 ? "no" : "yes") + "\r\n"
         "Replacement source treated as: " + std::string(target.usesLvzChunkHeader ? "sChunkHeader+payload for LVZ header record" : "whole IMG-backed chunk/payload") + "\r\n"
-        "Use File > Export/Rebuild LVZ+IMG Pair to write the edited files.";
+        "Right-click the archive tree to rebuild or overwrite the LVZ + IMG pair.";
 
     return true;
 }
@@ -4041,7 +4357,7 @@ bool StorylandArchiveBrowser::replaceWorldMeshResourceBytes(uint32_t resourceId,
         " VIF_streams=" + std::to_string(dmaPreflight.vifStreams) +
         " warnings=" + std::to_string(dmaPreflight.warnings) + "\r\n"
         "This path avoids the TLB bug where the game read the first material row dword as a pointer.\r\n"
-        "Use File > Export/Rebuild LVZ+IMG Pair to write the edited files.";
+        "Right-click the archive tree to rebuild or overwrite the LVZ + IMG pair.";
 
     return true;
 }
@@ -4133,7 +4449,7 @@ bool StorylandArchiveBrowser::changeWorldMeshResourceId(uint32_t oldResourceId, 
         "New id: " + std::to_string(newResourceId) + "\r\n"
         "Resource[] table rows changed: " + std::to_string(tableRowsChanged) + "\r\n"
         "sGeomInstance placement rows changed: " + std::to_string(placementRowsChanged) + "\r\n"
-        "Use File > Export/Rebuild LVZ+IMG Pair to write the edited files.";
+        "Right-click the archive tree to rebuild or overwrite the LVZ + IMG pair.";
 
     return true;
 }
