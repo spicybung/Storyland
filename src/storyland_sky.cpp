@@ -150,9 +150,11 @@ void buildBillboardBasis(float directionX, float directionY, float directionZ, f
     upZ = upZ / upLength * size;
 }
 
-void drawCelestialDisc(float directionX, float directionY, float directionZ, float radius,
-                       float size, const StorylandSkyColor& color) {
+void drawFeatheredDisc(float directionX, float directionY, float directionZ, float radius,
+                       float size, const StorylandSkyColor& color,
+                       float middleScale, float middleAlphaScale) {
     if (color.a <= 0.001f || directionZ <= -0.10f) return;
+
     float centerX, centerY, centerZ;
     float rightX, rightY, rightZ;
     float upX, upY, upZ;
@@ -168,16 +170,40 @@ void drawCelestialDisc(float directionX, float directionY, float directionZ, flo
     upY *= radius;
     upZ *= radius;
 
-    constexpr int SegmentCount = 32;
+    StorylandSkyColor middle = color;
+    middle.a = clampValue(color.a * middleAlphaScale, 0.0f, 1.0f);
+
+    StorylandSkyColor edge = color;
+    edge.a = 0.0f;
+
+    constexpr int SegmentCount = 48;
+
     glBegin(GL_TRIANGLE_FAN);
     setColor(color);
     glVertex3f(centerX, centerY, centerZ);
-    StorylandSkyColor edge = color;
-    edge.a = 0.0f;
     for (int segment = 0; segment <= SegmentCount; ++segment) {
         float angle = float(segment) / float(SegmentCount) * Pi * 2.0f;
         float cosine = std::cos(angle);
         float sine = std::sin(angle);
+
+        setColor(middle);
+        glVertex3f(centerX + (rightX * cosine + upX * sine) * middleScale,
+                   centerY + (rightY * cosine + upY * sine) * middleScale,
+                   centerZ + (rightZ * cosine + upZ * sine) * middleScale);
+    }
+    glEnd();
+
+    glBegin(GL_TRIANGLE_STRIP);
+    for (int segment = 0; segment <= SegmentCount; ++segment) {
+        float angle = float(segment) / float(SegmentCount) * Pi * 2.0f;
+        float cosine = std::cos(angle);
+        float sine = std::sin(angle);
+
+        setColor(middle);
+        glVertex3f(centerX + (rightX * cosine + upX * sine) * middleScale,
+                   centerY + (rightY * cosine + upY * sine) * middleScale,
+                   centerZ + (rightZ * cosine + upZ * sine) * middleScale);
+
         setColor(edge);
         glVertex3f(centerX + rightX * cosine + upX * sine,
                    centerY + rightY * cosine + upY * sine,
@@ -254,7 +280,8 @@ StorylandSkyState interpolateState(const StorylandSkyState& a, const StorylandSk
     result.fog = mixColor(a.fog, b.fog, amount);
     result.ambient = mixColor(a.ambient, b.ambient, amount);
     result.directional = mixColor(a.directional, b.directional, amount);
-    result.sun = mixColor(a.sun, b.sun, amount);
+    result.sunCore = mixColor(a.sunCore, b.sunCore, amount);
+    result.sunCorona = mixColor(a.sunCorona, b.sunCorona, amount);
     result.moon = mixColor(a.moon, b.moon, amount);
     return result;
 }
@@ -430,7 +457,8 @@ StorylandSkyState StorylandSky::evaluateVcsTimecycleState() const {
     result.fog = result.horizon;
     result.ambient = mixColor(first.ambient, second.ambient, amount);
     result.directional = mixColor(first.directional, second.directional, amount);
-    result.sun = mixColor(first.sunCorona, second.sunCorona, amount);
+    result.sunCore = mixColor(first.sunCore, second.sunCore, amount);
+    result.sunCorona = mixColor(first.sunCorona, second.sunCorona, amount);
     result.moon = {0.72f, 0.78f, 1.0f, 0.78f};
     StorylandSkyColor lowCloud = mixColor(first.lowCloud, second.lowCloud, amount);
     StorylandSkyColor topCloud = mixColor(first.topCloud, second.topCloud, amount);
@@ -521,10 +549,14 @@ void StorylandSky::evaluateState() {
     dawn.directional = {0.70f, 0.56f, 0.48f, 1.0f};
     day.directional = {0.95f, 0.92f, 0.84f, 1.0f};
     sunset.directional = {0.90f, 0.50f, 0.35f, 1.0f};
-    night.sun = {0.0f, 0.0f, 0.0f, 0.0f};
-    dawn.sun = {1.0f, 0.65f, 0.42f, 0.86f};
-    day.sun = {1.0f, 0.90f, 0.68f, 0.88f};
-    sunset.sun = {1.0f, 0.44f, 0.20f, 0.90f};
+    night.sunCore = {0.0f, 0.0f, 0.0f, 0.0f};
+    dawn.sunCore = {1.0f, 0.82f, 0.56f, 0.82f};
+    day.sunCore = {1.0f, 0.96f, 0.82f, 0.86f};
+    sunset.sunCore = {1.0f, 0.62f, 0.32f, 0.84f};
+    night.sunCorona = {0.0f, 0.0f, 0.0f, 0.0f};
+    dawn.sunCorona = {1.0f, 0.65f, 0.42f, 0.48f};
+    day.sunCorona = {1.0f, 0.90f, 0.68f, 0.42f};
+    sunset.sunCorona = {1.0f, 0.44f, 0.20f, 0.52f};
     night.moon = {0.72f, 0.78f, 1.0f, 0.78f};
     dawn.moon = {0.55f, 0.58f, 0.70f, 0.12f};
     day.moon = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -641,14 +673,28 @@ void StorylandSky::drawBackground(const StorylandSkyRotation& viewRotation, floa
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     drawStars(radius * 0.96f, currentState.starIntensity);
-    drawCelestialDisc(currentState.moonDirectionX, currentState.moonDirectionY,
+    drawFeatheredDisc(currentState.moonDirectionX, currentState.moonDirectionY,
                       currentState.moonDirectionZ, radius * 0.92f,
-                      currentState.moonSize, currentState.moon);
+                      currentState.moonSize, currentState.moon,
+                      0.82f, 0.75f);
     drawCloudBands(radius * 0.90f, currentState);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE);
-    drawCelestialDisc(currentState.sunDirectionX, currentState.sunDirectionY,
+
+    StorylandSkyColor sunCorona = currentState.sunCorona;
+    sunCorona.a = clampValue(currentState.sunCorona.a, 0.0f, 1.0f);
+
+    StorylandSkyColor sunCore = currentState.sunCore;
+    sunCore.a = clampValue(currentState.sunCore.a, 0.0f, 1.0f);
+
+    drawFeatheredDisc(currentState.sunDirectionX, currentState.sunDirectionY,
                       currentState.sunDirectionZ, radius * 0.88f,
-                      currentState.sunSize, currentState.sun);
+                      currentState.sunSize * 1.65f, sunCorona,
+                      0.50f, 0.18f);
+
+    drawFeatheredDisc(currentState.sunDirectionX, currentState.sunDirectionY,
+                      currentState.sunDirectionZ, radius * 0.88f,
+                      currentState.sunSize * 0.90f, sunCore,
+                      0.72f, 0.30f);
 
     glPopMatrix();
     glDepthMask(GL_TRUE);

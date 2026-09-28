@@ -9,7 +9,17 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <new>
 #include <sstream>
+
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/error.h>
+#include <libavutil/imgutils.h>
+#include <libavutil/samplefmt.h>
+#include <libswscale/swscale.h>
+}
 
 #ifdef _WIN32
 #define NOMINMAX
@@ -110,6 +120,164 @@ void releaseUnknown(void*& object) {
 }
 #endif
 
+struct GameVideoDecoder {
+    AVFormatContext* format = nullptr;
+    AVCodecContext* codec = nullptr;
+    AVFrame* decoded = nullptr;
+    AVPacket* packet = nullptr;
+    SwsContext* sws = nullptr;
+    int videoStream = -1;
+    AVRational timeBase{1, 1};
+    int64_t startPts = 0;
+    bool hasStartPts = false;
+    bool inputEof = false;
+    bool sentFlush = false;
+};
+
+std::string ffmpegError(int code) {
+    char text[AV_ERROR_MAX_STRING_SIZE]{};
+    av_strerror(code, text, sizeof(text));
+    return text[0] ? std::string(text) : ("FFmpeg error " + std::to_string(code));
+}
+
+void closeGameVideoDecoder(GameVideoDecoder*& decoder) {
+    if (!decoder) return;
+    if (decoder->sws) sws_freeContext(decoder->sws);
+    if (decoder->packet) av_packet_free(&decoder->packet);
+    if (decoder->decoded) av_frame_free(&decoder->decoded);
+    if (decoder->codec) avcodec_free_context(&decoder->codec);
+    if (decoder->format) avformat_close_input(&decoder->format);
+    delete decoder;
+    decoder = nullptr;
+}
+
+bool decodeNextGameVideoFrame(GameVideoDecoder* decoder, StorylandVideoFrame& output,
+                              double& positionSeconds, std::string& error) {
+    if (!decoder || !decoder->format || !decoder->codec || !decoder->decoded || !decoder->packet) {
+        error = "Game video decoder is not initialized.";
+        return false;
+    }
+
+    for (;;) {
+        int receiveResult = avcodec_receive_frame(decoder->codec, decoder->decoded);
+        if (receiveResult == 0) {
+            const int width = decoder->decoded->width;
+            const int height = decoder->decoded->height;
+            if (width <= 0 || height <= 0 || width > 8192 || height > 8192) {
+                error = "Decoded game video frame has invalid dimensions.";
+                return false;
+            }
+
+            decoder->sws = sws_getCachedContext(
+                decoder->sws, width, height, static_cast<AVPixelFormat>(decoder->decoded->format),
+                width, height, AV_PIX_FMT_BGRA, SWS_BILINEAR, nullptr, nullptr, nullptr);
+            if (!decoder->sws) {
+                error = "Could not create the game video color converter.";
+                return false;
+            }
+
+            const uint64_t bytes64 = uint64_t(width) * uint64_t(height) * 4ull;
+            if (bytes64 > uint64_t(std::numeric_limits<size_t>::max())) {
+                error = "Decoded game video frame is too large.";
+                return false;
+            }
+            output.width = uint32_t(width);
+            output.height = uint32_t(height);
+            output.bgra.resize(size_t(bytes64));
+            uint8_t* destinations[4] = {output.bgra.data(), nullptr, nullptr, nullptr};
+            int destinationStrides[4] = {width * 4, 0, 0, 0};
+            const int scaled = sws_scale(decoder->sws, decoder->decoded->data, decoder->decoded->linesize,
+                                         0, height, destinations, destinationStrides);
+            if (scaled != height) {
+                error = "Could not convert the decoded game video frame to BGRA.";
+                return false;
+            }
+
+            int64_t pts = decoder->decoded->best_effort_timestamp;
+            if (pts == AV_NOPTS_VALUE) pts = decoder->decoded->pts;
+            double seconds = positionSeconds;
+            if (pts != AV_NOPTS_VALUE) {
+                if (decoder->hasStartPts) pts -= decoder->startPts;
+                seconds = double(pts) * av_q2d(decoder->timeBase);
+                if (!std::isfinite(seconds) || seconds < 0.0) seconds = 0.0;
+            }
+            positionSeconds = seconds;
+            output.timestamp100ns = int64_t(std::llround(seconds * 10000000.0));
+            av_frame_unref(decoder->decoded);
+            error.clear();
+            return true;
+        }
+
+        if (receiveResult != AVERROR(EAGAIN) && receiveResult != AVERROR_EOF) {
+            error = "Game video frame decode failed: " + ffmpegError(receiveResult);
+            return false;
+        }
+        if (receiveResult == AVERROR_EOF) {
+            error.clear();
+            return false;
+        }
+
+        for (;;) {
+            if (decoder->inputEof) {
+                if (!decoder->sentFlush) {
+                    const int sendResult = avcodec_send_packet(decoder->codec, nullptr);
+                    decoder->sentFlush = true;
+                    if (sendResult < 0 && sendResult != AVERROR_EOF) {
+                        error = "Could not flush the game video decoder: " + ffmpegError(sendResult);
+                        return false;
+                    }
+                    break;
+                }
+                error.clear();
+                return false;
+            }
+
+            av_packet_unref(decoder->packet);
+            const int readResult = av_read_frame(decoder->format, decoder->packet);
+            if (readResult == AVERROR_EOF) {
+                decoder->inputEof = true;
+                continue;
+            }
+            if (readResult < 0) {
+                error = "Could not read the next game video packet: " + ffmpegError(readResult);
+                return false;
+            }
+            if (decoder->packet->stream_index != decoder->videoStream) continue;
+
+            const int sendResult = avcodec_send_packet(decoder->codec, decoder->packet);
+            av_packet_unref(decoder->packet);
+            if (sendResult == AVERROR(EAGAIN)) break;
+            if (sendResult < 0) {
+                error = "Could not submit a game video packet to the decoder: " + ffmpegError(sendResult);
+                return false;
+            }
+            break;
+        }
+    }
+}
+
+bool seekGameVideo(GameVideoDecoder* decoder, double targetSeconds, std::string& error) {
+    if (!decoder || !decoder->format || decoder->videoStream < 0) {
+        error = "Game video decoder is not initialized.";
+        return false;
+    }
+    targetSeconds = std::max(0.0, targetSeconds);
+    int64_t targetPts = int64_t(std::llround(targetSeconds / av_q2d(decoder->timeBase)));
+    if (decoder->hasStartPts) targetPts += decoder->startPts;
+    const int result = av_seek_frame(decoder->format, decoder->videoStream, targetPts, AVSEEK_FLAG_BACKWARD);
+    if (result < 0) {
+        error = "Game video seek failed: " + ffmpegError(result);
+        return false;
+    }
+    avcodec_flush_buffers(decoder->codec);
+    decoder->inputEof = false;
+    decoder->sentFlush = false;
+    av_packet_unref(decoder->packet);
+    av_frame_unref(decoder->decoded);
+    error.clear();
+    return true;
+}
+
 } // namespace
 
 StorylandMediaFile::StorylandMediaFile() = default;
@@ -127,6 +295,12 @@ uint32_t StorylandMediaFile::videoWidth() const { return decodedVideoWidth; }
 uint32_t StorylandMediaFile::videoHeight() const { return decodedVideoHeight; }
 double StorylandMediaFile::videoDurationSeconds() const { return decodedVideoDuration; }
 double StorylandMediaFile::videoPositionSeconds() const { return decodedVideoPosition; }
+double StorylandMediaFile::videoFrameRate() const { return decodedVideoFrameRate; }
+uint64_t StorylandMediaFile::videoFrameIndex() const {
+    if (!std::isfinite(decodedVideoPosition) || !std::isfinite(decodedVideoFrameRate) ||
+        decodedVideoPosition <= 0.0 || decodedVideoFrameRate <= 0.0) return 0u;
+    return uint64_t(std::llround(decodedVideoPosition * decodedVideoFrameRate));
+}
 bool StorylandMediaFile::videoDecoderReady() const { return videoReady; }
 bool StorylandMediaFile::isPlaying() const { return audioPlaying || videoPlaying; }
 
@@ -154,8 +328,21 @@ bool StorylandMediaFile::loadFromFile(const std::wstring& filePath, std::string&
     bool ok = false;
     if (ext == L".sdt") ok = loadSdt(filePath, errorMessage);
     else if (ext == L".raw" || ext == L".vag") ok = loadRaw(filePath, errorMessage);
-    else if (ext == L".wav") ok = loadWav(filePath, errorMessage);
-    else if (ext == L".pss" || ext == L".mpg" || ext == L".mpeg" || ext == L".mp4" ||
+    else if (ext == L".vb") ok = loadVb(filePath, errorMessage);
+    else if (ext == L".wav") {
+        ok = loadWav(filePath, errorMessage);
+        if (!ok) {
+            const std::string wavError = errorMessage;
+            ok = loadCompressedAudio(filePath, errorMessage);
+            if (!ok) errorMessage = wavError + " FFmpeg: " + errorMessage;
+        }
+    }
+    else if (ext == L".at3" || ext == L".aa3" || ext == L".oma" ||
+             ext == L".mp3" || ext == L".ogg" || ext == L".flac" ||
+             ext == L".aac" || ext == L".m4a" || ext == L".wma" ||
+             ext == L".ac3" || ext == L".aif" || ext == L".aiff" ||
+             ext == L".adx") ok = loadCompressedAudio(filePath, errorMessage);
+    else if (ext == L".pss" || ext == L".pmf" || ext == L".mpg" || ext == L".mpeg" || ext == L".mp4" ||
              ext == L".m4v" || ext == L".wmv" || ext == L".avi" || ext == L".mov" || ext == L".mkv" ||
              ext == L".ts" || ext == L".m2ts" || ext == L".mts" || ext == L".vob" ||
              ext == L".3gp" || ext == L".3g2" || ext == L".webm" || ext == L".ogv" || ext == L".flv") {
@@ -238,6 +425,132 @@ bool StorylandMediaFile::decodeVag(const std::vector<uint8_t>& bytes, size_t off
     clip.durationSeconds = clip.pcm.empty() ? 0.0 : double(clip.pcm.size()) / double(sampleRate);
     const std::string headerName = printableName(base + 0x20u, 16u);
     if (!headerName.empty()) clip.name = headerName;
+    errorMessage.clear();
+    return true;
+}
+
+bool StorylandMediaFile::loadVb(const std::wstring& filePath, std::string& errorMessage) {
+    std::vector<uint8_t> bytes;
+    if (!readFileBounded(filePath, bytes, errorMessage)) return false;
+
+    static constexpr uint32_t sampleRate = 32000u;
+    static constexpr size_t interleaveBytes = 0x2000u;
+    static constexpr size_t adpcmBlockBytes = 16u;
+    static constexpr size_t samplesPerBlock = 28u;
+    static constexpr int coefficients[5][2] = {
+        {0, 0}, {60, 0}, {115, -52}, {98, -55}, {122, -60}
+    };
+
+    if (bytes.empty() || (bytes.size() % adpcmBlockBytes) != 0u) {
+        errorMessage = "VB stream size is not aligned to 16-byte PS2 ADPCM blocks.";
+        return false;
+    }
+    if (bytes.size() < interleaveBytes * 2u) {
+        errorMessage = "VB stream is too small to contain one stereo interleave pair.";
+        return false;
+    }
+
+    const size_t blockCount = bytes.size() / adpcmBlockBytes;
+    for (size_t block = 0; block < blockCount; ++block) {
+        const uint8_t control = bytes[block * adpcmBlockBytes];
+        const uint8_t predictor = control >> 4u;
+        const uint8_t shift = control & 0x0Fu;
+        if (predictor > 4u || shift > 12u) {
+            std::ostringstream message;
+            message << "VB stream is not valid raw PS2 ADPCM: invalid block at 0x"
+                    << std::hex << (block * adpcmBlockBytes) << ".";
+            errorMessage = message.str();
+            return false;
+        }
+    }
+
+    const uint64_t decodedSamplesPerChannel =
+        (uint64_t(bytes.size()) / uint64_t(adpcmBlockBytes) / 2ull) * uint64_t(samplesPerBlock);
+    const uint64_t interleavedSampleCount = decodedSamplesPerChannel * 2ull;
+    if (interleavedSampleCount > uint64_t(kMaxDecodedPcmSamples)) {
+        errorMessage = "VB stream would decode to too many PCM samples.";
+        return false;
+    }
+
+    StorylandMediaClip clip;
+    clip.name = std::filesystem::path(filePath).stem().string();
+    clip.sourceOffset = 0u;
+    clip.sourceSize = bytes.size();
+    clip.sampleRate = sampleRate;
+    clip.channels = 2u;
+    clip.pcm.reserve(size_t(interleavedSampleCount));
+
+    std::array<int, 2> hist1{0, 0};
+    std::array<int, 2> hist2{0, 0};
+    std::array<std::vector<int16_t>, 2> channelChunk;
+    const size_t blocksPerInterleave = interleaveBytes / adpcmBlockBytes;
+    for (auto& channel : channelChunk) channel.reserve(blocksPerInterleave * samplesPerBlock);
+
+    auto decodeChannelChunk = [&](size_t byteOffset, size_t byteCount, int channelIndex) -> bool {
+        channelChunk[size_t(channelIndex)].clear();
+        const size_t chunkBlocks = byteCount / adpcmBlockBytes;
+        for (size_t block = 0; block < chunkBlocks; ++block) {
+            const uint8_t* packet = bytes.data() + byteOffset + block * adpcmBlockBytes;
+            const uint8_t predictor = packet[0] >> 4u;
+            const uint8_t shift = packet[0] & 0x0Fu;
+            for (size_t i = 0; i < samplesPerBlock; ++i) {
+                const uint8_t packed = packet[2u + i / 2u];
+                int nibble = (i & 1u) == 0u ? int(packed & 0x0Fu) : int(packed >> 4u);
+                if (nibble >= 8) nibble -= 16;
+                int sample = (nibble << 12) >> shift;
+                sample += (hist1[size_t(channelIndex)] * coefficients[predictor][0] +
+                           hist2[size_t(channelIndex)] * coefficients[predictor][1] + 32) >> 6;
+                const int16_t pcm = clampPcm(sample);
+                hist2[size_t(channelIndex)] = hist1[size_t(channelIndex)];
+                hist1[size_t(channelIndex)] = pcm;
+                channelChunk[size_t(channelIndex)].push_back(pcm);
+            }
+        }
+        return true;
+    };
+
+    size_t offset = 0u;
+    while (offset < bytes.size()) {
+        const size_t leftBytes = std::min(interleaveBytes, bytes.size() - offset);
+        if ((leftBytes % adpcmBlockBytes) != 0u) {
+            errorMessage = "VB left-channel interleave is truncated.";
+            return false;
+        }
+        if (!decodeChannelChunk(offset, leftBytes, 0)) return false;
+        offset += leftBytes;
+
+        if (offset >= bytes.size()) {
+            errorMessage = "VB stream ends after a left-channel interleave without matching right-channel data.";
+            return false;
+        }
+        const size_t rightBytes = std::min(interleaveBytes, bytes.size() - offset);
+        if ((rightBytes % adpcmBlockBytes) != 0u) {
+            errorMessage = "VB right-channel interleave is truncated.";
+            return false;
+        }
+        if (!decodeChannelChunk(offset, rightBytes, 1)) return false;
+        offset += rightBytes;
+
+        if (channelChunk[0].size() != channelChunk[1].size()) {
+            errorMessage = "VB stereo interleave channels contain different sample counts.";
+            return false;
+        }
+        for (size_t i = 0; i < channelChunk[0].size(); ++i) {
+            clip.pcm.push_back(channelChunk[0][i]);
+            clip.pcm.push_back(channelChunk[1][i]);
+        }
+    }
+
+    if (clip.pcm.empty()) {
+        errorMessage = "VB stream decoded to no PCM samples.";
+        return false;
+    }
+
+    clip.durationSeconds = double(clip.pcm.size() / 2u) / double(sampleRate);
+    audioClips.clear();
+    audioClips.push_back(std::move(clip));
+    selectedAudioClip = 0;
+    mediaKind = StorylandMediaKind::Audio;
     errorMessage.clear();
     return true;
 }
@@ -432,6 +745,262 @@ bool StorylandMediaFile::loadWav(const std::wstring& filePath, std::string& erro
     return true;
 }
 
+
+static bool appendAudioFrameS16(const AVFrame* frame, std::vector<int16_t>& output, std::string& error) {
+    if (!frame) {
+        error = "FFmpeg returned an empty audio frame.";
+        return false;
+    }
+    const int channels = frame->ch_layout.nb_channels;
+    const int samples = frame->nb_samples;
+    if (channels <= 0 || channels > 32 || samples < 0) {
+        error = "Decoded audio frame has invalid channel/sample counts.";
+        return false;
+    }
+    if (samples == 0) return true;
+
+    const AVSampleFormat format = static_cast<AVSampleFormat>(frame->format);
+    const bool planar = av_sample_fmt_is_planar(format) != 0;
+    const AVSampleFormat packed = planar ? av_get_packed_sample_fmt(format) : format;
+    if (packed == AV_SAMPLE_FMT_NONE) {
+        error = "Decoded audio uses an unsupported FFmpeg sample format.";
+        return false;
+    }
+
+    const uint64_t additions = uint64_t(samples) * uint64_t(channels);
+    if (additions > kMaxDecodedPcmSamples || output.size() > kMaxDecodedPcmSamples - size_t(additions)) {
+        error = "Decoded audio would exceed Storyland's PCM safety limit.";
+        return false;
+    }
+    output.reserve(output.size() + size_t(additions));
+
+    auto sampleToS16 = [&](const uint8_t* data, int index) -> int16_t {
+        switch (packed) {
+        case AV_SAMPLE_FMT_U8: {
+            const int value = int(reinterpret_cast<const uint8_t*>(data)[index]) - 128;
+            return int16_t(value << 8);
+        }
+        case AV_SAMPLE_FMT_S16:
+            return reinterpret_cast<const int16_t*>(data)[index];
+        case AV_SAMPLE_FMT_S32: {
+            const int32_t value = reinterpret_cast<const int32_t*>(data)[index];
+            return int16_t(value >> 16);
+        }
+        case AV_SAMPLE_FMT_S64: {
+            const int64_t value = reinterpret_cast<const int64_t*>(data)[index];
+            return int16_t(value >> 48);
+        }
+        case AV_SAMPLE_FMT_FLT: {
+            float value = reinterpret_cast<const float*>(data)[index];
+            if (!std::isfinite(value)) value = 0.0f;
+            value = std::max(-1.0f, std::min(1.0f, value));
+            return clampPcm(int(std::lrint(double(value) * 32767.0)));
+        }
+        case AV_SAMPLE_FMT_DBL: {
+            double value = reinterpret_cast<const double*>(data)[index];
+            if (!std::isfinite(value)) value = 0.0;
+            value = std::max(-1.0, std::min(1.0, value));
+            return clampPcm(int(std::lrint(value * 32767.0)));
+        }
+        default:
+            return 0;
+        }
+    };
+
+    switch (packed) {
+    case AV_SAMPLE_FMT_U8:
+    case AV_SAMPLE_FMT_S16:
+    case AV_SAMPLE_FMT_S32:
+    case AV_SAMPLE_FMT_S64:
+    case AV_SAMPLE_FMT_FLT:
+    case AV_SAMPLE_FMT_DBL:
+        break;
+    default:
+        error = "Decoded audio sample format is not supported by Storyland.";
+        return false;
+    }
+
+    for (int sample = 0; sample < samples; ++sample) {
+        for (int channel = 0; channel < channels; ++channel) {
+            if (planar) {
+                if (!frame->extended_data || !frame->extended_data[channel]) {
+                    error = "Decoded planar audio frame is missing a channel plane.";
+                    return false;
+                }
+                output.push_back(sampleToS16(frame->extended_data[channel], sample));
+            } else {
+                if (!frame->extended_data || !frame->extended_data[0]) {
+                    error = "Decoded packed audio frame has no sample data.";
+                    return false;
+                }
+                output.push_back(sampleToS16(frame->extended_data[0], sample * channels + channel));
+            }
+        }
+    }
+    return true;
+}
+
+bool StorylandMediaFile::loadCompressedAudio(const std::wstring& filePath, std::string& errorMessage) {
+    AVFormatContext* format = nullptr;
+    AVCodecContext* codec = nullptr;
+    AVPacket* packet = nullptr;
+    AVFrame* decoded = nullptr;
+
+    auto cleanup = [&]() {
+        if (packet) av_packet_free(&packet);
+        if (decoded) av_frame_free(&decoded);
+        if (codec) avcodec_free_context(&codec);
+        if (format) avformat_close_input(&format);
+    };
+
+    const std::string utf8Path = std::filesystem::path(filePath).u8string();
+    int result = avformat_open_input(&format, utf8Path.c_str(), nullptr, nullptr);
+    if (result < 0) {
+        errorMessage = "FFmpeg could not open this audio file: " + ffmpegError(result);
+        cleanup();
+        return false;
+    }
+    result = avformat_find_stream_info(format, nullptr);
+    if (result < 0) {
+        errorMessage = "FFmpeg could not read the audio stream information: " + ffmpegError(result);
+        cleanup();
+        return false;
+    }
+
+    const int streamIndex = av_find_best_stream(format, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+    if (streamIndex < 0) {
+        errorMessage = "No decodable audio stream was found in this file.";
+        cleanup();
+        return false;
+    }
+    AVStream* stream = format->streams[streamIndex];
+    const AVCodec* decoder = avcodec_find_decoder(stream->codecpar->codec_id);
+    if (!decoder) {
+        errorMessage = "FFmpeg has no decoder for this audio codec.";
+        cleanup();
+        return false;
+    }
+
+    codec = avcodec_alloc_context3(decoder);
+    if (!codec) {
+        errorMessage = "Could not allocate the FFmpeg audio decoder.";
+        cleanup();
+        return false;
+    }
+    result = avcodec_parameters_to_context(codec, stream->codecpar);
+    if (result < 0 || (result = avcodec_open2(codec, decoder, nullptr)) < 0) {
+        errorMessage = "Could not initialize the FFmpeg audio decoder: " + ffmpegError(result);
+        cleanup();
+        return false;
+    }
+
+    packet = av_packet_alloc();
+    decoded = av_frame_alloc();
+    if (!packet || !decoded) {
+        errorMessage = "Could not allocate FFmpeg audio decode buffers.";
+        cleanup();
+        return false;
+    }
+
+    StorylandMediaClip clip;
+    clip.name = std::filesystem::path(filePath).stem().u8string();
+    clip.sourceOffset = 0;
+    std::error_code sizeError;
+    clip.sourceSize = std::filesystem::file_size(std::filesystem::path(filePath), sizeError);
+    if (sizeError) clip.sourceSize = 0;
+
+    uint32_t sampleRate = 0;
+    uint16_t channels = 0;
+    bool sentFlush = false;
+    bool inputEof = false;
+
+    for (;;) {
+        result = avcodec_receive_frame(codec, decoded);
+        if (result == 0) {
+            const int frameChannels = decoded->ch_layout.nb_channels;
+            const int frameRate = decoded->sample_rate > 0 ? decoded->sample_rate : codec->sample_rate;
+            if (frameRate <= 0 || frameRate > 384000 || frameChannels <= 0 || frameChannels > 32) {
+                errorMessage = "Decoded audio frame reports invalid sample-rate/channel metadata.";
+                cleanup();
+                return false;
+            }
+            if (sampleRate == 0) {
+                sampleRate = uint32_t(frameRate);
+                channels = uint16_t(frameChannels);
+            } else if (sampleRate != uint32_t(frameRate) || channels != uint16_t(frameChannels)) {
+                errorMessage = "Audio stream changes sample rate or channel count mid-stream, which Storyland cannot play safely.";
+                cleanup();
+                return false;
+            }
+            if (!appendAudioFrameS16(decoded, clip.pcm, errorMessage)) {
+                cleanup();
+                return false;
+            }
+            av_frame_unref(decoded);
+            continue;
+        }
+        if (result == AVERROR_EOF) break;
+        if (result != AVERROR(EAGAIN)) {
+            errorMessage = "Audio decode failed: " + ffmpegError(result);
+            cleanup();
+            return false;
+        }
+
+        if (inputEof) {
+            if (!sentFlush) {
+                result = avcodec_send_packet(codec, nullptr);
+                sentFlush = true;
+                if (result < 0 && result != AVERROR_EOF) {
+                    errorMessage = "Could not flush the audio decoder: " + ffmpegError(result);
+                    cleanup();
+                    return false;
+                }
+                continue;
+            }
+            break;
+        }
+
+        av_packet_unref(packet);
+        result = av_read_frame(format, packet);
+        if (result == AVERROR_EOF) {
+            inputEof = true;
+            continue;
+        }
+        if (result < 0) {
+            errorMessage = "Could not read the next audio packet: " + ffmpegError(result);
+            cleanup();
+            return false;
+        }
+        if (packet->stream_index != streamIndex) {
+            av_packet_unref(packet);
+            continue;
+        }
+        result = avcodec_send_packet(codec, packet);
+        av_packet_unref(packet);
+        if (result < 0 && result != AVERROR(EAGAIN)) {
+            errorMessage = "Could not submit an audio packet to the decoder: " + ffmpegError(result);
+            cleanup();
+            return false;
+        }
+    }
+
+    cleanup();
+    if (clip.pcm.empty() || sampleRate == 0 || channels == 0) {
+        errorMessage = "The audio stream decoded to no PCM samples.";
+        return false;
+    }
+
+    clip.sampleRate = sampleRate;
+    clip.channels = channels;
+    clip.durationSeconds = double(clip.pcm.size()) / (double(sampleRate) * double(channels));
+    audioClips.clear();
+    audioClips.push_back(std::move(clip));
+    selectedAudioClip = 0;
+    mediaKind = StorylandMediaKind::Audio;
+    errorMessage.clear();
+    return true;
+}
+
 bool StorylandMediaFile::selectClip(size_t index, std::string& errorMessage) {
     if (index >= audioClips.size()) {
         errorMessage = "Audio selection is out of range.";
@@ -527,20 +1096,24 @@ bool StorylandMediaFile::play(std::string& errorMessage) {
             return false;
         }
 #ifdef _WIN32
-        if (!sourceReader) {
+        if (!sourceReader && !gameVideoDecoder) {
             errorMessage = "Video decoder is not ready.";
             return false;
         }
         if (decodedVideoDuration > 0.0 && decodedVideoPosition >= decodedVideoDuration - 0.05) {
-            PROPVARIANT position;
-            PropVariantInit(&position);
-            position.vt = VT_I8;
-            position.hVal.QuadPart = 0;
-            const HRESULT seekResult = reinterpret_cast<IMFSourceReader*>(sourceReader)->SetCurrentPosition(GUID_NULL, position);
-            PropVariantClear(&position);
-            if (FAILED(seekResult)) {
-                errorMessage = "Video could not be rewound (" + hresultText(seekResult) + ").";
-                return false;
+            if (gameVideoDecoder) {
+                if (!seekGameVideo(reinterpret_cast<GameVideoDecoder*>(gameVideoDecoder), 0.0, errorMessage)) return false;
+            } else {
+                PROPVARIANT position;
+                PropVariantInit(&position);
+                position.vt = VT_I8;
+                position.hVal.QuadPart = 0;
+                const HRESULT seekResult = reinterpret_cast<IMFSourceReader*>(sourceReader)->SetCurrentPosition(GUID_NULL, position);
+                PropVariantClear(&position);
+                if (FAILED(seekResult)) {
+                    errorMessage = "Video could not be rewound (" + hresultText(seekResult) + ").";
+                    return false;
+                }
             }
             decodedVideoPosition = 0.0;
             frame = {};
@@ -561,7 +1134,158 @@ void StorylandMediaFile::stop() {
 }
 
 #ifdef _WIN32
-static bool makePssDecodeAlias(const std::wstring& sourcePath, std::wstring& aliasPath, std::string& error) {
+static bool extractPmfAvcElementaryStream(const std::wstring& sourcePath,
+                                          const std::filesystem::path& outputPath,
+                                          std::string& error) {
+    std::ifstream input(std::filesystem::path(sourcePath), std::ios::binary);
+    if (!input) {
+        error = "Could not open PMF for AVC extraction.";
+        return false;
+    }
+
+    input.seekg(0, std::ios::end);
+    const std::streamoff fileSizeSigned = input.tellg();
+    if (fileSizeSigned < 0x20) {
+        error = "PMF is truncated.";
+        return false;
+    }
+    const uint64_t fileSize = uint64_t(fileSizeSigned);
+    input.seekg(0, std::ios::beg);
+
+    std::array<uint8_t, 16> header{};
+    input.read(reinterpret_cast<char*>(header.data()), std::streamsize(header.size()));
+    if (size_t(input.gcount()) != header.size() || std::memcmp(header.data(), "PSMF", 4u) != 0) {
+        error = "PMF does not contain a valid PSMF header.";
+        return false;
+    }
+
+    const uint32_t streamOffset = readBe32(header.data() + 8u);
+    if (streamOffset < 0x20u || uint64_t(streamOffset) >= fileSize) {
+        error = "PMF MPEG stream offset is invalid.";
+        return false;
+    }
+
+    input.seekg(std::streamoff(streamOffset), std::ios::beg);
+    std::vector<uint8_t> programStream(size_t(fileSize - uint64_t(streamOffset)));
+    if (!programStream.empty()) {
+        input.read(reinterpret_cast<char*>(programStream.data()), std::streamsize(programStream.size()));
+        if (size_t(input.gcount()) != programStream.size()) {
+            error = "PMF MPEG program stream is truncated.";
+            return false;
+        }
+    }
+
+    std::ofstream output(outputPath, std::ios::binary | std::ios::trunc);
+    if (!output) {
+        error = "Could not create the temporary AVC stream for PMF playback.";
+        return false;
+    }
+
+    size_t pos = 0;
+    uint64_t written = 0;
+    bool foundVideoPacket = false;
+
+    auto findStartCode = [&](size_t from) -> size_t {
+        for (size_t i = from; i + 3u < programStream.size(); ++i) {
+            if (programStream[i] == 0x00u && programStream[i + 1u] == 0x00u && programStream[i + 2u] == 0x01u)
+                return i;
+        }
+        return programStream.size();
+    };
+
+    while (pos + 6u <= programStream.size()) {
+        const size_t packet = findStartCode(pos);
+        if (packet + 6u > programStream.size()) break;
+
+        const uint8_t streamId = programStream[packet + 3u];
+
+        if (streamId == 0xBAu) {
+            if (packet + 14u > programStream.size()) break;
+            const size_t stuffing = size_t(programStream[packet + 13u] & 0x07u);
+            pos = std::min(programStream.size(), packet + 14u + stuffing);
+            continue;
+        }
+
+        if (streamId == 0xB9u) {
+            pos = packet + 4u;
+            continue;
+        }
+
+        const uint16_t packetLength = uint16_t(programStream[packet + 4u] << 8u) |
+                                      uint16_t(programStream[packet + 5u]);
+        size_t packetEnd = 0;
+        if (packetLength != 0u) {
+            packetEnd = packet + 6u + size_t(packetLength);
+            if (packetEnd > programStream.size()) packetEnd = programStream.size();
+        } else {
+            packetEnd = findStartCode(packet + 6u);
+            if (packetEnd <= packet + 6u) packetEnd = programStream.size();
+        }
+
+        if (streamId >= 0xE0u && streamId <= 0xEFu) {
+            foundVideoPacket = true;
+            size_t payload = packet + 6u;
+            if (payload + 3u <= packetEnd) {
+                const uint8_t markerBits = programStream[payload] & 0xC0u;
+                if (markerBits == 0x80u) {
+                    const size_t pesHeaderDataLength = size_t(programStream[payload + 2u]);
+                    const size_t candidate = payload + 3u + pesHeaderDataLength;
+                    if (candidate <= packetEnd) payload = candidate;
+                    else payload = packetEnd;
+                } else {
+                    while (payload < packetEnd && programStream[payload] == 0xFFu) ++payload;
+                    if (payload + 2u <= packetEnd && (programStream[payload] & 0xC0u) == 0x40u) payload += 2u;
+                    if (payload < packetEnd) {
+                        if ((programStream[payload] & 0xF0u) == 0x20u) payload += std::min<size_t>(5u, packetEnd - payload);
+                        else if ((programStream[payload] & 0xF0u) == 0x30u) payload += std::min<size_t>(10u, packetEnd - payload);
+                        else if (programStream[payload] == 0x0Fu) ++payload;
+                    }
+                }
+            }
+
+            if (payload < packetEnd) {
+                const size_t bytes = packetEnd - payload;
+                output.write(reinterpret_cast<const char*>(programStream.data() + payload), std::streamsize(bytes));
+                if (!output) {
+                    error = "Could not write the temporary AVC stream for PMF playback.";
+                    return false;
+                }
+                written += uint64_t(bytes);
+            }
+        }
+
+        pos = packetEnd > packet ? packetEnd : packet + 4u;
+    }
+
+    output.close();
+    if (!foundVideoPacket || written < 16u) {
+        error = "PMF does not contain a usable AVC video stream.";
+        return false;
+    }
+
+    std::ifstream verify(outputPath, std::ios::binary);
+    std::array<uint8_t, 4096> probe{};
+    verify.read(reinterpret_cast<char*>(probe.data()), std::streamsize(probe.size()));
+    const size_t probeSize = size_t(std::max<std::streamsize>(0, verify.gcount()));
+    bool hasAnnexB = false;
+    for (size_t i = 0; i + 4u <= probeSize; ++i) {
+        if (probe[i] == 0x00u && probe[i + 1u] == 0x00u &&
+            ((probe[i + 2u] == 0x01u) ||
+             (i + 4u <= probeSize && probe[i + 2u] == 0x00u && probe[i + 3u] == 0x01u))) {
+            hasAnnexB = true;
+            break;
+        }
+    }
+    if (!hasAnnexB) {
+        error = "PMF video packets were found, but the AVC payload is not Annex-B H.264.";
+        return false;
+    }
+
+    return true;
+}
+
+static bool makeMpegDecodeAlias(const std::wstring& sourcePath, const std::wstring& extension,
+                                std::wstring& aliasPath, std::string& error) {
     wchar_t tempDirectory[MAX_PATH]{};
     const DWORD length = GetTempPathW(MAX_PATH, tempDirectory);
     if (length == 0 || length >= MAX_PATH) {
@@ -582,21 +1306,32 @@ static bool makePssDecodeAlias(const std::wstring& sourcePath, std::wstring& ali
         created = std::filesystem::create_directory(privateDirectory, ec);
         if (created) break;
         if (ec && ec != std::errc::file_exists) {
-            error = "Could not create a private temporary directory for PSS playback.";
+            error = "Could not create a private temporary directory for video playback.";
             return false;
         }
     }
     if (!created) {
-        error = "Could not allocate a private temporary directory for PSS playback.";
+        error = "Could not allocate a private temporary directory for video playback.";
         return false;
     }
 
-    const std::filesystem::path alias = privateDirectory / L"stream.mpg";
-    if (!CopyFileW(sourcePath.c_str(), alias.c_str(), TRUE)) {
+    const std::filesystem::path alias = privateDirectory /
+        (extension == L".pmf" ? L"stream.h264" : L"stream.mpg");
+
+    bool ok = false;
+    if (extension == L".pmf") {
+        ok = extractPmfAvcElementaryStream(sourcePath, alias, error);
+    } else {
+        ok = CopyFileW(sourcePath.c_str(), alias.c_str(), TRUE) != FALSE;
+        if (!ok) error = "Could not create the temporary MPEG alias for video playback.";
+    }
+
+    if (!ok) {
+        std::filesystem::remove(alias, ec);
         std::filesystem::remove(privateDirectory, ec);
-        error = "Could not create the temporary MPEG alias for PSS playback.";
         return false;
     }
+
     aliasPath = alias.wstring();
     return true;
 }
@@ -611,9 +1346,109 @@ bool StorylandMediaFile::loadVideo(const std::wstring& filePath, std::string& er
         return false;
     }
 
+    const std::wstring extension = lowerExtension(filePath);
+    if (extension == L".pmf" || extension == L".pss") {
+        AVFormatContext* format = nullptr;
+        const std::string utf8Path = std::filesystem::path(filePath).u8string();
+        int ff = avformat_open_input(&format, utf8Path.c_str(), nullptr, nullptr);
+        if (ff < 0 || !format) {
+            if (format) avformat_close_input(&format);
+            errorMessage = "FFmpeg could not open this game video: " + ffmpegError(ff);
+            return false;
+        }
+        ff = avformat_find_stream_info(format, nullptr);
+        if (ff < 0) {
+            avformat_close_input(&format);
+            errorMessage = "FFmpeg could not read the game video stream table: " + ffmpegError(ff);
+            return false;
+        }
+        const int streamIndex = av_find_best_stream(format, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+        if (streamIndex < 0) {
+            avformat_close_input(&format);
+            errorMessage = "This game video does not contain a decodable video stream.";
+            return false;
+        }
+        AVStream* stream = format->streams[streamIndex];
+        const AVCodec* codecDefinition = avcodec_find_decoder(stream->codecpar->codec_id);
+        if (!codecDefinition) {
+            avformat_close_input(&format);
+            errorMessage = "No FFmpeg decoder is available for this game video codec.";
+            return false;
+        }
+        AVCodecContext* codec = avcodec_alloc_context3(codecDefinition);
+        if (!codec) {
+            avformat_close_input(&format);
+            errorMessage = "Could not allocate the game video decoder.";
+            return false;
+        }
+        ff = avcodec_parameters_to_context(codec, stream->codecpar);
+        if (ff >= 0) ff = avcodec_open2(codec, codecDefinition, nullptr);
+        if (ff < 0) {
+            avcodec_free_context(&codec);
+            avformat_close_input(&format);
+            errorMessage = "Could not initialize the game video codec: " + ffmpegError(ff);
+            return false;
+        }
+
+        GameVideoDecoder* decoder = new (std::nothrow) GameVideoDecoder();
+        if (!decoder) {
+            avcodec_free_context(&codec);
+            avformat_close_input(&format);
+            errorMessage = "Could not allocate the game video decoder state.";
+            return false;
+        }
+        decoder->format = format;
+        decoder->codec = codec;
+        decoder->decoded = av_frame_alloc();
+        decoder->packet = av_packet_alloc();
+        decoder->videoStream = streamIndex;
+        decoder->timeBase = stream->time_base;
+        decoder->hasStartPts = stream->start_time != AV_NOPTS_VALUE;
+        decoder->startPts = decoder->hasStartPts ? stream->start_time : 0;
+        if (!decoder->decoded || !decoder->packet || decoder->timeBase.num == 0 || decoder->timeBase.den == 0) {
+            closeGameVideoDecoder(decoder);
+            errorMessage = "Could not allocate FFmpeg frame/packet state for the game video.";
+            return false;
+        }
+
+        decodedVideoWidth = uint32_t(std::max(0, codec->width));
+        decodedVideoHeight = uint32_t(std::max(0, codec->height));
+        if (decodedVideoWidth == 0 || decodedVideoHeight == 0 || decodedVideoWidth > 8192u || decodedVideoHeight > 8192u) {
+            closeGameVideoDecoder(decoder);
+            errorMessage = "Game video frame dimensions are invalid or unsupported.";
+            return false;
+        }
+        AVRational rate = av_guess_frame_rate(format, stream, nullptr);
+        if (rate.num > 0 && rate.den > 0) decodedVideoFrameRate = av_q2d(rate);
+        if (!std::isfinite(decodedVideoFrameRate) || decodedVideoFrameRate < 1.0 || decodedVideoFrameRate > 240.0)
+            decodedVideoFrameRate = 30.0;
+        if (stream->duration != AV_NOPTS_VALUE)
+            decodedVideoDuration = double(stream->duration) * av_q2d(stream->time_base);
+        else if (format->duration != AV_NOPTS_VALUE)
+            decodedVideoDuration = double(format->duration) / double(AV_TIME_BASE);
+        else
+            decodedVideoDuration = 0.0;
+        decodedVideoStride = int32_t(decodedVideoWidth * 4u);
+        decodedVideoPosition = 0.0;
+        frame = {};
+        gameVideoDecoder = decoder;
+        mediaKind = StorylandMediaKind::Video;
+        videoReady = true;
+        videoPlaying = true;
+        nextVideoDecodeTickMs = 0;
+        if (!tickVideo(errorMessage)) {
+            closeVideoDecoder();
+            mediaKind = StorylandMediaKind::None;
+            return false;
+        }
+        videoPlaying = true;
+        errorMessage.clear();
+        return true;
+    }
+
     static bool mediaFoundationStarted = false;
     if (!mediaFoundationStarted) {
-        const HRESULT startup = MFStartup(MF_VERSION, MFSTARTUP_LITE);
+        const HRESULT startup = MFStartup(MF_VERSION, MFSTARTUP_FULL);
         if (FAILED(startup)) {
             errorMessage = "Windows Media Foundation startup failed (" + hresultText(startup) + ").";
             return false;
@@ -628,19 +1463,12 @@ bool StorylandMediaFile::loadVideo(const std::wstring& filePath, std::string& er
         return false;
     }
     readerAttributes->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
-    readerAttributes->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
 
+    readerAttributes->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
     std::wstring decoderPath = filePath;
     IMFSourceReader* reader = nullptr;
+
     hr = MFCreateSourceReaderFromURL(decoderPath.c_str(), readerAttributes, &reader);
-    if (FAILED(hr) && lowerExtension(filePath) == L".pss") {
-        if (!makePssDecodeAlias(filePath, videoDecodePath, errorMessage)) {
-            readerAttributes->Release();
-            return false;
-        }
-        decoderPath = videoDecodePath;
-        hr = MFCreateSourceReaderFromURL(decoderPath.c_str(), readerAttributes, &reader);
-    }
     readerAttributes->Release();
     if (FAILED(hr) || !reader) {
         errorMessage = "Windows Media Foundation could not open this video (" + hresultText(hr) + ").";
@@ -723,8 +1551,29 @@ bool StorylandMediaFile::loadVideo(const std::wstring& filePath, std::string& er
 
 bool StorylandMediaFile::tickVideo(std::string& errorMessage) {
 #ifdef _WIN32
-    if (mediaKind != StorylandMediaKind::Video || !videoReady || !sourceReader) return true;
+    if (mediaKind != StorylandMediaKind::Video || !videoReady) return true;
+    if (!sourceReader && !gameVideoDecoder) return true;
     if (!videoPlaying && !frame.bgra.empty()) return true;
+    if (gameVideoDecoder) {
+        const uint64_t nowMs = GetTickCount64();
+        if (!frame.bgra.empty() && nextVideoDecodeTickMs != 0u && nowMs < nextVideoDecodeTickMs) return true;
+        const bool gotFrame = decodeNextGameVideoFrame(reinterpret_cast<GameVideoDecoder*>(gameVideoDecoder),
+                                                       frame, decodedVideoPosition, errorMessage);
+        if (!gotFrame) {
+            if (errorMessage.empty()) {
+                videoPlaying = false;
+                return true;
+            }
+            return false;
+        }
+        decodedVideoWidth = frame.width;
+        decodedVideoHeight = frame.height;
+        decodedVideoStride = int32_t(decodedVideoWidth * 4u);
+        const double frameMilliseconds = 1000.0 / std::max(1.0, decodedVideoFrameRate);
+        nextVideoDecodeTickMs = nowMs + uint64_t(std::max(1.0, frameMilliseconds));
+        errorMessage.clear();
+        return true;
+    }
     const uint64_t nowMs = GetTickCount64();
     if (!frame.bgra.empty() && nextVideoDecodeTickMs != 0u && nowMs < nextVideoDecodeTickMs) return true;
     IMFSourceReader* reader = reinterpret_cast<IMFSourceReader*>(sourceReader);
@@ -789,9 +1638,165 @@ bool StorylandMediaFile::tickVideo(std::string& errorMessage) {
 #endif
 }
 
+bool StorylandMediaFile::stepVideoFrame(int direction, std::string& errorMessage) {
+#ifdef _WIN32
+    if (mediaKind != StorylandMediaKind::Video || !videoReady || (!sourceReader && !gameVideoDecoder)) {
+        errorMessage = "No decoded video is open.";
+        return false;
+    }
+    if (direction == 0) {
+        errorMessage.clear();
+        return true;
+    }
+
+    videoPlaying = false;
+    nextVideoDecodeTickMs = 0;
+
+    if (gameVideoDecoder) {
+        GameVideoDecoder* decoder = reinterpret_cast<GameVideoDecoder*>(gameVideoDecoder);
+        if (direction > 0) {
+            videoPlaying = true;
+            const bool ok = tickVideo(errorMessage);
+            videoPlaying = false;
+            nextVideoDecodeTickMs = 0;
+            return ok;
+        }
+        const double fps = (std::isfinite(decodedVideoFrameRate) && decodedVideoFrameRate > 0.0)
+            ? decodedVideoFrameRate : 30.0;
+        const double frameSeconds = 1.0 / fps;
+        const double current = std::max(0.0, decodedVideoPosition);
+        const double target = std::max(0.0, current - frameSeconds * 1.10);
+        if (!seekGameVideo(decoder, target, errorMessage)) return false;
+        frame = {};
+        decodedVideoPosition = target;
+        const double tolerance = frameSeconds * 0.45;
+        for (unsigned attempt = 0; attempt < 600u; ++attempt) {
+            videoPlaying = true;
+            nextVideoDecodeTickMs = 0;
+            if (!tickVideo(errorMessage)) {
+                videoPlaying = false;
+                return false;
+            }
+            videoPlaying = false;
+            if (!frame.bgra.empty() && decodedVideoPosition + tolerance >= target) {
+                errorMessage.clear();
+                return true;
+            }
+        }
+        errorMessage = "Game video frame seek did not reach the requested frame.";
+        return false;
+    }
+
+    IMFSourceReader* reader = reinterpret_cast<IMFSourceReader*>(sourceReader);
+
+    if (direction > 0) {
+        videoPlaying = true;
+        const bool ok = tickVideo(errorMessage);
+        videoPlaying = false;
+        nextVideoDecodeTickMs = 0;
+        return ok;
+    }
+
+    const double fps = (std::isfinite(decodedVideoFrameRate) && decodedVideoFrameRate > 0.0)
+        ? decodedVideoFrameRate : 30.0;
+    const double frameSeconds = 1.0 / fps;
+    const double current = std::max(0.0, decodedVideoPosition);
+    const double target = std::max(0.0, current - frameSeconds * 1.10);
+
+    PROPVARIANT position;
+    PropVariantInit(&position);
+    position.vt = VT_I8;
+    position.hVal.QuadPart = LONGLONG(std::llround(target * 10000000.0));
+    const HRESULT seekResult = reader->SetCurrentPosition(GUID_NULL, position);
+    PropVariantClear(&position);
+    if (FAILED(seekResult)) {
+        errorMessage = "Video frame seek failed (" + hresultText(seekResult) + ").";
+        return false;
+    }
+
+    frame = {};
+    decodedVideoPosition = target;
+    const double tolerance = frameSeconds * 0.45;
+    for (unsigned attempt = 0; attempt < 240u; ++attempt) {
+        videoPlaying = true;
+        nextVideoDecodeTickMs = 0;
+        if (!tickVideo(errorMessage)) {
+            videoPlaying = false;
+            return false;
+        }
+        videoPlaying = false;
+        if (!frame.bgra.empty() && decodedVideoPosition + tolerance >= target) {
+            errorMessage.clear();
+            return true;
+        }
+    }
+
+    errorMessage = "Video frame seek did not reach the requested frame.";
+    return false;
+#else
+    (void)direction;
+    errorMessage = "Video frame stepping is available in the Windows build.";
+    return false;
+#endif
+}
+
+bool StorylandMediaFile::seekVideoFrame(uint64_t index, std::string& errorMessage) {
+#ifdef _WIN32
+    if (mediaKind != StorylandMediaKind::Video || !videoReady || (!sourceReader && !gameVideoDecoder)) {
+        errorMessage = "No decoded video is open.";
+        return false;
+    }
+    videoPlaying = false;
+    nextVideoDecodeTickMs = 0;
+    if (index == videoFrameIndex() && !frame.bgra.empty()) {
+        errorMessage.clear();
+        return true;
+    }
+    const double fps = std::clamp(decodedVideoFrameRate, 1.0, 240.0);
+    const double target = std::max(0.0, std::min(double(index) / fps,
+        decodedVideoDuration > 0.0 ? decodedVideoDuration : double(index) / fps));
+    if (gameVideoDecoder) {
+        if (!seekGameVideo(reinterpret_cast<GameVideoDecoder*>(gameVideoDecoder), target, errorMessage)) return false;
+    } else {
+        IMFSourceReader* reader = reinterpret_cast<IMFSourceReader*>(sourceReader);
+        PROPVARIANT position;
+        PropVariantInit(&position);
+        position.vt = VT_I8;
+        position.hVal.QuadPart = LONGLONG(std::llround(target * 10000000.0));
+        const HRESULT result = reader->SetCurrentPosition(GUID_NULL, position);
+        PropVariantClear(&position);
+        if (FAILED(result)) {
+            errorMessage = "Video frame seek failed (" + hresultText(result) + ").";
+            return false;
+        }
+    }
+    frame = {};
+    decodedVideoPosition = target;
+    for (unsigned attempt = 0; attempt < 600u; ++attempt) {
+        videoPlaying = true;
+        nextVideoDecodeTickMs = 0;
+        if (!tickVideo(errorMessage)) { videoPlaying = false; return false; }
+        videoPlaying = false;
+        if (!frame.bgra.empty() && decodedVideoPosition + 0.45 / fps >= target) {
+            errorMessage.clear();
+            return true;
+        }
+    }
+    errorMessage = "Video seek did not reach the selected frame.";
+    return false;
+#else
+    (void)index;
+    errorMessage = "Video frame seeking is available in the Windows build.";
+    return false;
+#endif
+}
+
 void StorylandMediaFile::closeVideoDecoder() {
 #ifdef _WIN32
     releaseUnknown(sourceReader);
+    GameVideoDecoder* decoder = reinterpret_cast<GameVideoDecoder*>(gameVideoDecoder);
+    closeGameVideoDecoder(decoder);
+    gameVideoDecoder = nullptr;
     if (!videoDecodePath.empty()) {
         std::error_code ignored;
         const std::filesystem::path alias(videoDecodePath);
@@ -818,7 +1823,8 @@ std::string StorylandMediaFile::summary() const {
                 << " | " << std::fixed << std::setprecision(2) << clip.durationSeconds << " s";
         }
     } else if (mediaKind == StorylandMediaKind::Video) {
-        out << "Video | " << decodedVideoWidth << "x" << decodedVideoHeight;
+        out << "Video | " << decodedVideoWidth << "x" << decodedVideoHeight
+            << " | " << std::fixed << std::setprecision(3) << decodedVideoFrameRate << " fps";
         if (decodedVideoDuration > 0.0) out << " | " << std::fixed << std::setprecision(2) << decodedVideoDuration << " s";
     } else {
         out << "No media loaded";

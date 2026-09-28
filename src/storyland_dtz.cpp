@@ -359,20 +359,19 @@ static void addHint(std::vector<StorylandDtzResourceHint>& hints, const std::vec
     if (value != 0 && value < data.size()) hints.push_back({name, value, 0, note});
 }
 
-static std::string classifyKnownStreamingRecord(uint32_t start, uint32_t count) {
-    if (start == 0 && count == 23) return "plr.xtx";
-    if (start == 23) return "plr.mdl";
-    if (start == 67 && count <= 8) return "first entry after original PLR.mdl end";
+static std::string classifyKnownStreamingRecord(uint32_t, uint32_t) {
+    // Do not assign VCS-specific resource names from sector numbers. LCS and VCS,
+    // and even different regional/platform builds, can legitimately reuse the same
+    // sector positions for unrelated resources. Names are recovered from GAME.DTZ
+    // metadata, companion DIR data, hashes, or the payload itself instead.
     return "";
 }
 
 static std::string describeKnownStreamingRecord(uint32_t start, uint32_t count) {
-    if (start == 0 && count == 23) return "Known VCS/LCS first texture archive entry: PLR XTX at sectors [0, 23).";
-    if (start == 23 && count == 44) return "Known original PLR.mdl mapping: start=23 count=44, byte budget 90112.";
-    if (start == 23 && count == 68) return "Known patched PLR.mdl mapping: start=23 count=68, byte budget 139264.";
-    if (start == 23) return "PLR.mdl candidate: start sector is the known PLR.mdl base. Count is the editable MDL budget.";
-    if (start == 67) return "Entry starts at the original PLR end sector 23+44=67. If PLR is enlarged, this and later starts must shift.";
-    return "";
+    std::ostringstream ss;
+    ss << "Streaming allocation: sectors [" << start << ", " << (uint64_t(start) + uint64_t(count))
+       << "), " << (uint64_t(count) * 2048ull) << " bytes at 2048 bytes/sector.";
+    return ss.str();
 }
 
 bool StorylandDtzArchive::loadFromFile(const std::wstring& filePath, std::string& errorMessage) {
@@ -463,39 +462,142 @@ void StorylandDtzArchive::tryAutoLoadCompanionImg() {
     std::filesystem::path dtzPath(path);
     std::filesystem::path folder = dtzPath.parent_path();
     if (folder.empty()) folder = std::filesystem::current_path(ec);
+    if (ec || !std::filesystem::exists(folder, ec) || !std::filesystem::is_directory(folder, ec)) return;
 
     std::vector<std::filesystem::path> candidates;
-    candidates.push_back(folder / L"gta3PS2.img");
-    candidates.push_back(folder / L"GTA3PS2.IMG");
-    candidates.push_back(folder / L"gta3ps2.img");
-    candidates.push_back(folder / L"gta3PSP.img");
-    candidates.push_back(folder / L"GTA3PSP.IMG");
-    candidates.push_back(folder / L"gta3psp.img");
+    auto addCandidate = [&](const std::filesystem::path& candidate) {
+        if (candidate.empty()) return;
+        std::error_code candidateEc;
+        if (!std::filesystem::exists(candidate, candidateEc) ||
+            !std::filesystem::is_regular_file(candidate, candidateEc)) return;
+        const std::filesystem::path normalized = candidate.lexically_normal();
+        for (const auto& existing : candidates) {
+            std::error_code compareEc;
+            if (std::filesystem::equivalent(existing, normalized, compareEc) && !compareEc) return;
+            if (existing.lexically_normal() == normalized) return;
+        }
+        candidates.push_back(normalized);
+    };
+
+    // Retail PS2, retail/prototype PSP, and classic/beta LCS naming all occur in
+    // real Leeds asset sets. Do not prefer PS2 merely because its filename appears
+    // first: the actual DTZ sector map decides which IMG is the best companion.
+    const wchar_t* preferredNames[] = {
+        L"gta3PS2.img", L"GTA3PS2.IMG", L"gta3ps2.img",
+        L"gta3PSP.img", L"GTA3PSP.IMG", L"gta3psp.img",
+        L"GTA3PSPHR.IMG", L"gta3psphr.img",
+        L"GTA3.IMG", L"gta3.img"
+    };
+    for (const wchar_t* name : preferredNames) addCandidate(folder / name);
+    std::wstring folderName = folder.filename().wstring();
+    std::transform(folderName.begin(), folderName.end(), folderName.begin(),
+        [](wchar_t c) { return wchar_t(std::towlower(c)); });
+    const bool searchParent = (folderName == L"ps2" || folderName == L"models" || folderName == L"data") &&
+        folder.has_parent_path();
+    if (searchParent) {
+        for (const wchar_t* name : preferredNames) addCandidate(folder.parent_path() / name);
+    }
+
     std::filesystem::path sameStemImg = dtzPath;
     sameStemImg.replace_extension(L".img");
-    candidates.push_back(sameStemImg);
+    addCandidate(sameStemImg);
+    sameStemImg = dtzPath;
+    sameStemImg.replace_extension(L".IMG");
+    addCandidate(sameStemImg);
 
+    for (const auto& searchFolder : {folder, searchParent ? folder.parent_path() : folder}) {
+        ec.clear();
+        for (const auto& item : std::filesystem::directory_iterator(searchFolder, ec)) {
+            if (ec) break;
+            if (!item.is_regular_file(ec)) continue;
+            std::filesystem::path candidate = item.path();
+            std::wstring ext = candidate.extension().wstring();
+            std::transform(ext.begin(), ext.end(), ext.begin(), [](wchar_t c) { return wchar_t(std::towlower(c)); });
+            std::wstring stem = candidate.stem().wstring();
+            std::transform(stem.begin(), stem.end(), stem.begin(), [](wchar_t c) { return wchar_t(std::towlower(c)); });
+            if (ext == L".img" && stem.find(L"gta3") != std::wstring::npos) addCandidate(candidate);
+        }
+        if (!searchParent) break;
+    }
+
+    if (candidates.empty()) return;
+
+    struct ScoredImg {
+        std::filesystem::path path;
+        std::vector<uint8_t> bytes;
+        size_t validRanges = 0u;
+        size_t backedRanges = 0u;
+        size_t recognizablePayloads = 0u;
+        uint64_t highestReferencedEnd = 0u;
+    };
+
+    auto payloadLooksRecognizable = [](const std::vector<uint8_t>& bytes, uint64_t offset) -> bool {
+        if (offset > bytes.size() || bytes.size() - size_t(offset) < 4u) return false;
+        const size_t at = size_t(offset);
+        const uint8_t a = bytes[at + 0u], b = bytes[at + 1u], c = bytes[at + 2u], d = bytes[at + 3u];
+        if ((a == 'l' && b == 'd' && c == 'm' && d == 0) ||
+            (a == 'P' && b == 'M' && c == 'L' && d == 'C') ||
+            (a == 'x' && b == 'e' && c == 't' && d == 0) ||
+            (a == 'm' && b == 'i' && c == 'n' && d == 'a') ||
+            (a == 'C' && b == 'O' && c == 'L') ||
+            (a == 'I' && b == 'D' && c == 'E') ||
+            (a == 'I' && b == 'P' && c == 'L')) return true;
+        const uint32_t word = uint32_t(a) | (uint32_t(b) << 8u) | (uint32_t(c) << 16u) | (uint32_t(d) << 24u);
+        return word == 0x10u || word == 0x16u;
+    };
+
+    std::vector<ScoredImg> scored;
+    scored.reserve(candidates.size());
     for (const auto& candidate : candidates) {
-        if (std::filesystem::exists(candidate, ec) && !std::filesystem::is_directory(candidate, ec)) {
-            std::string ignored;
-            if (loadCompanionImg(candidate.wstring(), ignored)) return;
+        ScoredImg item;
+        item.path = candidate;
+        std::string ignored;
+        if (!readWholeFile(candidate.wstring(), item.bytes, ignored) || item.bytes.empty()) continue;
+
+        for (const StorylandDtzSectorRecord& record : records) {
+            if (!validStreamingPair(record.startSector, record.sectorCount)) continue;
+            ++item.validRanges;
+            const uint64_t begin = uint64_t(record.startSector) * 2048ull;
+            const uint64_t length = uint64_t(record.sectorCount) * 2048ull;
+            if (begin > std::numeric_limits<uint64_t>::max() - length) continue;
+            const uint64_t end = begin + length;
+            item.highestReferencedEnd = std::max(item.highestReferencedEnd, end);
+            if (begin <= item.bytes.size() && length <= uint64_t(item.bytes.size()) - begin) {
+                ++item.backedRanges;
+                if (payloadLooksRecognizable(item.bytes, begin)) ++item.recognizablePayloads;
+            }
         }
+        scored.push_back(std::move(item));
     }
 
-    if (!std::filesystem::exists(folder, ec) || !std::filesystem::is_directory(folder, ec)) return;
-    for (const auto& item : std::filesystem::directory_iterator(folder, ec)) {
-        if (ec) break;
-        if (!item.is_regular_file(ec)) continue;
-        std::filesystem::path candidate = item.path();
-        std::wstring ext = candidate.extension().wstring();
-        std::transform(ext.begin(), ext.end(), ext.begin(), [](wchar_t c) { return wchar_t(std::towlower(c)); });
-        std::wstring stem = candidate.stem().wstring();
-        std::transform(stem.begin(), stem.end(), stem.begin(), [](wchar_t c) { return wchar_t(std::towlower(c)); });
-        if (ext == L".img" && stem.find(L"gta3") != std::wstring::npos) {
-            std::string ignored;
-            if (loadCompanionImg(candidate.wstring(), ignored)) return;
-        }
-    }
+    if (scored.empty()) return;
+
+    auto better = [](const ScoredImg& left, const ScoredImg& right) {
+        // Primary criterion: how much of the DTZ's own sector map the image actually backs.
+        // Payload signatures break ties and prevent a similarly-sized unrelated IMG from
+        // winning just because all ranges happen to fit.
+        if (left.backedRanges != right.backedRanges) return left.backedRanges > right.backedRanges;
+        if (left.recognizablePayloads != right.recognizablePayloads) return left.recognizablePayloads > right.recognizablePayloads;
+
+        const uint64_t leftSlack = left.bytes.size() >= left.highestReferencedEnd
+            ? uint64_t(left.bytes.size()) - left.highestReferencedEnd
+            : std::numeric_limits<uint64_t>::max();
+        const uint64_t rightSlack = right.bytes.size() >= right.highestReferencedEnd
+            ? uint64_t(right.bytes.size()) - right.highestReferencedEnd
+            : std::numeric_limits<uint64_t>::max();
+        if (leftSlack != rightSlack) return leftSlack < rightSlack;
+        return left.path.native() < right.path.native();
+    };
+    std::sort(scored.begin(), scored.end(), better);
+
+    // If the DTZ contained no recoverable sector records, retaining deterministic filename
+    // fallback is still more useful than refusing to pair the files. Otherwise require the
+    // winning IMG to back at least one real DTZ allocation.
+    const ScoredImg& best = scored.front();
+    if (!records.empty() && best.backedRanges == 0u) return;
+
+    imgPath = best.path.wstring();
+    imgRawData = best.bytes;
 }
 
 void StorylandDtzArchive::rebuildDirMatches() {
@@ -524,6 +626,7 @@ void StorylandDtzArchive::rebuildDirMatches() {
         if (b0 == 'G' && b1 == 'T' && b2 == 'A' && b3 == 'G') return ".dtz";
         if (b0 == 'G' && b1 == 'A' && b2 == 'T' && b3 == 'G') return ".dtz";
         if (b0 == 'C' && b1 == 'O' && b2 == 'L') return ".col";
+        if (b0 == '2' && b1 == 'l' && b2 == 'o' && b3 == 'c') return ".col2";
         if (b0 == 'I' && b1 == 'D' && b2 == 'E') return ".ide";
         if (b0 == 'I' && b1 == 'P' && b2 == 'L') return ".ipl";
         const uint32_t chunkType = readU32(imgRawData, offset);
@@ -697,6 +800,39 @@ void StorylandDtzArchive::rebuildDirMatches() {
         }
     }
 
+    // Detect the LCS retail CStreamingInfo serialization independently of the
+    // VCS descriptor/sentinel layout.  LCS uses a 0x20-byte prefix followed by
+    // 0x14-byte rows with start/count at +0x04/+0x08.
+    bool lcsStreaming = false;
+    size_t lcsStreamBase = 0u;
+    size_t lcsStreamRowCount = 0u;
+    if (streamingObject >= 0xE0u && uint64_t(streamingObject) + 0x20ull + 0x14ull * 64ull <= unpackedData.size()) {
+        const size_t candidateBase = size_t(streamingObject) + 0x20u;
+        size_t validRows = 0u;
+        size_t usefulRows = 0u;
+        for (size_t row = 0u; row < 8192u; ++row) {
+            const uint64_t rowOffset64 = uint64_t(candidateBase) + uint64_t(row) * 0x14ull;
+            if (rowOffset64 + 0x14ull > unpackedData.size()) break;
+            const size_t rowOffset = size_t(rowOffset64);
+            const uint32_t start = readU32(unpackedData, rowOffset + 0x04u);
+            const uint32_t count = readU32(unpackedData, rowOffset + 0x08u);
+            const uint32_t tail0 = readU32(unpackedData, rowOffset + 0x0Cu);
+            const uint32_t tail1 = readU32(unpackedData, rowOffset + 0x10u);
+            const bool empty = start == 0u && count == 0u;
+            const bool pairValid = validStreamingPair(start, count);
+            if (tail0 != 0u || tail1 != 0u || (!empty && !pairValid)) break;
+            ++validRows;
+            if (pairValid) ++usefulRows;
+            lcsStreamRowCount = row + 1u;
+        }
+        if (validRows >= 256u && usefulRows >= 32u) {
+            lcsStreaming = true;
+            lcsStreamBase = candidateBase;
+            semanticStreaming = false;
+            streamRun = nullptr;
+        }
+    }
+
     std::map<std::pair<uint32_t, uint32_t>, size_t> entryIndexByPair;
     auto attachMatchingRecords = [&](StorylandDtzDirEntry& entry) {
         for (size_t recordIndex = 0; recordIndex < records.size(); ++recordIndex) {
@@ -706,7 +842,98 @@ void StorylandDtzArchive::rebuildDirMatches() {
         }
     };
 
-    if (semanticStreaming && streamRun) {
+    if (lcsStreaming) {
+        uint32_t firstTextureIndex = 0xFFFFFFFFu;
+        uint32_t firstCollisionIndex = 0xFFFFFFFFu;
+        uint32_t firstAnimIndex = 0xFFFFFFFFu;
+
+        // Once the IMG is loaded, payload signatures give reliable category
+        // boundaries without borrowing VCS-specific tex/col/anim offsets.
+        if (!imgRawData.empty()) {
+            for (size_t streamIndex = 0u; streamIndex < lcsStreamRowCount; ++streamIndex) {
+                const size_t rowOffset = lcsStreamBase + streamIndex * 0x14u;
+                const uint32_t start = readU32(unpackedData, rowOffset + 0x04u);
+                const uint32_t count = readU32(unpackedData, rowOffset + 0x08u);
+                if (!validStreamingPair(start, count)) continue;
+                const std::string extension = classifySliceExtension(start, count);
+                if ((extension == ".xtx" || extension == ".chk" || extension == ".tex" || extension == ".txd") && firstTextureIndex == 0xFFFFFFFFu)
+                    firstTextureIndex = uint32_t(streamIndex);
+                else if ((extension == ".col" || extension == ".col2") && firstCollisionIndex == 0xFFFFFFFFu)
+                    firstCollisionIndex = uint32_t(streamIndex);
+                else if (extension == ".anim" && firstAnimIndex == 0xFFFFFFFFu)
+                    firstAnimIndex = uint32_t(streamIndex);
+            }
+        }
+
+        for (size_t streamIndex = 0u; streamIndex < lcsStreamRowCount; ++streamIndex) {
+            const size_t rowOffset = lcsStreamBase + streamIndex * 0x14u;
+            const uint32_t start = readU32(unpackedData, rowOffset + 0x04u);
+            const uint32_t count = readU32(unpackedData, rowOffset + 0x08u);
+            if (!validStreamingPair(start, count)) continue;
+
+            const std::pair<uint32_t, uint32_t> key{start, count};
+            if (entryIndexByPair.count(key)) continue;
+
+            StorylandDtzDirEntry entry;
+            entry.streamingIndex = uint32_t(streamIndex);
+            entry.startSector = start;
+            entry.sectorCount = count;
+            entry.matchedDtzSectorCount = count;
+            entry.startStorageOffset = uint32_t(rowOffset + 0x04u);
+            entry.countStorageOffset = uint32_t(rowOffset + 0x08u);
+            populateImageRangeInfo(entry);
+            attachMatchingRecords(entry);
+
+            std::string baseName;
+            if (entry.detectedExtension == ".mdl" || entry.detectedExtension == ".dff") {
+                if (streamIndex < ideCount && modelInfoTable != 0u &&
+                    uint64_t(modelInfoTable) + uint64_t(streamIndex + 1u) * 4ull <= unpackedData.size()) {
+                    const uint32_t modelInfo = readU32(unpackedData, modelInfoTable + streamIndex * 4u);
+                    if (modelInfo != 0u && uint64_t(modelInfo) + 12ull <= unpackedData.size()) {
+                        const uint32_t hash = readU32(unpackedData, modelInfo + 8u);
+                        auto known = nameByHash.find(hash);
+                        if (known != nameByHash.end()) baseName = known->second;
+                        else {
+                            std::ostringstream unknown;
+                            unknown << "model_" << std::setw(4) << std::setfill('0') << streamIndex
+                                    << "_hash_" << std::uppercase << std::hex << std::setw(8)
+                                    << std::setfill('0') << hash;
+                            baseName = unknown.str();
+                        }
+                        entry.nameStorageOffset = modelInfo + 8u;
+                        entry.nameStorageLength = 4u;
+                        entry.nameStoredAsHash = true;
+                    }
+                }
+            } else if ((entry.detectedExtension == ".xtx" || entry.detectedExtension == ".chk" ||
+                        entry.detectedExtension == ".tex" || entry.detectedExtension == ".txd") &&
+                       firstTextureIndex != 0xFFFFFFFFu && streamIndex >= firstTextureIndex) {
+                const uint32_t slot = uint32_t(streamIndex) - firstTextureIndex;
+                if (slot < nameTable.names.size()) {
+                    baseName = nameTable.names[slot];
+                    const uint64_t nameOffset64 = uint64_t(nameTable.offset) + uint64_t(slot) * 28ull;
+                    if (nameOffset64 + 20ull <= unpackedData.size()) {
+                        entry.nameStorageOffset = uint32_t(nameOffset64);
+                        entry.nameStorageLength = 20u;
+                    }
+                }
+            } else if (entry.detectedExtension == ".anim" && firstAnimIndex != 0xFFFFFFFFu && streamIndex >= firstAnimIndex) {
+                const uint32_t slot = uint32_t(streamIndex) - firstAnimIndex;
+                if (slot < animNames.size()) {
+                    baseName = animNames[slot].name;
+                    entry.nameStorageOffset = animNames[slot].offset;
+                    entry.nameStorageLength = 24u;
+                }
+            }
+
+            if (baseName.empty()) entry.name = makeRecoveredName(dirMap.size(), start, count, entry.detectedExtension);
+            else entry.name = forceNameExtension(baseName, entry.detectedExtension);
+            entryIndexByPair[key] = dirMap.size();
+            dirMap.push_back(std::move(entry));
+        }
+    }
+
+    if (!lcsStreaming && semanticStreaming && streamRun) {
         for (uint32_t streamIndex = 0; streamIndex < numStreamInfos; ++streamIndex) {
             const size_t rowOffset = streamRun->base + size_t(streamIndex) * 24u;
             if (rowOffset + 24u > unpackedData.size()) break;
@@ -731,9 +958,7 @@ void StorylandDtzArchive::rebuildDirMatches() {
             if (explicitName != explicitStreamNames.end()) {
                 baseName = explicitName->second;
             } else if (streamIndex < texOffset && (entry.detectedExtension == ".mdl" || entry.detectedExtension == ".dff")) {
-                if (streamIndex == 0u && nameByHash.count(nameHash("plr"))) {
-                    baseName = "plr";
-                } else if (streamIndex < ideCount && modelInfoTable != 0u && uint64_t(modelInfoTable) + uint64_t(streamIndex + 1u) * 4ull <= unpackedData.size()) {
+                if (streamIndex < ideCount && modelInfoTable != 0u && uint64_t(modelInfoTable) + uint64_t(streamIndex + 1u) * 4ull <= unpackedData.size()) {
                     const uint32_t modelInfo = readU32(unpackedData, modelInfoTable + streamIndex * 4u);
                     if (modelInfo != 0u && uint64_t(modelInfo) + 12ull <= unpackedData.size()) {
                         const uint32_t hash = readU32(unpackedData, modelInfo + 8u);
@@ -782,7 +1007,7 @@ void StorylandDtzArchive::rebuildDirMatches() {
     //   u32 startSector, u32 sectorCount, char baseName[], '\0', char extension[], '\0'.
     // They cover resources such as special/cutscene MDLs that are not live CStreaming rows.
     // They are part of GAME.DTZ itself and must move whenever IMG sectors are inserted/removed.
-    if (semanticStreaming && streamRun) {
+    if (!lcsStreaming && semanticStreaming && streamRun) {
         const uint64_t namedDirectoryBase64 = uint64_t(streamRun->base) + uint64_t(numStreamInfos) * 24ull;
         if (namedDirectoryBase64 <= unpackedData.size()) {
             const size_t namedDirectoryBase = size_t(namedDirectoryBase64);
@@ -849,7 +1074,7 @@ void StorylandDtzArchive::rebuildDirMatches() {
     // Only synthesize a browser map from scanned sector records when the authoritative
     // CStreaming table could not be located.  Mixing both sources creates duplicate rows
     // after a retail rebuild (for example old plr.xtx/plr.mdl ranges beside the new ones).
-    if (!semanticStreaming) {
+    if (!semanticStreaming && !lcsStreaming) {
     // Preserve any valid ranges that are not part of a recognized CStreaming array.
     for (size_t recordIndex = 0; recordIndex < records.size(); ++recordIndex) {
         StorylandDtzSectorRecord& record = records[recordIndex];
@@ -1549,6 +1774,59 @@ void StorylandDtzArchive::rebuildSectorRecords() {
         records.push_back(record);
     };
 
+    // LCS retail PS2/PSP uses a different CStreamingInfo serialization from VCS.
+    // Header +0x7C points at the LCS streaming block.  After a 0x20-byte block
+    // prefix, entries are 0x14 bytes each and store the gta3PS*.img sector start
+    // and sector count at +0x04/+0x08.  The final two dwords of each entry are 0.
+    // Empty/reserved stream IDs use start/count 0/0 and are intentionally skipped.
+    //
+    // This must be detected before the older VCS 0x18-byte sentinel scan.  The
+    // previous generic scan could find unrelated zero/sentinel structures elsewhere
+    // in an LCS GAME.DTZ and turn them into hundreds of fake s000000 entries.
+    bool foundLcsStreamingTable = false;
+    const uint32_t streamingPointer = unpackedData.size() >= 0x80u ? readU32(unpackedData, 0x7Cu) : 0u;
+    if (streamingPointer >= 0xE0u && uint64_t(streamingPointer) + 0x20ull + 0x14ull * 64ull <= unpackedData.size()) {
+        const size_t tableBase = size_t(streamingPointer) + 0x20u;
+        size_t structurallyValidRows = 0u;
+        size_t usefulRows = 0u;
+        size_t rowCount = 0u;
+
+        // Validate a substantial prefix first.  This deliberately checks the LCS
+        // row shape rather than just plausible sector numbers.
+        for (size_t row = 0u; row < 8192u; ++row) {
+            const uint64_t rowOffset64 = uint64_t(tableBase) + uint64_t(row) * 0x14ull;
+            if (rowOffset64 + 0x14ull > unpackedData.size()) break;
+            const size_t rowOffset = size_t(rowOffset64);
+            const uint32_t start = readU32(unpackedData, rowOffset + 0x04u);
+            const uint32_t count = readU32(unpackedData, rowOffset + 0x08u);
+            const uint32_t tail0 = readU32(unpackedData, rowOffset + 0x0Cu);
+            const uint32_t tail1 = readU32(unpackedData, rowOffset + 0x10u);
+
+            const bool empty = start == 0u && count == 0u;
+            const bool pairValid = validStreamingPair(start, count);
+            if (tail0 != 0u || tail1 != 0u || (!empty && !pairValid)) break;
+
+            ++structurallyValidRows;
+            if (pairValid) ++usefulRows;
+            rowCount = row + 1u;
+        }
+
+        if (structurallyValidRows >= 256u && usefulRows >= 32u) {
+            foundLcsStreamingTable = true;
+            for (size_t row = 0u; row < rowCount; ++row) {
+                const size_t rowOffset = tableBase + row * 0x14u;
+                const uint32_t start = readU32(unpackedData, rowOffset + 0x04u);
+                const uint32_t count = readU32(unpackedData, rowOffset + 0x08u);
+                if (!validStreamingPair(start, count)) continue;
+
+                std::ostringstream source;
+                source << "LCS CStreamingInfo[" << row << "] (0x14-byte retail row)";
+                addRecord(uint32_t(rowOffset), uint32_t(rowOffset + 0x04u),
+                          uint32_t(rowOffset + 0x08u), start, count, source.str());
+            }
+        }
+    }
+
     auto looksLikeStreamingEntry = [&](size_t offset) -> bool {
         if (offset + 24 > unpackedData.size()) return false;
         return readU32(unpackedData, offset + 0x00) == 0xAAAAAAAAu
@@ -1557,25 +1835,22 @@ void StorylandDtzArchive::rebuildSectorRecords() {
             && readU32(unpackedData, offset + 0x0C) == 0xAAAA0000u;
     };
 
-
     uint32_t strictCount = 0;
-    std::set<std::pair<uint32_t, uint32_t>> strictSectorPairs;
-    for (size_t offset = 0; offset + 24 <= unpackedData.size(); offset += 4) {
-        if (!looksLikeStreamingEntry(offset)) continue;
+    if (!foundLcsStreamingTable) {
+        for (size_t offset = 0; offset + 24 <= unpackedData.size(); offset += 4) {
+            if (!looksLikeStreamingEntry(offset)) continue;
 
-        uint32_t start = readU32(unpackedData, offset + 0x10);
-        uint32_t count = readU32(unpackedData, offset + 0x14);
-        if (!validStreamingPair(start, count)) continue;
+            uint32_t start = readU32(unpackedData, offset + 0x10);
+            uint32_t count = readU32(unpackedData, offset + 0x14);
+            if (!validStreamingPair(start, count)) continue;
 
-        std::ostringstream source;
-        source << "GAME.DTZ internal gta3PS2.img streaming table entry";
-        addRecord(uint32_t(offset), uint32_t(offset + 0x10), uint32_t(offset + 0x14), start, count, source.str());
-        strictSectorPairs.insert({start, count});
-        strictCount++;
+            addRecord(uint32_t(offset), uint32_t(offset + 0x10), uint32_t(offset + 0x14),
+                      start, count, "VCS 0x18-byte GAME.DTZ gta3PS*.img streaming entry");
+            strictCount++;
+        }
     }
 
-
-    if (strictCount == 0) {
+    if (!foundLcsStreamingTable && strictCount == 0) {
         for (size_t offset = 0; offset + 24 <= unpackedData.size(); offset += 4) {
             uint32_t a = readU32(unpackedData, offset + 0x00);
             uint32_t b = readU32(unpackedData, offset + 0x04);
@@ -1583,14 +1858,15 @@ void StorylandDtzArchive::rebuildSectorRecords() {
             uint32_t d = readU32(unpackedData, offset + 0x0C);
             uint32_t start = readU32(unpackedData, offset + 0x10);
             uint32_t count = readU32(unpackedData, offset + 0x14);
-            if ((a == 0xAAAAAAAAu || a == 0x00000000u || a == 0xFFFFFFFFu) && b == 0 && c == 0 && (d == 0x0000AAAAu || d == 0xAAAAAAAAu || d == 0)) {
+            if ((a == 0xAAAAAAAAu || a == 0x00000000u || a == 0xFFFFFFFFu) && b == 0 && c == 0 &&
+                (d == 0x0000AAAAu || d == 0xAAAAAAAAu || d == 0)) {
                 if (validStreamingPair(start, count)) {
-                    addRecord(uint32_t(offset), uint32_t(offset + 0x10), uint32_t(offset + 0x14), start, count, "loose 24-byte sector pair candidate");
+                    addRecord(uint32_t(offset), uint32_t(offset + 0x10), uint32_t(offset + 0x14),
+                              start, count, "loose 24-byte sector pair candidate");
                 }
             }
         }
     }
-
 
     auto nameHasUsefulDtzExtension = [](const std::string& name) -> bool {
         if (name.empty()) return false;
@@ -1608,30 +1884,20 @@ void StorylandDtzArchive::rebuildSectorRecords() {
             ".mdl", ".xtx", ".chk", ".tex", ".anim", ".ifp", ".cut", ".dat", ".col", ".col2", ".wdr", ".wrld", ".raw", ".sdt", ".cam", ".gxt"
         };
         for (const char* ext : extensions) {
-            if (lower.size() >= std::strlen(ext) && lower.rfind(ext) == lower.size() - std::strlen(ext)) {
-                return true;
-            }
+            if (lower.size() >= std::strlen(ext) && lower.rfind(ext) == lower.size() - std::strlen(ext)) return true;
         }
         return false;
     };
 
-
-    if (strictCount == 0) {
+    if (!foundLcsStreamingTable && strictCount == 0) {
         for (size_t offset = 0; offset + 32u <= unpackedData.size(); offset += 4u) {
             std::string name = readDirName(unpackedData, offset, 24u);
-            if (!looksLikeDirName(name) || !nameHasUsefulDtzExtension(name)) {
-                continue;
-            }
+            if (!looksLikeDirName(name) || !nameHasUsefulDtzExtension(name)) continue;
 
             uint32_t start = readU32(unpackedData, offset + 24u);
             uint32_t count = readU32(unpackedData, offset + 28u);
-            if (!validStreamingPair(start, count)) {
-                continue;
-            }
-
-            if (!seenOffsets.insert({uint32_t(offset + 24u), uint32_t(offset + 28u)}).second) {
-                continue;
-            }
+            if (!validStreamingPair(start, count)) continue;
+            if (!seenOffsets.insert({uint32_t(offset + 24u), uint32_t(offset + 28u)}).second) continue;
 
             StorylandDtzSectorRecord record;
             record.recordOffset = uint32_t(offset);
@@ -1641,7 +1907,7 @@ void StorylandDtzArchive::rebuildSectorRecords() {
             record.sectorCount = count;
             record.source = "generic internal 32-byte ASCII DIR entry";
             record.resourceName = name;
-            record.note = "Name + sector pair scanned from DTZ contents; no strict gta3PS2.img table was found.";
+            record.note = "Name + sector pair scanned from DTZ contents; no strict gta3PS*.img table was found.";
             records.push_back(record);
         }
     }

@@ -11,26 +11,58 @@ set "DIST_EXE=%DIST_DIR%\Storyland.exe"
 
 set "VCPKG_TOOLCHAIN="
 set "VCPKG_EXE="
-if defined VCPKG_ROOT if exist "%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake" set "VCPKG_TOOLCHAIN=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake"
-if not defined VCPKG_TOOLCHAIN if exist "C:\Projects\vcpkg\scripts\buildsystems\vcpkg.cmake" set "VCPKG_TOOLCHAIN=C:\Projects\vcpkg\scripts\buildsystems\vcpkg.cmake"
+set "VCPKG_ROOT_FOUND="
+if defined VCPKG_ROOT if exist "%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake" (
+    set "VCPKG_ROOT_FOUND=%VCPKG_ROOT%"
+    set "VCPKG_TOOLCHAIN=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake"
+    if exist "%VCPKG_ROOT%\vcpkg.exe" set "VCPKG_EXE=%VCPKG_ROOT%\vcpkg.exe"
+)
+if not defined VCPKG_TOOLCHAIN if exist "C:\Projects\vcpkg\scripts\buildsystems\vcpkg.cmake" (
+    set "VCPKG_ROOT_FOUND=C:\Projects\vcpkg"
+    set "VCPKG_TOOLCHAIN=C:\Projects\vcpkg\scripts\buildsystems\vcpkg.cmake"
+    if exist "C:\Projects\vcpkg\vcpkg.exe" set "VCPKG_EXE=C:\Projects\vcpkg\vcpkg.exe"
+)
 if not defined VCPKG_TOOLCHAIN goto find_vcpkg_on_path
 goto vcpkg_found
 
 :find_vcpkg_on_path
 for /f "delims=" %%I in ('where vcpkg.exe 2^>nul') do if not defined VCPKG_EXE set "VCPKG_EXE=%%~fI"
 if not defined VCPKG_EXE goto vcpkg_missing
-for %%I in ("%VCPKG_EXE%") do set "VCPKG_TOOLCHAIN=%%~dpIscripts\buildsystems\vcpkg.cmake"
+for %%I in ("%VCPKG_EXE%") do (
+    set "VCPKG_ROOT_FOUND=%%~dpI"
+    set "VCPKG_TOOLCHAIN=%%~dpIscripts\buildsystems\vcpkg.cmake"
+)
 if not exist "%VCPKG_TOOLCHAIN%" goto vcpkg_missing
 
 :vcpkg_found
 >> "%BUILD_LOG%" echo vcpkg toolchain: %VCPKG_TOOLCHAIN%
 
-echo Configuring Storyland...
-cmake --fresh -S . -B "%BUILD_DIR%" -A x64 "-DCMAKE_TOOLCHAIN_FILE=%VCPKG_TOOLCHAIN%" -DVCPKG_TARGET_TRIPLET=x64-windows-static >> "%BUILD_LOG%" 2>&1
+if not defined VCPKG_EXE if defined VCPKG_ROOT_FOUND if exist "%VCPKG_ROOT_FOUND%\vcpkg.exe" set "VCPKG_EXE=%VCPKG_ROOT_FOUND%\vcpkg.exe"
+if not defined VCPKG_EXE goto vcpkg_missing
+
+echo.
+echo ============================================================
+echo Installing/verifying Storyland dependencies
+echo ============================================================
+echo The first build now includes FFmpeg for native PMF/PSS decoding.
+echo vcpkg may need several minutes the first time it builds FFmpeg.
+echo Its output is intentionally shown live so the build never appears frozen.
+echo.
+"%VCPKG_EXE%" install --triplet x64-windows-static
+if errorlevel 1 goto dependencies_failed
+
+echo.
+echo ============================================================
+echo Configuring Storyland
+echo ============================================================
+cmake --fresh -S . -B "%BUILD_DIR%" -A x64 "-DCMAKE_TOOLCHAIN_FILE=%VCPKG_TOOLCHAIN%" -DVCPKG_TARGET_TRIPLET=x64-windows-static
 if errorlevel 1 goto configure_failed
 
-echo Building Storyland...
-cmake --build "%BUILD_DIR%" --config Release --clean-first >> "%BUILD_LOG%" 2>&1
+echo.
+echo ============================================================
+echo Building Storyland
+echo ============================================================
+cmake --build "%BUILD_DIR%" --config Release --clean-first
 if errorlevel 1 goto build_failed
 
 if not exist "%STORYLAND_EXE%" goto missing_exe
@@ -52,6 +84,14 @@ echo Storyland.exe contains its shaders and zlib; no shaders folder or zlib1.dll
 echo.
 pause
 exit /b 0
+
+:dependencies_failed
+echo.
+echo vcpkg dependency installation failed.
+echo The failure is printed above. FFmpeg is required for PMF/PSS decoding.
+echo.
+pause
+exit /b 8
 
 :configure_failed
 type "%BUILD_LOG%"

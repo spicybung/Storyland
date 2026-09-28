@@ -230,7 +230,6 @@ static uint32_t animCanonicalIndexForBoneId(uint32_t boneId) {
 
 static uint32_t animBoneIdFromChannelTag(uint32_t tag) {
     uint32_t upper = (tag >> 16) & 0xFFFFu;
-    uint32_t lower = tag & 0xFFFFu;
 
     // Some anim banks store the HAnim/RslTAnim bone id directly in the low 16 bits:
     //   0xDF9E0000 -> bone 0
@@ -273,9 +272,8 @@ static uint32_t animBoneIdFromChannelTag(uint32_t tag) {
     default: break;
     }
 
-    // Direct low-word IDs are valid for some non-weapon anim banks.
-    // Weapon banks above must be decoded through the high-word hash first.
-    if (lower <= 80u || lower == 255u) return lower;
+    // The caller handles direct low-word IDs. An unknown hash cannot safely
+    // identify a bone, especially after its low word has been masked to zero.
     return 0xFFFFFFFFu;
 }
 
@@ -358,13 +356,13 @@ static float animHalfToFloat(uint16_t value) {
         if (mantissa == 0) {
             result = sign;
         } else {
-            exponent = 1;
+            int subnormalExponent = -14;
             while ((mantissa & 0x0400u) == 0) {
                 mantissa <<= 1;
-                exponent--;
+                --subnormalExponent;
             }
             mantissa &= 0x03FFu;
-            uint32_t floatExponent = exponent + (127u - 15u);
+            uint32_t floatExponent = uint32_t(subnormalExponent + 127);
             result = sign | (floatExponent << 23) | (mantissa << 13);
         }
     } else if (exponent == 31u) {
@@ -565,6 +563,7 @@ void StorylandAnimFile::parse() {
     } else {
         duration = std::max(1.0f / fps, float(std::max<uint32_t>(1, frames - 1)) / fps);
     }
+    frames = std::max(frames, uint32_t(std::ceil(duration * fps)));
 }
 
 void StorylandAnimFile::collectStrings() {
@@ -748,11 +747,11 @@ void StorylandAnimFile::rebuildActiveClipTracks() {
 
         uint32_t low16 = boneKey & 0xFFFFu;
         uint32_t boneId = 0xFFFFFFFFu;
-        if ((flags & 0x0010u) != 0u) {
+        if ((flags & 0x0010u) != 0u && (low16 <= 80u || low16 == 255u)) {
             boneId = low16;
         } else {
-            // Hash-keyed Leeds channels: resolve only the known stable high-word
-            // mapping; do not mistake arbitrary low-word channel data for a bone id.
+            // The extra 0x10 flag also occurs in hash-keyed banks. Their low
+            // word can contain unrelated channel data, not a direct bone id.
             boneId = animBoneIdFromChannelTag(boneKey & 0xFFFF0000u);
         }
 
@@ -766,10 +765,12 @@ void StorylandAnimFile::rebuildActiveClipTracks() {
         track.channelFlags = flags;
         track.boneId = boneId;
         uint32_t canonicalIndex = animCanonicalIndexForBoneId(boneId);
-        track.boneIndex = canonicalIndex != 0xFFFFFFFFu ? canonicalIndex : channelIndex;
+        track.boneIndex = canonicalIndex;
         track.parentIndex = animCanonicalParent(track.boneIndex);
         track.tag = boneKey;
-        track.name = animNameForBoneId(boneId, track.boneIndex);
+        track.name = canonicalIndex != 0xFFFFFFFFu
+            ? animNameForBoneId(boneId, canonicalIndex)
+            : "unresolved_" + animHex32(boneKey);
 
         std::ostringstream source;
         source << "clip '" << clip.name << "' channel=" << channelIndex
@@ -777,7 +778,7 @@ void StorylandAnimFile::rebuildActiveClipTracks() {
                << " boneKey=" << animHex32(boneKey)
                << " target=" << (boneId == 0xFFFFFFFFu ? std::string("hash/unresolved") : std::to_string(boneId))
                << " frames=" << frameCount << " stride=" << stride
-               << (((flags & 0x0010u) != 0u) ? " direct-id" : " hash-keyed");
+               << (((flags & 0x0010u) != 0u && (low16 <= 80u || low16 == 255u)) ? " direct-id" : " hash-keyed");
         track.source = source.str();
 
         float absoluteTime = 0.0f;
@@ -800,6 +801,7 @@ void StorylandAnimFile::rebuildActiveClipTracks() {
     for (const auto& track : trackRows) maxKeys = std::max<uint32_t>(maxKeys, uint32_t(track.keys.size()));
     frames = maxKeys;
     if (duration <= 0.0f) duration = std::max(1.0f / fps, float(std::max<uint32_t>(1u, frames - 1u)) / fps);
+    frames = std::max(frames, uint32_t(std::ceil(duration * fps)));
 }
 
 void StorylandAnimFile::buildStaticInspectionTracks() {
@@ -840,43 +842,100 @@ std::vector<StorylandAnimPoseBone> StorylandAnimFile::poseAt(float seconds) cons
         seconds = std::fmod(std::max(0.0f, seconds), duration);
     }
 
-    // Standalone view is only a skeleton probe. Full MDL application is done in main.cpp
-    // against the current model's imported RslTAnim hierarchy, using bone ids where available.
+    struct PreviewQuat { float x = 0.0f, y = 0.0f, z = 0.0f, w = 1.0f; };
+    struct PreviewPoint { float x = 0.0f, y = 0.0f, z = 0.0f; };
+    std::vector<PreviewQuat> localRotations(pose.size());
+    std::vector<PreviewQuat> worldRotations(pose.size());
+    std::vector<PreviewPoint> localPositions(pose.size());
+
+    for (size_t index = 0; index < pose.size(); ++index) {
+        const auto& bone = pose[index];
+        const bool hasParent = bone.parentIndex < index;
+        const auto& parent = hasParent ? pose[bone.parentIndex] : bone;
+        localPositions[index] = {
+            bone.x - (hasParent ? parent.x : 0.0f),
+            bone.y - (hasParent ? parent.y : 0.0f),
+            bone.z - (hasParent ? parent.z : 0.0f)
+        };
+    }
+
     for (const auto& track : trackRows) {
         if (track.keys.empty()) continue;
-
-        uint32_t targetIndex = track.boneIndex;
-        for (size_t i = 0; i < pose.size(); ++i) {
-            if (pose[i].boneId == track.boneId && track.boneId != 0xFFFFFFFFu) {
-                targetIndex = uint32_t(i);
-                break;
-            }
-        }
-
+        uint32_t targetIndex = track.boneId == 0xFFFFFFFFu
+            ? track.boneIndex : animCanonicalIndexForBoneId(track.boneId);
         if (targetIndex >= pose.size()) continue;
 
         const StorylandAnimKey* a = &track.keys.front();
         const StorylandAnimKey* b = &track.keys.back();
-
-        for (size_t i = 0; i < track.keys.size(); ++i) {
-            if (track.keys[i].time <= seconds) a = &track.keys[i];
-            if (track.keys[i].time >= seconds) {
-                b = &track.keys[i];
-                break;
-            }
+        auto next = std::lower_bound(track.keys.begin(), track.keys.end(), seconds,
+            [](const StorylandAnimKey& key, float time) { return key.time < time; });
+        if (next == track.keys.begin()) {
+            b = a;
+        } else if (next == track.keys.end()) {
+            a = b;
+        } else {
+            b = &*next;
+            a = &*(next - 1);
         }
 
         float span = std::max(0.0001f, b->time - a->time);
         float factor = std::max(0.0f, std::min(1.0f, (seconds - a->time) / span));
-        float tx = a->tx * (1.0f - factor) + b->tx * factor;
-        float ty = a->ty * (1.0f - factor) + b->ty * factor;
-        float tz = a->tz * (1.0f - factor) + b->tz * factor;
-
-        if (track.keyStride == 16) {
-            pose[targetIndex].x += std::max(-0.20f, std::min(0.20f, tx * 0.20f));
-            pose[targetIndex].y += std::max(-0.20f, std::min(0.20f, ty * 0.20f));
-            pose[targetIndex].z += std::max(-0.20f, std::min(0.20f, tz * 0.20f));
+        PreviewQuat first{a->qx, a->qy, a->qz, a->qw};
+        PreviewQuat second{b->qx, b->qy, b->qz, b->qw};
+        if (first.x * second.x + first.y * second.y + first.z * second.z + first.w * second.w < 0.0f) {
+            second = {-second.x, -second.y, -second.z, -second.w};
         }
+        PreviewQuat& rotation = localRotations[targetIndex];
+        rotation = {
+            first.x * (1.0f - factor) + second.x * factor,
+            first.y * (1.0f - factor) + second.y * factor,
+            first.z * (1.0f - factor) + second.z * factor,
+            first.w * (1.0f - factor) + second.w * factor
+        };
+        normalizeQuat(rotation.x, rotation.y, rotation.z, rotation.w);
+
+        if ((track.channelFlags & 0x0002u) != 0u) {
+            localPositions[targetIndex] = {
+                a->tx * (1.0f - factor) + b->tx * factor,
+                a->ty * (1.0f - factor) + b->ty * factor,
+                a->tz * (1.0f - factor) + b->tz * factor
+            };
+        }
+    }
+
+    for (size_t index = 0; index < pose.size(); ++index) {
+        const PreviewQuat& local = localRotations[index];
+        const uint32_t parentIndex = pose[index].parentIndex;
+        if (parentIndex >= index) {
+            worldRotations[index] = local;
+            pose[index].x = localPositions[index].x;
+            pose[index].y = localPositions[index].y;
+            pose[index].z = localPositions[index].z;
+            continue;
+        }
+
+        const PreviewQuat& parent = worldRotations[parentIndex];
+        worldRotations[index] = {
+            parent.w * local.x + parent.x * local.w + parent.y * local.z - parent.z * local.y,
+            parent.w * local.y - parent.x * local.z + parent.y * local.w + parent.z * local.x,
+            parent.w * local.z + parent.x * local.y - parent.y * local.x + parent.z * local.w,
+            parent.w * local.w - parent.x * local.x - parent.y * local.y - parent.z * local.z
+        };
+        const PreviewPoint& offset = localPositions[index];
+        const PreviewPoint cross{
+            parent.y * offset.z - parent.z * offset.y,
+            parent.z * offset.x - parent.x * offset.z,
+            parent.x * offset.y - parent.y * offset.x
+        };
+        const PreviewPoint twiceCross{2.0f * cross.x, 2.0f * cross.y, 2.0f * cross.z};
+        const PreviewPoint rotated{
+            offset.x + parent.w * twiceCross.x + parent.y * twiceCross.z - parent.z * twiceCross.y,
+            offset.y + parent.w * twiceCross.y + parent.z * twiceCross.x - parent.x * twiceCross.z,
+            offset.z + parent.w * twiceCross.z + parent.x * twiceCross.y - parent.y * twiceCross.x
+        };
+        pose[index].x = pose[parentIndex].x + rotated.x;
+        pose[index].y = pose[parentIndex].y + rotated.y;
+        pose[index].z = pose[parentIndex].z + rotated.z;
     }
 
     return pose;

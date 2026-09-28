@@ -38,7 +38,8 @@ struct StorylandSkyState {
     StorylandSkyColor fog;
     StorylandSkyColor ambient;
     StorylandSkyColor directional;
-    StorylandSkyColor sun;
+    StorylandSkyColor sunCore;
+    StorylandSkyColor sunCorona;
     StorylandSkyColor moon;
     StorylandSkyColor cloud;
 

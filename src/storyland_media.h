@@ -51,11 +51,15 @@ public:
     bool isPlaying() const;
 
     bool tickVideo(std::string& errorMessage);
+    bool stepVideoFrame(int direction, std::string& errorMessage);
+    bool seekVideoFrame(uint64_t index, std::string& errorMessage);
     const StorylandVideoFrame& videoFrame() const;
     uint32_t videoWidth() const;
     uint32_t videoHeight() const;
     double videoDurationSeconds() const;
     double videoPositionSeconds() const;
+    double videoFrameRate() const;
+    uint64_t videoFrameIndex() const;
     bool videoDecoderReady() const;
 
     std::string summary() const;
@@ -63,7 +67,9 @@ public:
 private:
     bool loadSdt(const std::wstring& filePath, std::string& errorMessage);
     bool loadRaw(const std::wstring& filePath, std::string& errorMessage);
+    bool loadVb(const std::wstring& filePath, std::string& errorMessage);
     bool loadWav(const std::wstring& filePath, std::string& errorMessage);
+    bool loadCompressedAudio(const std::wstring& filePath, std::string& errorMessage);
     bool loadVideo(const std::wstring& filePath, std::string& errorMessage);
     bool decodeVag(const std::vector<uint8_t>& bytes, size_t offset, size_t size,
                    uint32_t sampleRateHint, StorylandMediaClip& clip, std::string& errorMessage) const;
@@ -94,5 +100,6 @@ private:
     void* waveHeader = nullptr;
     std::vector<uint8_t> waveBytes;
     void* sourceReader = nullptr;
+    void* gameVideoDecoder = nullptr;
 #endif
 };
