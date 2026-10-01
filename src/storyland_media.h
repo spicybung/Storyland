@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <map>
 #include <vector>
 
 struct StorylandMediaClip {
@@ -52,7 +53,10 @@ public:
 
     bool tickVideo(std::string& errorMessage);
     bool stepVideoFrame(int direction, std::string& errorMessage);
-    bool seekVideoFrame(uint64_t index, std::string& errorMessage);
+    bool seekVideoFrame(uint64_t frameIndex, std::string& errorMessage);
+    uint64_t videoFrameCountEstimate() const;
+    bool replaceCurrentVideoFrame(const StorylandVideoFrame& replacement, std::string& errorMessage);
+    bool currentVideoFrameIsOverridden() const;
     const StorylandVideoFrame& videoFrame() const;
     uint32_t videoWidth() const;
     uint32_t videoHeight() const;
@@ -93,6 +97,7 @@ private:
     uint64_t nextVideoDecodeTickMs = 0;
     bool videoPlaying = false;
     bool videoReady = false;
+    std::map<uint64_t, StorylandVideoFrame> videoFrameOverrides;
     std::wstring videoDecodePath;
 
 #ifdef _WIN32

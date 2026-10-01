@@ -40,7 +40,6 @@
 #include "storyland_wbl.h"
 #include "storyland_archive.h"
 #include "storyland_atomic_io.h"
-#include "storyland_scripting.h"
 #include "storyland_dma_validator.h"
 #include "storyland_psp_validator.h"
 #include "storyland_model_validator.h"
@@ -176,7 +175,6 @@ typedef void (APIENTRY *PFNGLACTIVETEXTUREPROC)(GLenum texture);
 #define ID_FILE_EXIT 1055
 #define ID_FILE_RECENT_CLEAR 1056
 #define ID_HELP_WIKI 1057
-#define ID_HELP_SCRIPTING 1107
 #define ID_FILE_EXPORT_CURRENT 1066
 #define ID_FILE_EXPORT_AS 1067
 #define ID_DTZ_FIND 1068
@@ -218,6 +216,15 @@ typedef void (APIENTRY *PFNGLACTIVETEXTUREPROC)(GLenum texture);
 #define ID_FILE_NEW_MODEL_PSP_DFF_WORLD 1104
 #define ID_FILE_NEW_TEXTURE_PSP_XTX 1105
 #define ID_FILE_NEW_TEXTURE_PSP_CHK 1106
+#define ID_VIEW_SCRIPTING_CONSOLE 1107
+#define ID_ARCHIVE_TEST_LVZ_IMG_PAIR 1108
+#define ID_MEDIA_REPLACE_CURRENT_FRAME 1109
+#define ID_SCRIPT_NEW 2101
+#define ID_SCRIPT_OPEN 2102
+#define ID_SCRIPT_SAVE 2103
+#define ID_SCRIPT_RUN 2104
+#define ID_SCRIPT_EDITOR 2105
+#define ID_SCRIPT_OUTPUT 2106
 #define ID_VIEW_SHOW_2DFX_LIGHTS 1059
 #define ID_SCM_CONFIGURE_SANNY 1060
 #define ID_SCM_DECOMPILE_PS2 1061
@@ -236,6 +243,7 @@ typedef void (APIENTRY *PFNGLACTIVETEXTUREPROC)(GLenum texture);
 #define ID_ACTION_SECONDARY 2008
 #define ID_ACTION_TERTIARY 2009
 #define ID_ACTION_QUATERNARY 2010
+#define ID_MEDIA_TIMELINE 2011
 
 static HINSTANCE gInstance = nullptr;
 static HWND gMainWindow = nullptr;
@@ -249,6 +257,8 @@ static HWND gActionPrimary = nullptr;
 static HWND gActionSecondary = nullptr;
 static HWND gActionTertiary = nullptr;
 static HWND gActionQuaternary = nullptr;
+static HWND gMediaTimeline = nullptr;
+static bool gMediaTimelineInternalUpdate = false;
 static HWND gRenderPieWindow = nullptr;
 static HMENU gMainMenu = nullptr;
 static HMENU gFileMenu = nullptr;
@@ -385,15 +395,9 @@ struct StorylandAreaArchive {
 };
 static std::array<StorylandAreaArchive, 3> gAreaArchives;
 static int gActiveAreaArchive = -1;
-static uint64_t gDtzAreaRevision = 0;
 static StorylandAnimFile gAnimFile;
 static StorylandScmFile gScmFile;
 static StorylandMediaFile gMediaFile;
-struct StorylandFilmThumbnail {
-    uint64_t index = 0;
-    StorylandVideoFrame image;
-};
-static std::vector<StorylandFilmThumbnail> gMediaFilmStrip;
 static std::wstring gSannyBuilderPath;
 static RgbaImage gCurrentImage;
 static HBITMAP gTextureBitmap = nullptr;
@@ -658,10 +662,6 @@ static StorylandVec3 rotateVecByQuat(const StorylandQuat& q, StorylandVec3 v) {
 
 static HGLRC gOpenGlContext = nullptr;
 static bool gOpenGlReady = false;
-static GLuint gDtzAreaGeometryList = 0;
-static uint64_t gDtzAreaGeometryRevision = UINT64_MAX;
-static size_t gDtzAreaGeometryInstances = 0;
-static size_t gDtzAreaGeometryTriangles = 0;
 static GLuint gArchiveTexturePreviewId = 0;
 static int gArchiveTexturePreviewIndex = -1;
 static uint32_t gArchiveTexturePreviewHeaderOffset = 0;
@@ -671,18 +671,11 @@ static bool gModelLeftDrag = false;
 static bool gModelRightDrag = false;
 static POINT gModelLastMouse = {};
 static StorylandQuat gModelViewRotation = {};
-static StorylandQuat gModelTargetRotation = {};
 static StorylandQuat gModelDragStartRotation = {};
 static StorylandVec3 gModelDragStartPoint = {};
 static float gModelDistance = 3.5f;
-static float gModelTargetDistance = 3.5f;
 static float gModelPanX = 0.0f;
 static float gModelPanY = 0.0f;
-static float gModelTargetPanX = 0.0f;
-static float gModelTargetPanY = 0.0f;
-static float gModelMoveX = 0.0f;
-static float gModelMoveY = 0.0f;
-static float gModelMoveZ = 0.0f;
 
 static enum class StorylandMode { Empty, TextureArchive, DtzArchive, ModelFile, WblFile, ArchiveFile, AnimFile, ScmFile, MediaFile } gMode = StorylandMode::Empty;
 static int gSelectedIndex = -1;
@@ -789,6 +782,26 @@ static std::vector<StorylandTreePayload> gTreePayloads;
 static std::vector<uint32_t> gArchiveMeshResourceIds;
 static std::vector<uint32_t> gArchiveTextureIds;
 static std::vector<int> gArchiveAnimationEntryIndices;
+
+struct ArchiveViewportPick {
+    int x = 0;
+    int y = 0;
+    int radius = 10;
+    float depth = 1.0f;
+    uint32_t resourceId = 0;
+};
+
+static std::vector<ArchiveViewportPick> gArchiveViewportPicks;
+static bool gModelDragMoved = false;
+static POINT gModelMouseDownPoint = {};
+
+static HWND gScriptWindow = nullptr;
+static HWND gScriptToolbar = nullptr;
+static HWND gScriptEditor = nullptr;
+static HWND gScriptOutput = nullptr;
+static HFONT gScriptFont = nullptr;
+static HBRUSH gScriptBackgroundBrush = nullptr;
+static HBRUSH gScriptToolbarBrush = nullptr;
 
 static LPARAM addTreePayload(StorylandTreeKind kind, int index) {
     gTreePayloads.push_back({kind, index});
@@ -2886,82 +2899,26 @@ static void clearView() {
 
 static void resetModelViewport() {
     gModelViewRotation = {};
-    gModelTargetRotation = gModelViewRotation;
     gModelDragStartRotation = gModelViewRotation;
     gModelDragStartPoint = {};
     gModelViewCubeDrag = false;
     gModelDistance = 3.5f;
-    gModelTargetDistance = gModelDistance;
     gModelPanX = 0.0f;
     gModelPanY = 0.0f;
-    gModelTargetPanX = gModelPanX;
-    gModelTargetPanY = gModelPanY;
-    gModelMoveX = gModelMoveY = gModelMoveZ = 0.0f;
-}
-
-static bool updateModelViewportCamera(float elapsedSeconds) {
-    if (!currentModeUsesInteractiveModelViewport()) {
-        gModelMoveX = gModelMoveY = gModelMoveZ = 0.0f;
-        return false;
-    }
-    const float dt = std::clamp(elapsedSeconds, 0.0f, 0.05f);
-    const HWND focused = GetFocus();
-    const bool keyboardActive = GetActiveWindow() == gMainWindow &&
-        (focused == gPreview || focused == gMainWindow);
-    auto pressed = [&](int key) {
-        return keyboardActive && (GetAsyncKeyState(key) & 0x8000) != 0;
-    };
-    const float x = float(int(pressed('D')) - int(pressed('A')));
-    const float y = float(int(pressed('E')) - int(pressed('Q')));
-    const float z = float(int(pressed('W')) - int(pressed('S')));
-    const float magnitude = std::sqrt(x * x + y * y + z * z);
-    const float moveBlend = 1.0f - std::exp(-dt * 10.0f);
-    gModelMoveX += ((magnitude > 0.0f ? x / magnitude : 0.0f) - gModelMoveX) * moveBlend;
-    gModelMoveY += ((magnitude > 0.0f ? y / magnitude : 0.0f) - gModelMoveY) * moveBlend;
-    gModelMoveZ += ((magnitude > 0.0f ? z / magnitude : 0.0f) - gModelMoveZ) * moveBlend;
-
-    const float panSpeed = std::max(0.25f, gModelTargetDistance * 0.95f);
-    gModelTargetPanX -= gModelMoveX * panSpeed * dt;
-    gModelTargetPanY += gModelMoveY * panSpeed * dt;
-    gModelTargetDistance = std::clamp(gModelTargetDistance * std::exp(-gModelMoveZ * dt * 1.8f), 0.05f, 240.0f);
-
-    const float alpha = 1.0f - std::exp(-dt * 13.0f);
-    const float beforeDistance = gModelDistance;
-    const float beforeX = gModelPanX;
-    const float beforeY = gModelPanY;
-    gModelDistance += (gModelTargetDistance - gModelDistance) * alpha;
-    gModelPanX += (gModelTargetPanX - gModelPanX) * alpha;
-    gModelPanY += (gModelTargetPanY - gModelPanY) * alpha;
-
-    StorylandQuat destination = gModelTargetRotation;
-    float dot = gModelViewRotation.w * destination.w + gModelViewRotation.x * destination.x +
-                gModelViewRotation.y * destination.y + gModelViewRotation.z * destination.z;
-    if (dot < 0.0f) {
-        destination = {-destination.w, -destination.x, -destination.y, -destination.z};
-        dot = -dot;
-    }
-    const bool rotationMoving = dot < 0.999999f;
-    gModelViewRotation = quatNormalize({
-        gModelViewRotation.w + (destination.w - gModelViewRotation.w) * alpha,
-        gModelViewRotation.x + (destination.x - gModelViewRotation.x) * alpha,
-        gModelViewRotation.y + (destination.y - gModelViewRotation.y) * alpha,
-        gModelViewRotation.z + (destination.z - gModelViewRotation.z) * alpha
-    });
-    return rotationMoving || std::fabs(gModelDistance - beforeDistance) > 0.00001f ||
-           std::fabs(gModelPanX - beforeX) > 0.00001f || std::fabs(gModelPanY - beforeY) > 0.00001f ||
-           std::fabs(gModelMoveX) + std::fabs(gModelMoveY) + std::fabs(gModelMoveZ) > 0.001f;
 }
 
 static void applyModelViewportZoom(float scale) {
     if (scale <= 0.0f) return;
-    gModelTargetDistance = std::clamp(gModelTargetDistance * scale, 0.05f, 240.0f);
+    gModelDistance *= scale;
+    if (gModelDistance < 0.05f) gModelDistance = 0.05f;
+    else if (gModelDistance > 240.0f) gModelDistance = 240.0f;
     if (gPreview) InvalidateRect(gPreview, nullptr, FALSE);
 }
 
 static void fitModelViewportCloser() {
-    gModelTargetDistance = 2.25f;
-    gModelTargetPanX = 0.0f;
-    gModelTargetPanY = 0.0f;
+    gModelDistance = 2.25f;
+    gModelPanX = 0.0f;
+    gModelPanY = 0.0f;
     if (gPreview) InvalidateRect(gPreview, nullptr, FALSE);
 }
 
@@ -3008,19 +2965,46 @@ static void stepStoriesSkyTime(float hours) {
 }
 
 static void rotateModelViewport(float degrees, float x, float y, float z) {
-    gModelTargetRotation = quatMul(quatFromAxisAngle(degrees, x, y, z), gModelTargetRotation);
+    gModelViewRotation = quatMul(quatFromAxisAngle(degrees, x, y, z), gModelViewRotation);
     if (gPreview) InvalidateRect(gPreview, nullptr, FALSE);
 }
 
-static bool handleViewportMovementKey(WPARAM key) {
+static bool moveArchiveViewportKey(WPARAM key) {
+    if (gMode != StorylandMode::ArchiveFile) return false;
+
+    float panStep = std::max(0.04f, gModelDistance * 0.055f);
+    float zoomIn = 0.78f;
+    float zoomOut = 1.28f;
+
     switch (key) {
     case 'W':
+        applyModelViewportZoom(zoomIn);
+        setStatus(L"LVZ/IMG: moved in. W/S move in/out, A/D strafe, Q/E vertical, right-drag pan.");
+        return true;
     case 'S':
+        applyModelViewportZoom(zoomOut);
+        setStatus(L"LVZ/IMG: moved out. W/S move in/out, A/D strafe, Q/E vertical, right-drag pan.");
+        return true;
     case 'A':
+        gModelPanX += panStep;
+        if (gPreview) InvalidateRect(gPreview, nullptr, FALSE);
+        setStatus(L"LVZ/IMG: strafe left/right with A/D.");
+        return true;
     case 'D':
+        gModelPanX -= panStep;
+        if (gPreview) InvalidateRect(gPreview, nullptr, FALSE);
+        setStatus(L"LVZ/IMG: strafe left/right with A/D.");
+        return true;
     case 'Q':
+        gModelPanY -= panStep;
+        if (gPreview) InvalidateRect(gPreview, nullptr, FALSE);
+        setStatus(L"LVZ/IMG: vertical move with Q/E.");
+        return true;
     case 'E':
-        return GetFocus() == gPreview || GetFocus() == gMainWindow;
+        gModelPanY += panStep;
+        if (gPreview) InvalidateRect(gPreview, nullptr, FALSE);
+        setStatus(L"LVZ/IMG: vertical move with Q/E.");
+        return true;
     }
 
     return false;
@@ -3144,9 +3128,7 @@ static void showRenderModePie(HWND owner) {
 
 static bool handleModelViewportShortcut(WPARAM key) {
     if (!currentModeUsesInteractiveModelViewport()) return false;
-    const HWND focused = GetFocus();
-    if (focused != gPreview && focused != gMainWindow) return false;
-    if (handleViewportMovementKey(key)) return true;
+    if (moveArchiveViewportKey(key)) return true;
 
     switch (key) {
     case VK_OEM_4: // [
@@ -3160,14 +3142,14 @@ static bool handleModelViewportShortcut(WPARAM key) {
     case VK_ADD:
     case VK_PRIOR:
         applyModelViewportZoom(0.82f);
-        setStatus(L"Preview zoomed in. Keys: + / - zoom, F fit, R/0 reset, 1-4 render. Hold W/S/A/D/Q/E to move.");
+        setStatus(L"Preview zoomed in. Keys: + / - zoom, F fit, R/0 reset, 1-4 render. LVZ/IMG: W/S/A/D/Q/E move.");
         return true;
 
     case VK_OEM_MINUS:
     case VK_SUBTRACT:
     case VK_NEXT:
         applyModelViewportZoom(1.22f);
-        setStatus(L"Preview zoomed out. Keys: + / - zoom, F fit, R/0 reset, 1-4 render. Hold W/S/A/D/Q/E to move.");
+        setStatus(L"Preview zoomed out. Keys: + / - zoom, F fit, R/0 reset, 1-4 render. LVZ/IMG: W/S/A/D/Q/E move.");
         return true;
 
     case VK_LEFT:
@@ -3185,14 +3167,14 @@ static bool handleModelViewportShortcut(WPARAM key) {
 
     case 'F':
         fitModelViewportCloser();
-        setStatus(L"Preview fit closer. Keys: + / - zoom, F fit, R/0 reset, 1-4 render. Hold W/S/A/D/Q/E to move.");
+        setStatus(L"Preview fit closer. Keys: + / - zoom, F fit, R/0 reset, 1-4 render. LVZ/IMG: W/S/A/D/Q/E move.");
         return true;
 
     case 'R':
     case '0':
         resetModelViewport();
         if (gPreview) InvalidateRect(gPreview, nullptr, FALSE);
-        setStatus(L"Preview view reset. Keys: + / - zoom, F fit, R/0 reset, 1-4 render. Hold W/S/A/D/Q/E to move.");
+        setStatus(L"Preview view reset. Keys: + / - zoom, F fit, R/0 reset, 1-4 render. LVZ/IMG: W/S/A/D/Q/E move.");
         return true;
 
     case '1':
@@ -3390,7 +3372,7 @@ static bool beginStoriesShaderProgram(bool useTexture) {
     }
     const StorylandSkyState& sky = gStoriesSky.state();
     loc = pglGetUniformLocation(gStoriesShaderProgram, "uAmbientColor");
-    if (loc >= 0) pglUniform3f(loc, sky.ambient.r, sky.ambient.g, sky.ambient.b);
+    if (loc >= 0) pglUniform3f(loc, sky.objectAmbient.r, sky.objectAmbient.g, sky.objectAmbient.b);
     loc = pglGetUniformLocation(gStoriesShaderProgram, "uDirectionalColor");
     if (loc >= 0) pglUniform3f(loc, sky.directional.r, sky.directional.g, sky.directional.b);
     loc = pglGetUniformLocation(gStoriesShaderProgram, "uSunDirection");
@@ -3412,29 +3394,23 @@ static void setupFixedPipelineStoriesLighting(bool lit) {
     glEnable(GL_LIGHTING);
     glShadeModel(GL_SMOOTH);
     glEnable(GL_LIGHT0);
-    glEnable(GL_LIGHT1);
+    glDisable(GL_LIGHT1);
     glEnable(GL_NORMALIZE);
     glEnable(GL_COLOR_MATERIAL);
     glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE);
 
     const StorylandSkyState& sky = gStoriesSky.state();
-    GLfloat ambientModel[] = {sky.ambient.r, sky.ambient.g, sky.ambient.b, 1.0f};
+    GLfloat ambientModel[] = {sky.objectAmbient.r, sky.objectAmbient.g, sky.objectAmbient.b, 1.0f};
     glLightModelfv(GL_LIGHT_MODEL_AMBIENT, ambientModel);
     GLfloat light0Pos[] = {sky.sunDirectionX, sky.sunDirectionY, sky.sunDirectionZ, 0.0f};
     GLfloat light0Diffuse[] = {sky.directional.r, sky.directional.g, sky.directional.b, 1.0f};
-    GLfloat light0Spec[] = {sky.directional.r * 0.18f, sky.directional.g * 0.18f, sky.directional.b * 0.18f, 1.0f};
+    GLfloat light0Spec[] = {0.0f, 0.0f, 0.0f, 1.0f};
     glLightfv(GL_LIGHT0, GL_POSITION, light0Pos);
     glLightfv(GL_LIGHT0, GL_DIFFUSE, light0Diffuse);
     glLightfv(GL_LIGHT0, GL_SPECULAR, light0Spec);
-    GLfloat light1Pos[] = {-sky.sunDirectionX, -sky.sunDirectionY, 0.35f, 0.0f};
-    GLfloat light1Diffuse[] = {sky.ambient.r * 0.45f, sky.ambient.g * 0.45f, sky.ambient.b * 0.45f, 1.0f};
-    GLfloat light1Spec[] = {0.0f, 0.0f, 0.0f, 1.0f};
-    glLightfv(GL_LIGHT1, GL_POSITION, light1Pos);
-    glLightfv(GL_LIGHT1, GL_DIFFUSE, light1Diffuse);
-    glLightfv(GL_LIGHT1, GL_SPECULAR, light1Spec);
-    GLfloat materialSpec[] = {0.18f, 0.18f, 0.16f, 1.0f};
+    GLfloat materialSpec[] = {0.0f, 0.0f, 0.0f, 1.0f};
     glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, materialSpec);
-    glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 18.0f);
+    glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 0.0f);
 }
 
 static bool initializeOpenGlPreview(HWND hwnd) {
@@ -3499,11 +3475,6 @@ static void destroyOpenGlPreview() {
     if (gOpenGlContext) {
         HDC dc = gPreview ? GetDC(gPreview) : nullptr;
         if (dc) wglMakeCurrent(dc, gOpenGlContext);
-        if (gDtzAreaGeometryList != 0) {
-            glDeleteLists(gDtzAreaGeometryList, 1);
-            gDtzAreaGeometryList = 0;
-        }
-        gDtzAreaGeometryRevision = UINT64_MAX;
         if (gArchiveTexturePreviewId != 0) {
             glDeleteTextures(1, &gArchiveTexturePreviewId);
             gArchiveTexturePreviewId = 0;
@@ -3961,7 +3932,6 @@ static void refreshModeUi();
 static void returnToDtzFromAreaArchive();
 
 static void loadAreaArchivesForCurrentDtz() {
-    ++gDtzAreaRevision;
     if (gActiveAreaArchive >= 0 && gAreaArchives[size_t(gActiveAreaArchive)].browser) {
         std::swap(gArchiveBrowser, *gAreaArchives[size_t(gActiveAreaArchive)].browser);
     }
@@ -4053,7 +4023,6 @@ static void activateAreaArchive(int index) {
     gMode = StorylandMode::ArchiveFile;
     resetModelViewport();
     gModelDistance = 8.0f;
-    gModelTargetDistance = gModelDistance;
     populateArchiveList();
     SetWindowTextW(gMainWindow, (L"Storyland - " + area.name + L" LVZ + IMG").c_str());
     refreshModeUi();
@@ -4352,7 +4321,6 @@ static void populateDtzList() {
 
 static void returnToDtzFromAreaArchive() {
     if (gActiveAreaArchive < 0) return;
-    ++gDtzAreaRevision;
     gMode = StorylandMode::DtzArchive;
     clearDtzFindState(true);
     populateDtzList();
@@ -5025,8 +4993,21 @@ static void populateArchiveList() {
         if (resolution.payloadOffset != 0) line << L" | payload=" << hexWide(resolution.payloadOffset, 8);
         if (resolution.candidateCount > 1) line << L" | candidates=" << resolution.candidateCount;
         HTREEITEM parent = missingRoot;
-        if (resolution.source == "same-sector") { parent = resolvedRoot; sameSectorCount++; }
-        else if (resolution.source == "unique linked sector" || resolution.source == "same-row" || resolution.source == "official AERA" || resolution.source == "master LVZ" || resolution.source == "placement-fit exact RES" || resolution.source == "IMG continuation") { parent = linkedRoot; linkedCount++; }
+        if (resolution.source == "same-sector" || resolution.source == "same-sector verified") {
+            parent = resolvedRoot;
+            sameSectorCount++;
+        }
+        else if (resolution.source == "unique linked sector" ||
+                 resolution.source == "unique linked sector verified" ||
+                 resolution.source == "same-row" ||
+                 resolution.source == "same-row verified" ||
+                 resolution.source == "official AERA" ||
+                 resolution.source == "master LVZ" ||
+                 resolution.source == "placement-fit exact RES" ||
+                 resolution.source == "IMG continuation") {
+            parent = linkedRoot;
+            linkedCount++;
+        }
         else if (resolution.source == "conflict") { parent = conflictRoot; conflictCount++; }
         else missingCount++;
         auto listIndex = meshListIndex.find(resolution.resourceId);
@@ -5292,7 +5273,7 @@ static void selectArchiveMeshResource(int listIndex) {
        << L"Placed instances: " << instanceCount << L"\r\n"
        << L"Sectors used: " << sectorCount << L"\r\n"
        << L"Triangles in parsed resource meshes: " << triangleCount << L"\r\n\r\n"
-       << L"The OpenGL viewport is isolated to this real placed mesh resource.\r\n"
+       << L"The OpenGL viewport remains on the full map. Every placed instance of this resource is highlighted red without opening or isolating its WRLD sector.\r\n"
        << L"Right-click this mesh resource > Replace Selected LVZ+IMG Resource From File to replace this mesh resource in-place. If the selected file is a normal .mdl/.wrld Leeds chunk, Storyland converts its Leeds strip geometry into the existing runtime-safe sector payload slot, preserves this resource id, and does not redirect the Resource[] row.\r\n"
        << L"Right-click this mesh resource > Clone Selected Mesh Resource From Resource ID to clone another already parsed sector mesh resource, like resource 376, into this one while keeping this resource id.\r\n"
        << L"Right-click this mesh resource > Change Selected Mesh Resource ID only when you explicitly want to change the id afterwards.\r\n"
@@ -9046,7 +9027,6 @@ static void returnToGameDtz() {
     gMode = StorylandMode::DtzArchive;
     resetModelViewport();
     gModelDistance = 4.0f;
-    gModelTargetDistance = gModelDistance;
     populateDtzList();
     SetWindowTextW(gMainWindow, gDtzArchive.hasCompanionImg() ? L"Storyland - GAME.DTZ + gta3PS*.img" : L"Storyland - GAME.DTZ");
 
@@ -9616,7 +9596,6 @@ static bool openImgWithGameDtzPair(const std::wstring& imgPath, std::string& err
     refreshModeUi();
     resetModelViewport();
     gModelDistance = 4.0f;
-    gModelTargetDistance = gModelDistance;
     populateDtzList();
     SetWindowTextW(gMainWindow, L"Storyland - GAME.DTZ + gta3PS*.img");
     StorylandTitleTint pairTint = titleTintFromPath(dtzPath);
@@ -10281,6 +10260,28 @@ static std::wstring formatMediaSeconds(double seconds) {
     return out.str();
 }
 
+static void updateMediaTimelineFromDecoder() {
+    if (!gMediaTimeline) return;
+    const bool video = gMode == StorylandMode::MediaFile && gMediaFile.kind() == StorylandMediaKind::Video;
+    ShowWindow(gMediaTimeline, video ? SW_SHOW : SW_HIDE);
+    if (!video) return;
+
+    const uint64_t totalFrames = gMediaFile.videoFrameCountEstimate();
+    const int maximum = int(std::max<uint64_t>(1u, std::min<uint64_t>(totalFrames > 0u ? totalFrames - 1u : 1u, 1000000u)));
+    uint64_t currentFrame = gMediaFile.videoFrameIndex();
+    int position = 0;
+    if (totalFrames > 1u) {
+        position = int(std::min<uint64_t>(uint64_t(maximum),
+            (currentFrame * uint64_t(maximum)) / (totalFrames - 1u)));
+    }
+    gMediaTimelineInternalUpdate = true;
+    SendMessageW(gMediaTimeline, TBM_SETRANGEMIN, FALSE, 0);
+    SendMessageW(gMediaTimeline, TBM_SETRANGEMAX, FALSE, maximum);
+    SendMessageW(gMediaTimeline, TBM_SETPAGESIZE, 0, std::max(1, maximum / 20));
+    SendMessageW(gMediaTimeline, TBM_SETPOS, TRUE, position);
+    gMediaTimelineInternalUpdate = false;
+}
+
 static void updateMediaVideoDetails() {
     if (gMediaFile.kind() != StorylandMediaKind::Video) return;
     std::wstringstream details;
@@ -10291,7 +10292,9 @@ static void updateMediaVideoDetails() {
             << L"Frame: " << gMediaFile.videoFrameIndex() << L"\r\n"
             << L"Position: " << std::fixed << std::setprecision(3) << gMediaFile.videoPositionSeconds() << L" s\r\n"
             << L"Duration: " << formatMediaSeconds(gMediaFile.videoDurationSeconds()) << L"\r\n"
-            << L"Decoder: Windows Media Foundation\r\n"
+            << L"Decoder: FFmpeg/Media Foundation game-video path\r\n"
+            << L"Frame scrubber: frame-accurate seek\r\n"
+            << L"Current frame replacement: " << (gMediaFile.currentVideoFrameIsOverridden() ? L"edited in current session" : L"original decoded frame") << L"\r\n"
             << L"Frame stepping: Previous Frame / Next Frame\r\n";
     setDetails(details.str());
 }
@@ -10319,63 +10322,6 @@ static void drawMediaFrameImage(HDC dc, const RECT& bounds, const StorylandVideo
                   frame.bgra.data(), &info, DIB_RGB_COLORS, SRCCOPY);
 }
 
-static void collectMediaFilmFrame() {
-    if (gMediaFile.kind() != StorylandMediaKind::Video) return;
-    const StorylandVideoFrame& frame = gMediaFile.videoFrame();
-    if (frame.width == 0 || frame.height == 0 ||
-        frame.bgra.size() < uint64_t(frame.width) * frame.height * 4u) return;
-    const uint64_t index = gMediaFile.videoFrameIndex();
-    for (const auto& item : gMediaFilmStrip) if (item.index == index) return;
-
-    StorylandFilmThumbnail item;
-    item.index = index;
-    item.image.width = 144;
-    item.image.height = 90;
-    item.image.bgra.resize(144u * 90u * 4u);
-    for (uint32_t y = 0; y < 90; ++y) {
-        const uint32_t sourceY = uint32_t(uint64_t(y) * frame.height / 90u);
-        for (uint32_t x = 0; x < 144; ++x) {
-            const uint32_t sourceX = uint32_t(uint64_t(x) * frame.width / 144u);
-            const size_t from = (size_t(sourceY) * frame.width + sourceX) * 4u;
-            const size_t to = (size_t(y) * 144u + x) * 4u;
-            std::memcpy(item.image.bgra.data() + to, frame.bgra.data() + from, 4u);
-        }
-    }
-    auto position = std::lower_bound(gMediaFilmStrip.begin(), gMediaFilmStrip.end(), index,
-        [](const StorylandFilmThumbnail& existing, uint64_t value) { return existing.index < value; });
-    gMediaFilmStrip.insert(position, std::move(item));
-    while (gMediaFilmStrip.size() > 240u) gMediaFilmStrip.erase(gMediaFilmStrip.begin());
-}
-
-struct StorylandFilmLayout {
-    int divider = 0;
-    int left = 0;
-    int top = 0;
-    int slotWidth = 0;
-    int slots = 0;
-    size_t first = 0;
-};
-
-static StorylandFilmLayout mediaFilmLayout(const RECT& rc) {
-    StorylandFilmLayout layout;
-    layout.divider = int(rc.top) + std::max<int>(0, int(rc.bottom - rc.top)) * 68 / 100;
-    layout.left = rc.left + 10;
-    layout.top = layout.divider + 30;
-    const int available = std::max(1, int(rc.right - rc.left) - 20);
-    layout.slots = std::max(1, available / 154);
-    layout.slotWidth = std::max(1, available / layout.slots);
-    if (gMediaFilmStrip.empty()) return layout;
-    const uint64_t current = gMediaFile.videoFrameIndex();
-    auto chosen = std::lower_bound(gMediaFilmStrip.begin(), gMediaFilmStrip.end(), current,
-        [](const StorylandFilmThumbnail& item, uint64_t value) { return item.index < value; });
-    const size_t selected = chosen == gMediaFilmStrip.end()
-        ? gMediaFilmStrip.size() - 1u : size_t(chosen - gMediaFilmStrip.begin());
-    const size_t count = std::min<size_t>(size_t(layout.slots), gMediaFilmStrip.size());
-    layout.first = std::min(gMediaFilmStrip.size() - count,
-        selected > count / 2u ? selected - count / 2u : 0u);
-    return layout;
-}
-
 static void drawMediaPreview(HDC dc, RECT rc) {
     HBRUSH background = CreateSolidBrush(storylandPaneBackgroundColor());
     FillRect(dc, &rc, background);
@@ -10383,50 +10329,25 @@ static void drawMediaPreview(HDC dc, RECT rc) {
 
     if (gMediaFile.kind() == StorylandMediaKind::Video) {
         const StorylandVideoFrame& frame = gMediaFile.videoFrame();
-        const StorylandFilmLayout film = mediaFilmLayout(rc);
-        const int divider = film.divider;
-        RECT playerImage{rc.left + 8, rc.top + 28, rc.right - 8, divider - 7};
-        drawMediaFrameImage(dc, playerImage, frame);
-
-        HPEN separator = CreatePen(PS_SOLID, 1, storylandPaneBorderColor());
-        HGDIOBJ previousPen = SelectObject(dc, separator);
-        MoveToEx(dc, rc.left + 8, divider, nullptr);
-        LineTo(dc, rc.right - 8, divider);
-        SelectObject(dc, previousPen);
-        DeleteObject(separator);
+        RECT frameImage{rc.left + 8, rc.top + 30, rc.right - 8, rc.bottom - 30};
+        drawMediaFrameImage(dc, frameImage, frame);
 
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, storylandPaneTextColor());
-        std::wstring playerStatus = L"Video  " + std::to_wstring(gMediaFile.videoWidth()) + L"x" +
-            std::to_wstring(gMediaFile.videoHeight()) + L"  " +
-            formatMediaSeconds(gMediaFile.videoPositionSeconds()) + L" / " +
-            formatMediaSeconds(gMediaFile.videoDurationSeconds());
-        TextOutW(dc, rc.left + 10, rc.top + 7, playerStatus.c_str(), int(playerStatus.size()));
+        std::wstringstream playerStatus;
+        playerStatus << L"Video  " << gMediaFile.videoWidth() << L"x" << gMediaFile.videoHeight()
+                     << L"  |  frame " << gMediaFile.videoFrameIndex() << L" / "
+                     << (gMediaFile.videoFrameCountEstimate() > 0u ? gMediaFile.videoFrameCountEstimate() - 1u : 0u)
+                     << L"  |  " << std::fixed << std::setprecision(3) << gMediaFile.videoPositionSeconds() << L" s";
+        if (gMediaFile.currentVideoFrameIsOverridden()) playerStatus << L"  |  REPLACED";
+        const std::wstring status = playerStatus.str();
+        TextOutW(dc, rc.left + 10, rc.top + 7, status.c_str(), int(status.size()));
 
-        const std::wstring frameStatus = L"Frames — click a picture to seek  |  #" +
-            std::to_wstring(gMediaFile.videoFrameIndex());
-        TextOutW(dc, rc.left + 10, divider + 9, frameStatus.c_str(), int(frameStatus.size()));
-        const int visible = std::min<int>(film.slots, int(gMediaFilmStrip.size() - film.first));
-        for (int slot = 0; slot < visible; ++slot) {
-            const auto& thumb = gMediaFilmStrip[film.first + size_t(slot)];
-            const int x = film.left + slot * film.slotWidth;
-            RECT picture{x + 3, film.top, x + film.slotWidth - 5, rc.bottom - 26};
-            drawMediaFrameImage(dc, picture, thumb.image);
-            const bool selected = thumb.index == gMediaFile.videoFrameIndex();
-            HPEN pen = CreatePen(PS_SOLID, selected ? 2 : 1,
-                selected ? RGB(235, 38, 141) : storylandPaneBorderColor());
-            HGDIOBJ previous = SelectObject(dc, pen);
-            HGDIOBJ brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-            Rectangle(dc, picture.left, picture.top, picture.right, picture.bottom);
-            SelectObject(dc, brush);
-            SelectObject(dc, previous);
-            DeleteObject(pen);
-            const std::wstring label = L"#" + std::to_wstring(thumb.index);
-            TextOutW(dc, x + 6, rc.bottom - 24, label.c_str(), int(label.size()));
-        }
-        if (frame.bgra.empty() && visible == 0) {
-            const wchar_t* prompt = L"Press Play or Next Frame to decode a frame.";
-            TextOutW(dc, rc.left + 12, film.top + 4, prompt, int(wcslen(prompt)));
+        const wchar_t* hint = L"Drag the frame slider to scrub like a video editor. Right-click and choose Replace Current Frame Image to edit this frame.";
+        TextOutW(dc, rc.left + 10, rc.bottom - 22, hint, int(wcslen(hint)));
+        if (frame.bgra.empty()) {
+            const wchar_t* prompt = L"Press Play, step a frame, or drag the timeline to decode a frame.";
+            TextOutW(dc, frameImage.left + 4, frameImage.top + 4, prompt, int(wcslen(prompt)));
         }
         return;
     }
@@ -10576,14 +10497,12 @@ static void openStorylandFile(const std::wstring& path) {
     }
 
     if (isStorylandMediaExtension(ext)) {
-        gMediaFilmStrip.clear();
         if (!gMediaFile.loadFromFile(path, error)) {
             MessageBoxW(gMainWindow, widen(error).c_str(), L"Storyland media open failed", MB_ICONERROR);
             return;
         }
         clearView();
         gMode = StorylandMode::MediaFile;
-        collectMediaFilmFrame();
         populateMediaList();
         SetWindowTextW(gMainWindow,
             gMediaFile.kind() == StorylandMediaKind::Video ? L"Storyland - Video Player" : L"Storyland - Audio Player");
@@ -10634,7 +10553,6 @@ static void openStorylandFile(const std::wstring& path) {
         gMode = StorylandMode::AnimFile;
         resetModelViewport();
         gModelDistance = 3.0f;
-        gModelTargetDistance = gModelDistance;
         populateAnimList();
         startAnimationPlaybackTimer();
         SetWindowTextW(gMainWindow, L"Storyland - ANIM Player");
@@ -10728,7 +10646,6 @@ static void openStorylandFile(const std::wstring& path) {
             gMode = StorylandMode::ArchiveFile;
             resetModelViewport();
             gModelDistance = 8.0f;
-            gModelTargetDistance = gModelDistance;
             populateArchiveList();
             SetWindowTextW(gMainWindow, L"Storyland - IMG Browser");
             applyStorylandTitleTint(gArchiveBrowser.hasLvzContext() ? titleTintFromPath(path) : StorylandTitleTint::LCS);
@@ -10754,7 +10671,6 @@ static void openStorylandFile(const std::wstring& path) {
         gMode = StorylandMode::ArchiveFile;
         resetModelViewport();
         gModelDistance = 8.0f;
-        gModelTargetDistance = gModelDistance;
         populateArchiveList();
         SetWindowTextW(gMainWindow, L"Storyland - LVZ + IMG Browser");
         applyStorylandTitleTintForPath(path);
@@ -10786,7 +10702,6 @@ static void openStorylandFile(const std::wstring& path) {
         gMode = StorylandMode::WblFile;
         resetModelViewport();
         gModelDistance = 5.0f;
-        gModelTargetDistance = gModelDistance;
         gModelPanX = 0.0f;
         gModelPanY = 0.0f;
         populateWblList();
@@ -10835,7 +10750,6 @@ static void openStorylandFile(const std::wstring& path) {
         gMode = StorylandMode::DtzArchive;
         resetModelViewport();
         gModelDistance = 4.0f;
-        gModelTargetDistance = gModelDistance;
         populateDtzList();
         SetWindowTextW(gMainWindow, gDtzArchive.hasCompanionImg() ? L"Storyland - GAME.DTZ + gta3PS*.img" : L"Storyland - GAME.DTZ");
         StorylandTitleTint dtzTint = titleTintFromPath(path);
@@ -10941,10 +10855,7 @@ static bool currentModeUsesInteractiveModelViewport() {
     if (gMode == StorylandMode::ModelFile || gMode == StorylandMode::ArchiveFile || gMode == StorylandMode::AnimFile || gMode == StorylandMode::WblFile) return true;
     if (gMode == StorylandMode::DtzArchive) {
         if (gDtzEmbeddedPreviewKind == DtzEmbeddedPreviewKind::ModelFile) return true;
-        if (gDtzEmbeddedPreviewKind == DtzEmbeddedPreviewKind::None) {
-            if (!gDtzArchive.leeds2dfxEffects().empty()) return true;
-            for (const auto& area : gAreaArchives) if (area.browser) return true;
-        }
+        if (gDtzEmbeddedPreviewKind == DtzEmbeddedPreviewKind::None && !gDtzArchive.leeds2dfxEffects().empty()) return true;
     }
     return false;
 }
@@ -11547,14 +11458,92 @@ static void replaceSelectedArchiveResourceFromFile() {
         return;
     }
 
+    const StorylandArchiveEntry selectedBeforeReplace = gArchiveBrowser.entries()[size_t(gSelectedIndex)];
     if (!gArchiveBrowser.replaceEntryBytes(size_t(gSelectedIndex), replacementBytes, report, error)) {
         MessageBoxW(gMainWindow, widen(error).c_str(), L"LVZ+IMG replacement failed", MB_ICONERROR);
         return;
     }
 
     populateArchiveList();
+    int rebuiltIndex = -1;
+    const auto& rebuiltEntries = gArchiveBrowser.entries();
+    for (size_t i = 0; i < rebuiltEntries.size(); ++i) {
+        const StorylandArchiveEntry& entry = rebuiltEntries[i];
+        const bool sameIdent = entry.chunkIdent == selectedBeforeReplace.chunkIdent ||
+            (archiveEntryIsWorld(entry) && archiveEntryIsWorld(selectedBeforeReplace));
+        if (entry.byteOffset == selectedBeforeReplace.byteOffset && sameIdent) {
+            rebuiltIndex = int(i);
+            break;
+        }
+    }
+    if (rebuiltIndex >= 0) {
+        selectTreePayloadItem(StorylandTreeKind::ArchiveEntry, rebuiltIndex);
+        selectArchiveEntry(rebuiltIndex);
+    }
     setDetails(widen(report));
-    setStatus(L"LVZ+IMG resource replaced in memory; right-click the archive tree to rebuild or overwrite the LVZ + IMG pair.");
+    setStatus(L"LVZ+IMG resource replaced in-place and verified; original IMG offsets remain stable.");
+}
+
+static void testCurrentLvzImgPair() {
+    if (gMode != StorylandMode::ArchiveFile || !gArchiveBrowser.hasLvzContext() || !gArchiveBrowser.hasImgContext()) {
+        MessageBoxW(gMainWindow, L"Open an LVZ + IMG pair first.", L"Test LVZ/IMG Pair", MB_ICONINFORMATION);
+        return;
+    }
+    std::string report;
+    std::string error;
+    if (!gArchiveBrowser.validateLvzImgPair(report, error)) {
+        setDetails(widen(error));
+        MessageBoxW(gMainWindow, L"LVZ/IMG pair test failed. The detailed report is shown in the lower pane.", L"Test LVZ/IMG Pair", MB_ICONERROR);
+        setStatus(L"LVZ/IMG test: FAIL");
+        return;
+    }
+    setDetails(widen(report));
+    setStatus(L"LVZ/IMG test: PASS - archive ranges, WRLD resources, geometry, and PS2 DMA/VIF/GIF structural checks passed.");
+}
+
+static StorylandVideoFrame makeReplacementVideoFrame(const RgbaImage& image, uint32_t width, uint32_t height) {
+    StorylandVideoFrame frame;
+    frame.width = width;
+    frame.height = height;
+    if (width == 0u || height == 0u || image.width <= 0 || image.height <= 0 || image.rgba.empty()) return frame;
+    frame.bgra.resize(size_t(width) * size_t(height) * 4u);
+    for (uint32_t y = 0; y < height; ++y) {
+        const uint32_t sy = std::min<uint32_t>(uint32_t(image.height - 1), uint32_t((uint64_t(y) * uint64_t(image.height)) / height));
+        for (uint32_t x = 0; x < width; ++x) {
+            const uint32_t sx = std::min<uint32_t>(uint32_t(image.width - 1), uint32_t((uint64_t(x) * uint64_t(image.width)) / width));
+            const size_t src = (size_t(sy) * size_t(image.width) + size_t(sx)) * 4u;
+            const size_t dst = (size_t(y) * size_t(width) + size_t(x)) * 4u;
+            frame.bgra[dst + 0] = image.rgba[src + 2];
+            frame.bgra[dst + 1] = image.rgba[src + 1];
+            frame.bgra[dst + 2] = image.rgba[src + 0];
+            frame.bgra[dst + 3] = image.rgba[src + 3];
+        }
+    }
+    return frame;
+}
+
+static void replaceCurrentVideoFrameImage() {
+    if (gMode != StorylandMode::MediaFile || gMediaFile.kind() != StorylandMediaKind::Video || gMediaFile.videoFrame().bgra.empty()) {
+        MessageBoxW(gMainWindow, L"Decode or scrub to a video frame first.", L"Replace Current Frame Image", MB_ICONINFORMATION);
+        return;
+    }
+    const std::wstring path = openFileDialog(L"Image\0*.png;*.bmp;*.jpg;*.jpeg;*.tif;*.tiff\0All files\0*.*\0");
+    if (path.empty()) return;
+    RgbaImage image;
+    std::string error;
+    if (!loadImageWithWic(path, image, error)) {
+        MessageBoxW(gMainWindow, widen(error).c_str(), L"Frame image load failed", MB_ICONERROR);
+        return;
+    }
+    StorylandVideoFrame replacement = makeReplacementVideoFrame(image, gMediaFile.videoWidth(), gMediaFile.videoHeight());
+    if (!gMediaFile.replaceCurrentVideoFrame(replacement, error)) {
+        MessageBoxW(gMainWindow, widen(error).c_str(), L"Replace Current Frame Image failed", MB_ICONERROR);
+        return;
+    }
+    updateMediaVideoDetails();
+    updateMediaTimelineFromDecoder();
+    InvalidateRect(gPreview, nullptr, FALSE);
+    setStatus(L"Replaced decoded frame " + std::to_wstring(gMediaFile.videoFrameIndex()) + L" in the current editing session. Scrubbing away and back preserves the frame edit.");
 }
 
 static void exportSelectedResourceBytes() {
@@ -12802,7 +12791,44 @@ static void drawArchivePreviewBox(float minX, float minY, float minZ, float maxX
     glEnd();
 }
 
+static bool projectArchiveViewportPoint(
+    float x,
+    float y,
+    float z,
+    const GLdouble model[16],
+    const GLdouble projection[16],
+    const GLint viewport[4],
+    int& screenX,
+    int& screenY,
+    float& depth) {
+    const GLdouble in[4] = {x, y, z, 1.0};
+    GLdouble eye[4] = {};
+    GLdouble clip[4] = {};
+
+    for (int row = 0; row < 4; ++row) {
+        eye[row] = model[row] * in[0] + model[4 + row] * in[1] +
+                   model[8 + row] * in[2] + model[12 + row] * in[3];
+    }
+    for (int row = 0; row < 4; ++row) {
+        clip[row] = projection[row] * eye[0] + projection[4 + row] * eye[1] +
+                    projection[8 + row] * eye[2] + projection[12 + row] * eye[3];
+    }
+    if (std::fabs(clip[3]) < 1.0e-9 || clip[3] <= 0.0) return false;
+
+    const GLdouble ndcX = clip[0] / clip[3];
+    const GLdouble ndcY = clip[1] / clip[3];
+    const GLdouble ndcZ = clip[2] / clip[3];
+    if (ndcX < -1.15 || ndcX > 1.15 || ndcY < -1.15 || ndcY > 1.15 || ndcZ < -1.0 || ndcZ > 1.0) return false;
+
+    screenX = viewport[0] + int((ndcX + 1.0) * 0.5 * GLdouble(viewport[2]));
+    const int openGlY = viewport[1] + int((ndcY + 1.0) * 0.5 * GLdouble(viewport[3]));
+    screenY = viewport[3] - 1 - openGlY;
+    depth = float((ndcZ + 1.0) * 0.5);
+    return true;
+}
+
 static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
+    gArchiveViewportPicks.clear();
     if (!gOpenGlReady && !initializeOpenGlPreview(hwnd)) {
         FillRect(dc, &rc, reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1));
         TextOutW(dc, rc.left + 8, rc.top + 8, L"OpenGL init failed for LVZ/IMG preview", 38);
@@ -12985,7 +13011,6 @@ static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
 
     for (const auto& placement : placements) {
         if (selectedSectorIndex >= 0 && int(placement.sectorIndex) != selectedSectorIndex) continue;
-        if (selectedResourceIndex >= 0 && int(placement.resourceIndex) != selectedResourceIndex) continue;
         if (selectedTextureId >= 0) {
             uint64_t key = (uint64_t(placement.sectorIndex) << 32) | uint64_t(placement.resourceIndex);
             auto meshFoundForTexture = meshByKey.find(key);
@@ -13046,7 +13071,7 @@ static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
         maxZ = std::max(maxZ, point.z + point.radius);
     }
 
-    bool shouldIncludeSectorExtents = selectedResourceIndex < 0 && selectedTextureId < 0;
+    bool shouldIncludeSectorExtents = selectedTextureId < 0;
     if (shouldIncludeSectorExtents) {
         for (const auto& sector : sectors) {
             if (selectedSectorIndex >= 0 && int(sector.sectorIndex) != selectedSectorIndex) continue;
@@ -13071,6 +13096,38 @@ static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
     glMultModelQuat(gModelViewRotation);
     glScalef(modelScale, modelScale, modelScale);
     glTranslatef(-centerX, -centerY, -centerZ);
+
+    gArchiveViewportPicks.clear();
+    GLdouble pickModel[16] = {};
+    GLdouble pickProjection[16] = {};
+    GLint pickViewport[4] = {};
+    glGetDoublev(GL_MODELVIEW_MATRIX, pickModel);
+    glGetDoublev(GL_PROJECTION_MATRIX, pickProjection);
+    glGetIntegerv(GL_VIEWPORT, pickViewport);
+    for (const auto& placement : placements) {
+        if (selectedSectorIndex >= 0 && int(placement.sectorIndex) != selectedSectorIndex) continue;
+        if (selectedTextureId >= 0) {
+            uint64_t key = (uint64_t(placement.sectorIndex) << 32) | uint64_t(placement.resourceIndex);
+            auto meshFoundForTexture = meshByKey.find(key);
+            if (meshFoundForTexture == meshByKey.end() || meshFoundForTexture->second == nullptr) continue;
+            if (!meshUsesTextureId(*meshFoundForTexture->second, uint32_t(selectedTextureId))) continue;
+        }
+
+        int screenX = 0;
+        int screenY = 0;
+        float depth = 1.0f;
+        if (!projectArchiveViewportPoint(placement.x, placement.y, placement.z, pickModel, pickProjection, pickViewport, screenX, screenY, depth)) continue;
+
+        int edgeX = 0;
+        int edgeY = 0;
+        float edgeDepth = 1.0f;
+        int radius = 10;
+        const float worldRadius = std::max(1.0f, std::min(20.0f, placement.boundRadius));
+        if (projectArchiveViewportPoint(placement.x + worldRadius, placement.y, placement.z, pickModel, pickProjection, pickViewport, edgeX, edgeY, edgeDepth)) {
+            radius = std::max(8, std::min(42, std::abs(edgeX - screenX) + 5));
+        }
+        gArchiveViewportPicks.push_back({screenX, screenY, radius, depth, placement.resourceIndex});
+    }
 
     float gridStep = largestSpan / 20.0f;
     if (gridStep < 50.0f) gridStep = 50.0f;
@@ -13140,65 +13197,135 @@ static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
         return handle;
     };
 
+    // Leeds WRLD stores geometry in render passes.  Drawing every pass as opaque
+    // geometry makes the night-light shells and alpha meshes look like enormous
+    // malformed buildings even though their transforms are valid.  Match the
+    // retail pass intent: opaque first, then no-z-write, transparent, and finally
+    // night-only light geometry.  SUPERLOD/LOD were already excluded while
+    // parsing the placement lists.
+    const bool worldNight = gStoriesSky.time() < 6.0f || gStoriesSky.time() >= 20.0f;
+    auto placementRenderPhase = [&](const StorylandWorldPlacement& placement) -> int {
+        if (placement.passName == "LIGHTS") return worldNight ? 3 : -1;
+        if (placement.passName == "TRANSPARENT") return 2;
+        if (placement.passName == "NOZWRITE") return 1;
+        return 0;
+    };
+
     glEnable(GL_CULL_FACE);
     glCullFace(GL_BACK);
-    bool triangleBatchOpen = false;
-    GLuint activeTexture = GLuint(-1);
-    uint32_t activeMaterial = 0xFFFFFFFEu;
-    for (const auto& placement : placements) {
-        if (selectedSectorIndex >= 0 && int(placement.sectorIndex) != selectedSectorIndex) continue;
-        if (selectedResourceIndex >= 0 && int(placement.resourceIndex) != selectedResourceIndex) continue;
-        uint64_t key = (uint64_t(placement.sectorIndex) << 32) | uint64_t(placement.resourceIndex);
-        auto found = meshByKey.find(key);
-        if (found == meshByKey.end() || found->second == nullptr) continue;
-        const StorylandWorldMesh& mesh = *found->second;
-        if (mesh.vertices.empty() || mesh.triangles.empty()) continue;
-
-        drawnInstances++;
-        for (const StorylandWorldMeshTriangle& tri : mesh.triangles) {
-            if (selectedTextureId >= 0 && int(tri.textureId) != selectedTextureId) continue;
-            if (tri.a >= mesh.vertices.size() || tri.b >= mesh.vertices.size() || tri.c >= mesh.vertices.size()) continue;
-            uint32_t desiredMaterial = tri.textureId;
-            GLuint textureHandle = activeTexture == GLuint(-1) ? 0 : activeTexture;
-            if (desiredMaterial != activeMaterial) {
-                if (triangleBatchOpen) glEnd();
-                activeMaterial = desiredMaterial;
-                textureHandle = desiredMaterial == 0xFFFFFFFFu ? 0 : textureForMaterial(desiredMaterial);
-                activeTexture = textureHandle;
-                if (textureHandle != 0) {
-                    glEnable(GL_TEXTURE_2D);
-                    glBindTexture(GL_TEXTURE_2D, textureHandle);
-                    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
-                } else {
-                    glDisable(GL_TEXTURE_2D);
-                }
-                glBegin(GL_TRIANGLES);
-                triangleBatchOpen = true;
-            }
-            uint32_t seed = tri.textureId == 0xFFFFFFFFu ? placement.resourceIndex : tri.textureId;
-            float r = 0.30f + float((seed * 37u + 31u) & 0x7Fu) / 255.0f;
-            float g = 0.30f + float((seed * 67u + 91u) & 0x7Fu) / 255.0f;
-            float b = 0.30f + float((seed * 97u + 17u) & 0x7Fu) / 255.0f;
-            if (textureHandle != 0) glColor3f(1.0f, 1.0f, 1.0f);
-            else glColor3f(r, g, b);
-
-            const StorylandWorldMeshVertex* verts[3] = {
-                &mesh.vertices[tri.a],
-                &mesh.vertices[tri.b],
-                &mesh.vertices[tri.c]
-            };
-            for (const StorylandWorldMeshVertex* vertex : verts) {
-                if (textureHandle != 0) glTexCoord2f(vertex->u, vertex->v);
-                float wx = placement.matrix[0] * vertex->x + placement.matrix[4] * vertex->y + placement.matrix[8]  * vertex->z + placement.matrix[12];
-                float wy = placement.matrix[1] * vertex->x + placement.matrix[5] * vertex->y + placement.matrix[9]  * vertex->z + placement.matrix[13];
-                float wz = placement.matrix[2] * vertex->x + placement.matrix[6] * vertex->y + placement.matrix[10] * vertex->z + placement.matrix[14];
-                glVertex3f(wx, wy, wz);
-            }
-
-            drawnTriangles++;
+    for (int renderPhase = 0; renderPhase < 4; ++renderPhase) {
+        if (renderPhase == 0) {
+            glDisable(GL_BLEND);
+            glDepthMask(GL_TRUE);
+        } else if (renderPhase == 1) {
+            glDisable(GL_BLEND);
+            glDepthMask(GL_FALSE);
+        } else if (renderPhase == 2) {
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glDepthMask(GL_FALSE);
+        } else {
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+            glDepthMask(GL_FALSE);
         }
+
+        bool triangleBatchOpen = false;
+        GLuint activeTexture = GLuint(-1);
+        uint32_t activeMaterial = 0xFFFFFFFEu;
+        for (const auto& placement : placements) {
+            if (placementRenderPhase(placement) != renderPhase) continue;
+            if (selectedSectorIndex >= 0 && int(placement.sectorIndex) != selectedSectorIndex) continue;
+            uint64_t key = (uint64_t(placement.sectorIndex) << 32) | uint64_t(placement.resourceIndex);
+            auto found = meshByKey.find(key);
+            if (found == meshByKey.end() || found->second == nullptr) continue;
+            const StorylandWorldMesh& mesh = *found->second;
+            if (mesh.vertices.empty() || mesh.triangles.empty()) continue;
+
+            drawnInstances++;
+            for (const StorylandWorldMeshTriangle& tri : mesh.triangles) {
+                if (selectedTextureId >= 0 && int(tri.textureId) != selectedTextureId) continue;
+                if (tri.a >= mesh.vertices.size() || tri.b >= mesh.vertices.size() || tri.c >= mesh.vertices.size()) continue;
+                uint32_t desiredMaterial = tri.textureId;
+                GLuint textureHandle = activeTexture == GLuint(-1) ? 0 : activeTexture;
+                if (desiredMaterial != activeMaterial) {
+                    if (triangleBatchOpen) glEnd();
+                    activeMaterial = desiredMaterial;
+                    textureHandle = desiredMaterial == 0xFFFFFFFFu ? 0 : textureForMaterial(desiredMaterial);
+                    activeTexture = textureHandle;
+                    if (textureHandle != 0) {
+                        glEnable(GL_TEXTURE_2D);
+                        glBindTexture(GL_TEXTURE_2D, textureHandle);
+                        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+                    } else {
+                        glDisable(GL_TEXTURE_2D);
+                    }
+                    glBegin(GL_TRIANGLES);
+                    triangleBatchOpen = true;
+                }
+                const bool isSelectedResource = selectedResourceIndex >= 0 &&
+                                                int(placement.resourceIndex) == selectedResourceIndex;
+                uint32_t seed = tri.textureId == 0xFFFFFFFFu ? placement.resourceIndex : tri.textureId;
+                float r = 0.30f + float((seed * 37u + 31u) & 0x7Fu) / 255.0f;
+                float g = 0.30f + float((seed * 67u + 91u) & 0x7Fu) / 255.0f;
+                float b = 0.30f + float((seed * 97u + 17u) & 0x7Fu) / 255.0f;
+                const float fallbackAlpha = renderPhase == 2 ? 0.45f : (renderPhase == 3 ? 0.70f : 1.0f);
+                if (isSelectedResource) {
+                    glColor4f(1.0f, 0.12f, 0.12f, renderPhase >= 2 ? 0.85f : 1.0f);
+                } else if (textureHandle != 0) {
+                    glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+                } else {
+                    glColor4f(r, g, b, fallbackAlpha);
+                }
+
+                const StorylandWorldMeshVertex* verts[3] = {
+                    &mesh.vertices[tri.a],
+                    &mesh.vertices[tri.b],
+                    &mesh.vertices[tri.c]
+                };
+
+                // The retail sGeomInstance bounding sphere is authoritative for
+                // this placement.  A decoded strip can contain false tail data
+                // when the WRLD payload parser walks past the real packet end.
+                // Those false vertices are exactly what produce the remaining
+                // giant wedges/slabs even when the instance matrix itself is
+                // correct.  Do not draw a triangle if any transformed vertex
+                // falls materially outside the retail placement sphere.
+                float transformed[3][3] = {};
+                bool triangleInsideRetailBound = true;
+                const float retailRadius = std::max(0.01f, std::fabs(placement.boundRadius));
+                const float retailLimit = retailRadius * 1.20f + 0.50f;
+                const float retailLimitSquared = retailLimit * retailLimit;
+                for (int vertexIndex = 0; vertexIndex < 3; ++vertexIndex) {
+                    const StorylandWorldMeshVertex* vertex = verts[vertexIndex];
+                    const float wx = placement.matrix[0] * vertex->x + placement.matrix[4] * vertex->y + placement.matrix[8]  * vertex->z + placement.matrix[12];
+                    const float wy = placement.matrix[1] * vertex->x + placement.matrix[5] * vertex->y + placement.matrix[9]  * vertex->z + placement.matrix[13];
+                    const float wz = placement.matrix[2] * vertex->x + placement.matrix[6] * vertex->y + placement.matrix[10] * vertex->z + placement.matrix[14];
+                    transformed[vertexIndex][0] = wx;
+                    transformed[vertexIndex][1] = wy;
+                    transformed[vertexIndex][2] = wz;
+                    const float dx = wx - placement.boundX;
+                    const float dy = wy - placement.boundY;
+                    const float dz = wz - placement.boundZ;
+                    if (dx * dx + dy * dy + dz * dz > retailLimitSquared) {
+                        triangleInsideRetailBound = false;
+                        break;
+                    }
+                }
+                if (!triangleInsideRetailBound) continue;
+
+                for (int vertexIndex = 0; vertexIndex < 3; ++vertexIndex) {
+                    if (textureHandle != 0) glTexCoord2f(verts[vertexIndex]->u, verts[vertexIndex]->v);
+                    glVertex3f(transformed[vertexIndex][0], transformed[vertexIndex][1], transformed[vertexIndex][2]);
+                }
+
+                drawnTriangles++;
+            }
+        }
+        if (triangleBatchOpen) glEnd();
     }
-    if (triangleBatchOpen) glEnd();
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
     glDisable(GL_TEXTURE_2D);
     glDisable(GL_CULL_FACE);
 
@@ -13211,7 +13338,13 @@ static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
         glPointSize(selectedSectorIndex >= 0 || selectedResourceIndex >= 0 ? 5.0f : 3.0f);
         glBegin(GL_POINTS);
         for (const auto& point : points) {
-            glColor3f(point.isSectorFallback ? 0.35f : 0.78f, point.isSectorFallback ? 0.55f : 0.78f, point.isSectorFallback ? 1.0f : 0.70f);
+            if (selectedResourceIndex >= 0 && int(point.resourceIndex) == selectedResourceIndex) {
+                glColor3f(1.0f, 0.12f, 0.12f);
+            } else {
+                glColor3f(point.isSectorFallback ? 0.35f : 0.78f,
+                          point.isSectorFallback ? 0.55f : 0.78f,
+                          point.isSectorFallback ? 1.0f : 0.70f);
+            }
             glVertex3f(point.x, point.y, point.z);
         }
         glEnd();
@@ -13226,7 +13359,9 @@ static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
     wglMakeCurrent(nullptr, nullptr);
 
     std::wstring title = L"OpenGL LVZ+IMG mesh viewport  |  ";
-    if (selectedEntry || gSelectedKind == StorylandTreeKind::ArchiveMeshResource || gSelectedKind == StorylandTreeKind::ArchiveTextureResource || gSelectedKind == StorylandTreeKind::ArchiveAnimationResource) {
+    if (gSelectedKind == StorylandTreeKind::ArchiveMeshResource && selectedResourceIndex >= 0) {
+        title += L"highlighted=" + widen(selectedName);
+    } else if (selectedEntry || gSelectedKind == StorylandTreeKind::ArchiveTextureResource || gSelectedKind == StorylandTreeKind::ArchiveAnimationResource) {
         title += L"selected=" + widen(selectedName);
     } else {
         title += L"real sector overlay meshes";
@@ -14324,58 +14459,183 @@ static void drawDtzLeeds2dfxPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
     stopStoriesShaderProgram();
     setupFixedPipelineStoriesLighting(false);
 
+    size_t drawnAreaInstances = 0;
+    size_t drawnAreaTriangles = 0;
+    size_t drawnTexturedTriangles = 0;
     glDisable(GL_BLEND);
-    glDisable(GL_CULL_FACE);
-    glDisable(GL_TEXTURE_2D);
-    if (gDtzAreaGeometryRevision != gDtzAreaRevision || gDtzAreaGeometryList == 0) {
-        if (gDtzAreaGeometryList != 0) glDeleteLists(gDtzAreaGeometryList, 1);
-        gDtzAreaGeometryList = glGenLists(1);
-        if (gDtzAreaGeometryList != 0) glNewList(gDtzAreaGeometryList, GL_COMPILE);
-        size_t drawnAreaInstances = 0;
-        size_t drawnAreaTriangles = 0;
-        for (size_t areaIndex = 0; areaIndex < areaBrowsers.size(); ++areaIndex) {
-            const StorylandArchiveBrowser* browser = areaBrowsers[areaIndex];
-            if (!browser) continue;
-            std::map<uint64_t, const StorylandWorldMesh*> meshByKey;
-            for (const auto& mesh : browser->worldMeshes()) {
-                const uint64_t key = (uint64_t(mesh.sectorIndex) << 32) | mesh.resourceIndex;
-                meshByKey.emplace(key, &mesh);
+    glEnable(GL_CULL_FACE);
+    glCullFace(GL_BACK);
+
+    for (size_t areaIndex = 0; areaIndex < areaBrowsers.size(); ++areaIndex) {
+        const StorylandArchiveBrowser* browser = areaBrowsers[areaIndex];
+        if (!browser) continue;
+
+        std::map<uint64_t, const StorylandWorldMesh*> meshByKey;
+        for (const auto& mesh : browser->worldMeshes()) {
+            const uint64_t key = (uint64_t(mesh.sectorIndex) << 32) | mesh.resourceIndex;
+            meshByKey.emplace(key, &mesh);
+        }
+
+        std::map<uint32_t, const StorylandDirectTextureResource*> boundTextureByMaterial;
+        for (const auto& texture : browser->directTextures()) {
+            if (texture.materialId < 0 || texture.width <= 0 || texture.height <= 0 || texture.rgba.empty()) continue;
+            boundTextureByMaterial.emplace(uint32_t(texture.materialId), &texture);
+        }
+
+        std::map<uint32_t, GLuint> uploadedTextures;
+        auto textureForMaterial = [&](uint32_t materialId) -> GLuint {
+            const auto uploaded = uploadedTextures.find(materialId);
+            if (uploaded != uploadedTextures.end()) return uploaded->second;
+
+            const auto foundTexture = boundTextureByMaterial.find(materialId);
+            if (foundTexture == boundTextureByMaterial.end() || foundTexture->second == nullptr) return 0;
+
+            const StorylandDirectTextureResource& texture = *foundTexture->second;
+            GLuint handle = 0;
+            glGenTextures(1, &handle);
+            if (handle == 0) return 0;
+
+            glBindTexture(GL_TEXTURE_2D, handle);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, texture.width, texture.height, 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, texture.rgba.data());
+            uploadedTextures.emplace(materialId, handle);
+            return handle;
+        };
+
+        // Render WRLD pass classes with the same intent as the standalone
+        // LVZ+IMG viewport.  In particular, LIGHTS is a night-only geometry
+        // pass and TRANSPARENT must not be drawn as opaque world geometry.
+        const bool areaNight = gStoriesSky.time() < 6.0f || gStoriesSky.time() >= 20.0f;
+        auto placementRenderPhase = [&](const StorylandWorldPlacement& placement) -> int {
+            if (placement.passName == "LIGHTS") return areaNight ? 3 : -1;
+            if (placement.passName == "TRANSPARENT") return 2;
+            if (placement.passName == "NOZWRITE") return 1;
+            return 0;
+        };
+
+        for (int renderPhase = 0; renderPhase < 4; ++renderPhase) {
+            if (renderPhase == 0) {
+                glDisable(GL_BLEND);
+                glDepthMask(GL_TRUE);
+            } else if (renderPhase == 1) {
+                glDisable(GL_BLEND);
+                glDepthMask(GL_FALSE);
+            } else if (renderPhase == 2) {
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                glDepthMask(GL_FALSE);
+            } else {
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+                glDepthMask(GL_FALSE);
             }
+
+            GLuint activeTexture = GLuint(-1);
+            uint32_t activeMaterial = 0xFFFFFFFEu;
+            bool triangleBatchOpen = false;
+
             for (const auto& placement : browser->placements()) {
+                if (placementRenderPhase(placement) != renderPhase) continue;
                 const uint64_t key = (uint64_t(placement.sectorIndex) << 32) | placement.resourceIndex;
                 const auto found = meshByKey.find(key);
-                if (found == meshByKey.end()) continue;
+                if (found == meshByKey.end() || found->second == nullptr) continue;
+
                 const StorylandWorldMesh& mesh = *found->second;
                 if (mesh.vertices.empty() || mesh.triangles.empty()) continue;
                 ++drawnAreaInstances;
-                glPushMatrix();
-                glMultMatrixf(placement.matrix);
-                glBegin(GL_TRIANGLES);
+
                 for (const auto& triangle : mesh.triangles) {
                     if (triangle.a >= mesh.vertices.size() || triangle.b >= mesh.vertices.size() ||
                         triangle.c >= mesh.vertices.size()) continue;
-                    const uint32_t seed = triangle.textureId == 0xFFFFFFFFu
-                        ? placement.resourceIndex : triangle.textureId;
-                    const float tint = areaIndex == 0 ? 0.07f : (areaIndex == 1 ? 0.0f : 0.12f);
-                    glColor3f(0.32f + float((seed * 37u + 31u) & 0x7Fu) / 255.0f + tint,
-                              0.32f + float((seed * 67u + 91u) & 0x7Fu) / 255.0f + tint,
-                              0.32f + float((seed * 97u + 17u) & 0x7Fu) / 255.0f);
-                    for (uint32_t vertexIndex : {triangle.a, triangle.b, triangle.c}) {
-                        const auto& vertex = mesh.vertices[vertexIndex];
-                        glVertex3f(vertex.x, vertex.y, vertex.z);
+
+                    const uint32_t desiredMaterial = triangle.textureId;
+                    GLuint textureHandle = activeTexture == GLuint(-1) ? 0 : activeTexture;
+                    if (desiredMaterial != activeMaterial) {
+                        if (triangleBatchOpen) glEnd();
+                        activeMaterial = desiredMaterial;
+                        textureHandle = desiredMaterial == 0xFFFFFFFFu ? 0 : textureForMaterial(desiredMaterial);
+                        activeTexture = textureHandle;
+                        if (textureHandle != 0) {
+                            glEnable(GL_TEXTURE_2D);
+                            glBindTexture(GL_TEXTURE_2D, textureHandle);
+                            glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+                        } else {
+                            glDisable(GL_TEXTURE_2D);
+                        }
+                        glBegin(GL_TRIANGLES);
+                        triangleBatchOpen = true;
+                    }
+
+                    if (textureHandle != 0) {
+                        glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+                        ++drawnTexturedTriangles;
+                    } else {
+                        const uint32_t seed = triangle.textureId == 0xFFFFFFFFu
+                            ? placement.resourceIndex : triangle.textureId;
+                        const float tint = areaIndex == 0 ? 0.07f : (areaIndex == 1 ? 0.0f : 0.12f);
+                        const float alpha = renderPhase == 2 ? 0.45f : (renderPhase == 3 ? 0.70f : 1.0f);
+                        glColor4f(0.32f + float((seed * 37u + 31u) & 0x7Fu) / 255.0f + tint,
+                                  0.32f + float((seed * 67u + 91u) & 0x7Fu) / 255.0f + tint,
+                                  0.32f + float((seed * 97u + 17u) & 0x7Fu) / 255.0f,
+                                  alpha);
+                    }
+
+                    const StorylandWorldMeshVertex* vertices[3] = {
+                        &mesh.vertices[triangle.a],
+                        &mesh.vertices[triangle.b],
+                        &mesh.vertices[triangle.c]
+                    };
+
+                    float transformed[3][3] = {};
+                    bool triangleInsideRetailBound = true;
+                    const float retailRadius = std::max(0.01f, std::fabs(placement.boundRadius));
+                    const float retailLimit = retailRadius * 1.20f + 0.50f;
+                    const float retailLimitSquared = retailLimit * retailLimit;
+                    for (int vertexIndex = 0; vertexIndex < 3; ++vertexIndex) {
+                        const StorylandWorldMeshVertex* vertex = vertices[vertexIndex];
+                        const float wx = placement.matrix[0] * vertex->x + placement.matrix[4] * vertex->y + placement.matrix[8]  * vertex->z + placement.matrix[12];
+                        const float wy = placement.matrix[1] * vertex->x + placement.matrix[5] * vertex->y + placement.matrix[9]  * vertex->z + placement.matrix[13];
+                        const float wz = placement.matrix[2] * vertex->x + placement.matrix[6] * vertex->y + placement.matrix[10] * vertex->z + placement.matrix[14];
+                        transformed[vertexIndex][0] = wx;
+                        transformed[vertexIndex][1] = wy;
+                        transformed[vertexIndex][2] = wz;
+                        const float dx = wx - placement.boundX;
+                        const float dy = wy - placement.boundY;
+                        const float dz = wz - placement.boundZ;
+                        if (dx * dx + dy * dy + dz * dz > retailLimitSquared) {
+                            triangleInsideRetailBound = false;
+                            break;
+                        }
+                    }
+                    if (!triangleInsideRetailBound) continue;
+
+                    for (int vertexIndex = 0; vertexIndex < 3; ++vertexIndex) {
+                        if (textureHandle != 0) glTexCoord2f(vertices[vertexIndex]->u, vertices[vertexIndex]->v);
+                        glVertex3f(transformed[vertexIndex][0], transformed[vertexIndex][1], transformed[vertexIndex][2]);
                     }
                     ++drawnAreaTriangles;
                 }
-                glEnd();
-                glPopMatrix();
             }
+
+            if (triangleBatchOpen) glEnd();
         }
-        if (gDtzAreaGeometryList != 0) glEndList();
-        gDtzAreaGeometryInstances = drawnAreaInstances;
-        gDtzAreaGeometryTriangles = drawnAreaTriangles;
-        gDtzAreaGeometryRevision = gDtzAreaRevision;
+        glDepthMask(GL_TRUE);
+        glDisable(GL_BLEND);
+        glDisable(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D, 0);
+
+        for (const auto& uploaded : uploadedTextures) {
+            GLuint handle = uploaded.second;
+            if (handle != 0) glDeleteTextures(1, &handle);
+        }
     }
-    if (gDtzAreaGeometryList != 0) glCallList(gDtzAreaGeometryList);
+    glDisable(GL_TEXTURE_2D);
+    glDisable(GL_CULL_FACE);
 
     if (gOpenGlShowGrid) {
         float gridExtent = std::max(2.0f, largestSpan * 0.6f);
@@ -14501,8 +14761,9 @@ static void drawDtzLeeds2dfxPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
             overlay << gAreaArchives[index].name;
             first = false;
         }
-        overlay << L") | " << gDtzAreaGeometryInstances << L" mesh instances, "
-                << gDtzAreaGeometryTriangles << L" triangles | " << lights.size() << L" world lights";
+        overlay << L") | " << drawnAreaInstances << L" mesh instances, "
+                << drawnAreaTriangles << L" triangles, "
+                << drawnTexturedTriangles << L" textured | " << lights.size() << L" world lights";
     } else if (worldPositioned) {
         overlay << L"Leeds GAME.DTZ world 2DFX: " << lights.size()
                 << L" allocated CEntity light instances | BUILDING/TREADABLE/DUMMY native matrices";
@@ -14512,6 +14773,35 @@ static void drawDtzLeeds2dfxPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
     }
     std::wstring overlayText = overlay.str();
     TextOutW(dc, rc.left + 10, rc.top + 10, overlayText.c_str(), int(overlayText.size()));
+}
+
+static bool selectArchiveResourceFromViewportPoint(int x, int y) {
+    if (gMode != StorylandMode::ArchiveFile || gArchiveViewportPicks.empty()) return false;
+
+    const ArchiveViewportPick* best = nullptr;
+    double bestScore = (std::numeric_limits<double>::max)();
+    for (const ArchiveViewportPick& pick : gArchiveViewportPicks) {
+        const int dx = x - pick.x;
+        const int dy = y - pick.y;
+        const double distanceSquared = double(dx) * double(dx) + double(dy) * double(dy);
+        const double radiusSquared = double(pick.radius) * double(pick.radius);
+        if (distanceSquared > radiusSquared) continue;
+        const double score = distanceSquared + double(pick.depth) * 64.0;
+        if (score < bestScore) {
+            bestScore = score;
+            best = &pick;
+        }
+    }
+    if (!best) return false;
+
+    for (size_t i = 0; i < gArchiveMeshResourceIds.size(); ++i) {
+        if (gArchiveMeshResourceIds[i] != best->resourceId) continue;
+        selectTreePayloadItem(StorylandTreeKind::ArchiveMeshResource, int(i));
+        selectArchiveMeshResource(int(i));
+        setStatus(L"Selected resource " + std::to_wstring(best->resourceId) + L" from the viewport; its placed instances are highlighted red. Right-click it in the resource tree to export or replace it.");
+        return true;
+    }
+    return false;
 }
 
 static LRESULT CALLBACK previewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -14559,38 +14849,17 @@ static LRESULT CALLBACK previewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     if (msg == WM_KEYDOWN && handleModelViewportShortcut(wParam)) {
         return 0;
     }
-    if (msg == WM_LBUTTONDOWN && gMode == StorylandMode::MediaFile &&
-        gMediaFile.kind() == StorylandMediaKind::Video) {
-        RECT client{};
-        GetClientRect(hwnd, &client);
-        const StorylandFilmLayout film = mediaFilmLayout(client);
-        const int x = GET_X_LPARAM(lParam), y = GET_Y_LPARAM(lParam);
-        const int slot = film.slotWidth > 0 ? (x - film.left) / film.slotWidth : -1;
-        if (x >= film.left && y >= film.top && y < client.bottom && slot >= 0 && slot < film.slots &&
-            film.first + size_t(slot) < gMediaFilmStrip.size()) {
-            std::string error;
-            const uint64_t index = gMediaFilmStrip[film.first + size_t(slot)].index;
-            if (!gMediaFile.seekVideoFrame(index, error))
-                setStatus(L"Could not seek to frame " + std::to_wstring(index) + L": " + widen(error));
-            else {
-                collectMediaFilmFrame();
-                updateMediaVideoDetails();
-                setStatus(L"Video frame " + std::to_wstring(gMediaFile.videoFrameIndex()) + L" | " +
-                          formatMediaSeconds(gMediaFile.videoPositionSeconds()));
-            }
-            InvalidateRect(hwnd, nullptr, FALSE);
-            return 0;
-        }
-    }
     if (msg == WM_LBUTTONDOWN && currentModeUsesInteractiveModelViewport()) {
         gModelLeftDrag = true;
+        gModelDragMoved = false;
         gModelLastMouse.x = GET_X_LPARAM(lParam);
         gModelLastMouse.y = GET_Y_LPARAM(lParam);
+        gModelMouseDownPoint = gModelLastMouse;
         gModelViewCubeDrag = pointInViewCube(hwnd, gModelLastMouse.x, gModelLastMouse.y);
         gModelDragStartPoint = gModelViewCubeDrag ?
             viewCubePointFromMouse(hwnd, gModelLastMouse.x, gModelLastMouse.y) :
             arcballPointFromMouse(hwnd, gModelLastMouse.x, gModelLastMouse.y);
-        gModelDragStartRotation = gModelTargetRotation;
+        gModelDragStartRotation = gModelViewRotation;
         SetFocus(hwnd);
         SetCapture(hwnd);
         return 0;
@@ -14604,8 +14873,16 @@ static LRESULT CALLBACK previewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     }
     if ((msg == WM_LBUTTONUP || msg == WM_RBUTTONUP) && currentModeUsesInteractiveModelViewport()) {
         if (msg == WM_LBUTTONUP) {
+            const bool wasViewCubeDrag = gModelViewCubeDrag;
+            const bool wasClick = !gModelDragMoved && !wasViewCubeDrag;
+            const int clickX = GET_X_LPARAM(lParam);
+            const int clickY = GET_Y_LPARAM(lParam);
             gModelLeftDrag = false;
             gModelViewCubeDrag = false;
+            if (wasClick && selectArchiveResourceFromViewportPoint(clickX, clickY)) {
+                ReleaseCapture();
+                return 0;
+            }
         }
         if (msg == WM_RBUTTONUP) gModelRightDrag = false;
         if (!gModelLeftDrag && !gModelRightDrag) ReleaseCapture();
@@ -14619,26 +14896,26 @@ static LRESULT CALLBACK previewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         gModelLastMouse.x = x;
         gModelLastMouse.y = y;
         if (gModelLeftDrag) {
+            if (std::abs(x - gModelMouseDownPoint.x) > 3 || std::abs(y - gModelMouseDownPoint.y) > 3) gModelDragMoved = true;
             StorylandVec3 currentPoint = gModelViewCubeDrag ?
                 viewCubePointFromMouse(hwnd, x, y) :
                 arcballPointFromMouse(hwnd, x, y);
             StorylandQuat dragDelta = quatFromVectors(gModelDragStartPoint, currentPoint);
-            gModelTargetRotation = quatMul(dragDelta, gModelDragStartRotation);
+            gModelViewRotation = quatMul(dragDelta, gModelDragStartRotation);
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
         if (gModelRightDrag) {
-            float panScale = (gMode == StorylandMode::ArchiveFile || gMode == StorylandMode::DtzArchive)
-                ? std::max(0.006f, gModelTargetDistance * 0.004f) : 0.005f;
-            gModelTargetPanX += float(dx) * panScale;
-            gModelTargetPanY -= float(dy) * panScale;
+            float panScale = (gMode == StorylandMode::ArchiveFile) ? std::max(0.006f, gModelDistance * 0.004f) : 0.005f;
+            gModelPanX += float(dx) * panScale;
+            gModelPanY -= float(dy) * panScale;
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
     }
     if (msg == WM_MOUSEWHEEL && currentModeUsesInteractiveModelViewport()) {
         short delta = GET_WHEEL_DELTA_WPARAM(wParam);
-        applyModelViewportZoom(std::exp(-float(delta) / float(WHEEL_DELTA) * 0.13f));
+        applyModelViewportZoom(delta > 0 ? 0.88f : 1.14f);
         return 0;
     }
     if (msg == WM_LBUTTONDBLCLK && currentModeUsesInteractiveModelViewport()) {
@@ -14653,6 +14930,7 @@ static void updateActionBar() {
     if (!gActionBar || !gActionPrimary || !gActionSecondary || !gActionTertiary || !gActionQuaternary) return;
     ShowWindow(gActionPrimary, SW_HIDE);
     ShowWindow(gActionSecondary, SW_HIDE);
+    if (gMediaTimeline) ShowWindow(gMediaTimeline, SW_HIDE);
     ShowWindow(gActionTertiary, SW_HIDE);
     ShowWindow(gActionQuaternary, SW_HIDE);
     EnableWindow(gActionSecondary, TRUE);
@@ -14714,6 +14992,7 @@ static void updateActionBar() {
             SetWindowTextW(gActionQuaternary, L"Next Frame");
             ShowWindow(gActionTertiary, SW_SHOW);
             ShowWindow(gActionQuaternary, SW_SHOW);
+            updateMediaTimelineFromDecoder();
         }
     } else {
         ShowWindow(gActionBar, SW_HIDE);
@@ -14791,30 +15070,21 @@ static void layoutChildren(HWND hwnd) {
 
     const int actionHeight =
         (gActionBar && IsWindowVisible(gActionBar)) ? 36 : 0;
-    const int fullWidth = std::max(0, int(rc.right - rc.left));
-    HWND scriptingPane = storylandScriptingConsoleWindow();
-    const int scriptingWidth = scriptingPane && IsWindow(scriptingPane)
-        ? std::clamp(fullWidth / 4, 260, 400) : 0;
-    const int clientWidth = std::max(0, fullWidth - (scriptingWidth ? scriptingWidth + gutter : 0));
+    const int clientWidth = std::max(0, int(rc.right - rc.left));
     const int clientHeight = std::max(0, int(rc.bottom - rc.top));
 
     SendMessageW(gStatus, WM_SIZE, 0, 0);
     storylandMoveWindowToRect(
         gStatus,
-        {0, std::max(0, clientHeight - statusHeight), fullWidth, clientHeight});
+        {0, std::max(0, clientHeight - statusHeight), clientWidth, clientHeight});
     storylandMoveWindowToRect(
         gMenuStrip,
-        {0, 0, fullWidth, menuHeight});
+        {0, 0, clientWidth, menuHeight});
 
     const int contentTop = menuHeight + gutter;
     const int contentBottom =
         std::max(contentTop, clientHeight - statusHeight - gutter);
     const int contentHeight = std::max(0, contentBottom - contentTop);
-
-    if (scriptingWidth) {
-        MoveWindow(scriptingPane, clientWidth + gutter, contentTop,
-                   scriptingWidth - gutter, contentHeight, TRUE);
-    }
 
     if (gAnalyzeGraphActive) {
         ShowWindow(gPreview, SW_HIDE);
@@ -14898,6 +15168,21 @@ static void layoutChildren(HWND hwnd) {
         contentTop + previewH
     };
     storylandMoveWindowToRect(gPreview, previewRect);
+    if (gMediaTimeline) {
+        if (videoFrameViewer) {
+            const int timelineHeight = 30;
+            const StorylandUiRect timelineRect{
+                previewRect.left + 8,
+                std::max(previewRect.top + 4, previewRect.bottom - timelineHeight - 4),
+                previewRect.right - 8,
+                previewRect.bottom - 4
+            };
+            storylandMoveWindowToRect(gMediaTimeline, timelineRect);
+            SetWindowPos(gMediaTimeline, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        } else {
+            ShowWindow(gMediaTimeline, SW_HIDE);
+        }
+    }
 
     int cursorY = previewRect.bottom + gutter;
 
@@ -15575,9 +15860,12 @@ static bool buildTreeContextMenu(HMENU menu) {
         }
         if (gArchiveBrowser.hasLvzContext() && gArchiveBrowser.hasImgContext()) {
             if (hasItems) AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            hasItems = addContextMenuItem(menu, ID_ARCHIVE_TEST_LVZ_IMG_PAIR, L"Test LVZ/IMG Pair") || hasItems;
             hasItems = addContextMenuItem(menu, ID_ARCHIVE_EXPORT_LVZ_IMG_PAIR, L"Rebuild LVZ + IMG As...") || hasItems;
             hasItems = addContextMenuItem(menu, ID_ARCHIVE_OVERWRITE_LVZ_IMG_PAIR, L"Overwrite Current LVZ + IMG...") || hasItems;
         }
+    } else if (gMode == StorylandMode::MediaFile && gMediaFile.kind() == StorylandMediaKind::Video) {
+        hasItems = addContextMenuItem(menu, ID_MEDIA_REPLACE_CURRENT_FRAME, L"Replace Current Frame Image...") || hasItems;
     }
 
     return hasItems;
@@ -15875,6 +16163,343 @@ static void rebuildFileMenu() {
     if (gMenuStrip) InvalidateRect(gMenuStrip, nullptr, TRUE);
 }
 
+
+static std::wstring scriptControlText(HWND control) {
+    if (!control) return L"";
+    const int length = GetWindowTextLengthW(control);
+    if (length <= 0) return L"";
+    std::wstring text(size_t(length) + 1u, L'\0');
+    GetWindowTextW(control, text.data(), length + 1);
+    text.resize(size_t(length));
+    return text;
+}
+
+static void setScriptOutput(const std::wstring& text) {
+    if (gScriptOutput) SetWindowTextW(gScriptOutput, text.c_str());
+}
+
+static std::wstring trimScriptLine(const std::wstring& line) {
+    size_t begin = 0;
+    while (begin < line.size() && iswspace(line[begin])) ++begin;
+    size_t end = line.size();
+    while (end > begin && iswspace(line[end - 1])) --end;
+    return line.substr(begin, end - begin);
+}
+
+static bool scriptExtractCallArgument(const std::wstring& line, const std::wstring& prefix, std::wstring& argument) {
+    if (line.rfind(prefix, 0) != 0 || line.size() < prefix.size() + 1u || line.back() != L')') return false;
+    argument = trimScriptLine(line.substr(prefix.size(), line.size() - prefix.size() - 1u));
+    return true;
+}
+
+static bool scriptParseFloat(const std::wstring& text, float& value) {
+    wchar_t* end = nullptr;
+    errno = 0;
+    const float parsed = std::wcstof(text.c_str(), &end);
+    if (errno != 0 || end == text.c_str()) return false;
+    while (*end && iswspace(*end)) ++end;
+    if (*end) return false;
+    value = parsed;
+    return std::isfinite(value);
+}
+
+static bool scriptParseTwoFloats(const std::wstring& text, float& a, float& b) {
+    const size_t comma = text.find(L',');
+    if (comma == std::wstring::npos) return false;
+    return scriptParseFloat(trimScriptLine(text.substr(0, comma)), a) &&
+           scriptParseFloat(trimScriptLine(text.substr(comma + 1)), b);
+}
+
+static bool scriptParseFourFloats(const std::wstring& text, float& a, float& b, float& c, float& d) {
+    std::array<std::wstring, 4> parts;
+    size_t start = 0;
+    for (size_t i = 0; i < 3; ++i) {
+        const size_t comma = text.find(L',', start);
+        if (comma == std::wstring::npos) return false;
+        parts[i] = trimScriptLine(text.substr(start, comma - start));
+        start = comma + 1;
+    }
+    parts[3] = trimScriptLine(text.substr(start));
+    return scriptParseFloat(parts[0], a) && scriptParseFloat(parts[1], b) &&
+           scriptParseFloat(parts[2], c) && scriptParseFloat(parts[3], d);
+}
+
+static std::wstring scriptUnquote(std::wstring value) {
+    value = trimScriptLine(value);
+    if (value.size() >= 2u && ((value.front() == L'"' && value.back() == L'"') ||
+                              (value.front() == L'\'' && value.back() == L'\''))) {
+        return value.substr(1u, value.size() - 2u);
+    }
+    return value;
+}
+
+static void runStorylandScriptEditor() {
+    const std::wstring source = scriptControlText(gScriptEditor);
+    std::wistringstream stream(source);
+    std::wstring line;
+    std::wstringstream output;
+    int lineNumber = 0;
+    int executed = 0;
+
+    while (std::getline(stream, line)) {
+        ++lineNumber;
+        line = trimScriptLine(line);
+        if (line.empty() || line.rfind(L"#", 0) == 0 || line.rfind(L"//", 0) == 0) continue;
+
+        std::wstring argument;
+        bool handled = false;
+
+        if (line == L"storyland.reset()") {
+            resetModelViewport();
+            handled = true;
+            output << L"> reset viewport\r\n";
+        } else if (scriptExtractCallArgument(line, L"storyland.zoom(", argument)) {
+            float scale = 0.0f;
+            if (!scriptParseFloat(argument, scale) || scale <= 0.0f) {
+                output << L"Line " << lineNumber << L": zoom() requires a positive number.\r\n";
+                continue;
+            }
+            applyModelViewportZoom(scale);
+            handled = true;
+            output << L"> zoom " << scale << L"\r\n";
+        } else if (scriptExtractCallArgument(line, L"storyland.pan(", argument)) {
+            float x = 0.0f, y = 0.0f;
+            if (!scriptParseTwoFloats(argument, x, y)) {
+                output << L"Line " << lineNumber << L": pan() requires x, y.\r\n";
+                continue;
+            }
+            gModelPanX += x;
+            gModelPanY += y;
+            handled = true;
+            output << L"> pan " << x << L", " << y << L"\r\n";
+        } else if (scriptExtractCallArgument(line, L"storyland.rotate(", argument)) {
+            float degrees = 0.0f, x = 0.0f, y = 0.0f, z = 0.0f;
+            if (!scriptParseFourFloats(argument, degrees, x, y, z)) {
+                output << L"Line " << lineNumber << L": rotate() requires degrees, x, y, z.\r\n";
+                continue;
+            }
+            rotateModelViewport(degrees, x, y, z);
+            handled = true;
+            output << L"> rotate " << degrees << L" degrees\r\n";
+        } else if (scriptExtractCallArgument(line, L"storyland.grid(", argument)) {
+            const std::wstring value = trimScriptLine(argument);
+            if (value == L"True" || value == L"true" || value == L"1") gOpenGlShowGrid = true;
+            else if (value == L"False" || value == L"false" || value == L"0") gOpenGlShowGrid = false;
+            else {
+                output << L"Line " << lineNumber << L": grid() requires True or False.\r\n";
+                continue;
+            }
+            handled = true;
+            output << L"> grid " << (gOpenGlShowGrid ? L"on" : L"off") << L"\r\n";
+        } else if (scriptExtractCallArgument(line, L"storyland.dark(", argument)) {
+            const std::wstring value = trimScriptLine(argument);
+            bool dark = gEyeFriendlyPaneBackground;
+            if (value == L"True" || value == L"true" || value == L"1") dark = true;
+            else if (value == L"False" || value == L"false" || value == L"0") dark = false;
+            else {
+                output << L"Line " << lineNumber << L": dark() requires True or False.\r\n";
+                continue;
+            }
+            if (dark != gEyeFriendlyPaneBackground) {
+                gEyeFriendlyPaneBackground = dark;
+                applyStorylandPaneBackground(gMainWindow);
+                rebuildViewMenu();
+            }
+            handled = true;
+            output << L"> UI " << (dark ? L"dark" : L"light") << L"\r\n";
+        } else if (scriptExtractCallArgument(line, L"storyland.open(", argument)) {
+            const std::wstring path = scriptUnquote(argument);
+            if (path.empty()) {
+                output << L"Line " << lineNumber << L": open() requires a quoted path.\r\n";
+                continue;
+            }
+            openStorylandFile(path);
+            handled = true;
+            output << L"> opened " << path << L"\r\n";
+        }
+
+        if (!handled) {
+            output << L"Line " << lineNumber << L": unsupported statement: " << line << L"\r\n";
+            continue;
+        }
+        ++executed;
+    }
+
+    if (executed == 0 && output.str().empty()) output << L"Nothing to run.\r\n";
+    else output << L"\r\nExecuted " << executed << L" Storyland API statement" << (executed == 1 ? L"." : L"s.") << L"\r\n";
+    setScriptOutput(output.str());
+    InvalidateRect(gPreview, nullptr, FALSE);
+}
+
+static void loadStorylandScriptFile() {
+    const std::wstring path = openFileDialog(L"Storyland script\0*.py;*.txt\0Python files\0*.py\0Text files\0*.txt\0All files\0*.*\0");
+    if (path.empty()) return;
+    std::wifstream file{std::filesystem::path(path)};
+    if (!file) {
+        setScriptOutput(L"Could not open script file:\r\n" + path);
+        return;
+    }
+    std::wstringstream contents;
+    contents << file.rdbuf();
+    SetWindowTextW(gScriptEditor, contents.str().c_str());
+    setScriptOutput(L"Loaded " + path + L"\r\n");
+}
+
+static void saveStorylandScriptFile() {
+    const std::wstring path = saveFileDialog(L"Python-style Storyland script\0*.py\0Text files\0*.txt\0All files\0*.*\0", L"py");
+    if (path.empty()) return;
+    std::wofstream file{std::filesystem::path(path), std::ios::trunc};
+    if (!file) {
+        setScriptOutput(L"Could not save script file:\r\n" + path);
+        return;
+    }
+    file << scriptControlText(gScriptEditor);
+    file.flush();
+    setScriptOutput(L"Saved " + path + L"\r\n");
+}
+
+static void layoutStorylandScriptWindow(HWND hwnd) {
+    RECT client{};
+    GetClientRect(hwnd, &client);
+    const int width = std::max(1, static_cast<int>(client.right - client.left));
+    const int height = std::max(1, static_cast<int>(client.bottom - client.top));
+    const int toolbarHeight = 38;
+    const int gap = 6;
+    const int outputHeight = std::max(120, height / 4);
+    const int editorHeight = std::max(80, height - toolbarHeight - outputHeight - gap * 3);
+
+    if (gScriptToolbar) MoveWindow(gScriptToolbar, 0, 0, width, toolbarHeight, TRUE);
+    if (gScriptEditor) MoveWindow(gScriptEditor, gap, toolbarHeight + gap, width - gap * 2, editorHeight, TRUE);
+    if (gScriptOutput) MoveWindow(gScriptOutput, gap, toolbarHeight + gap * 2 + editorHeight, width - gap * 2, outputHeight, TRUE);
+}
+
+static LRESULT CALLBACK storylandScriptProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+    case WM_CREATE: {
+        gScriptToolbar = CreateWindowExW(0, L"STATIC", nullptr, WS_CHILD | WS_VISIBLE, 0, 0, 100, 38, hwnd, nullptr, gInstance, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"New", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 8, 7, 58, 25, hwnd, reinterpret_cast<HMENU>(ID_SCRIPT_NEW), gInstance, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"Open", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 72, 7, 62, 25, hwnd, reinterpret_cast<HMENU>(ID_SCRIPT_OPEN), gInstance, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"Save", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 140, 7, 62, 25, hwnd, reinterpret_cast<HMENU>(ID_SCRIPT_SAVE), gInstance, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"Run Script", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, 214, 7, 86, 25, hwnd, reinterpret_cast<HMENU>(ID_SCRIPT_RUN), gInstance, nullptr);
+        CreateWindowExW(0, L"STATIC", L"Storyland API", WS_CHILD | WS_VISIBLE, 316, 10, 160, 22, hwnd, nullptr, gInstance, nullptr);
+
+        const DWORD editStyle = WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | WS_HSCROLL |
+            ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_WANTRETURN | ES_NOHIDESEL;
+        gScriptEditor = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", nullptr, editStyle, 0, 0, 100, 100,
+            hwnd, reinterpret_cast<HMENU>(ID_SCRIPT_EDITOR), gInstance, nullptr);
+        gScriptOutput = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", nullptr,
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
+            0, 0, 100, 100, hwnd, reinterpret_cast<HMENU>(ID_SCRIPT_OUTPUT), gInstance, nullptr);
+
+        if (!gScriptFont) {
+            gScriptFont = CreateFontW(-16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                FIXED_PITCH | FF_MODERN, L"Consolas");
+        }
+        if (!gScriptBackgroundBrush) gScriptBackgroundBrush = CreateSolidBrush(RGB(31, 32, 36));
+        if (!gScriptToolbarBrush) gScriptToolbarBrush = CreateSolidBrush(RGB(43, 44, 49));
+        if (gScriptFont) {
+            SendMessageW(gScriptEditor, WM_SETFONT, reinterpret_cast<WPARAM>(gScriptFont), TRUE);
+            SendMessageW(gScriptOutput, WM_SETFONT, reinterpret_cast<WPARAM>(gScriptFont), TRUE);
+        }
+        SendMessageW(gScriptEditor, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(10, 10));
+        SendMessageW(gScriptOutput, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(10, 10));
+        SetWindowTextW(gScriptEditor,
+            L"# Storyland scripting workspace\r\n"
+            L"# Ctrl+Enter runs the current script.\r\n"
+            L"storyland.zoom(0.85)\r\n"
+            L"# storyland.pan(0.05, 0.0)\r\n"
+            L"# storyland.rotate(15.0, 0.0, 0.0, 1.0)\r\n"
+            L"# storyland.grid(True)\r\n"
+            L"# storyland.reset()\r\n");
+        setScriptOutput(L"Storyland scripting output\r\nThe editor uses Python-style Storyland API calls and keeps code and output in one workspace.\r\n");
+        layoutStorylandScriptWindow(hwnd);
+        return 0;
+    }
+    case WM_SIZE:
+        layoutStorylandScriptWindow(hwnd);
+        return 0;
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case ID_SCRIPT_NEW:
+            SetWindowTextW(gScriptEditor, L"");
+            setScriptOutput(L"New script.\r\n");
+            SetFocus(gScriptEditor);
+            return 0;
+        case ID_SCRIPT_OPEN:
+            loadStorylandScriptFile();
+            return 0;
+        case ID_SCRIPT_SAVE:
+            saveStorylandScriptFile();
+            return 0;
+        case ID_SCRIPT_RUN:
+            runStorylandScriptEditor();
+            return 0;
+        }
+        break;
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = reinterpret_cast<HDC>(wParam);
+        HWND control = reinterpret_cast<HWND>(lParam);
+        SetTextColor(dc, RGB(226, 228, 233));
+        if (control == gScriptToolbar) {
+            SetBkColor(dc, RGB(43, 44, 49));
+            return reinterpret_cast<LRESULT>(gScriptToolbarBrush);
+        }
+        SetBkColor(dc, RGB(31, 32, 36));
+        return reinterpret_cast<LRESULT>(gScriptBackgroundBrush);
+    }
+    case WM_KEYDOWN:
+        if (wParam == VK_RETURN && (GetKeyState(VK_CONTROL) & 0x8000) != 0) {
+            runStorylandScriptEditor();
+            return 0;
+        }
+        break;
+    case WM_CLOSE:
+        ShowWindow(hwnd, SW_HIDE);
+        return 0;
+    case WM_DESTROY:
+        gScriptWindow = nullptr;
+        gScriptToolbar = nullptr;
+        gScriptEditor = nullptr;
+        gScriptOutput = nullptr;
+        return 0;
+    }
+    return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
+static void showStorylandScriptingConsole() {
+    if (gScriptWindow && IsWindow(gScriptWindow)) {
+        ShowWindow(gScriptWindow, SW_SHOWNORMAL);
+        SetForegroundWindow(gScriptWindow);
+        return;
+    }
+
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW windowClass{};
+        windowClass.cbSize = sizeof(windowClass);
+        windowClass.lpfnWndProc = storylandScriptProc;
+        windowClass.hInstance = gInstance;
+        windowClass.hCursor = LoadCursor(nullptr, IDC_IBEAM);
+        windowClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+        windowClass.lpszClassName = L"StorylandScriptingWindow";
+        registered = RegisterClassExW(&windowClass) != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+    }
+    if (!registered) return;
+
+    gScriptWindow = CreateWindowExW(
+        WS_EX_TOOLWINDOW,
+        L"StorylandScriptingWindow",
+        L"Storyland - Scripting",
+        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+        CW_USEDEFAULT, CW_USEDEFAULT, 920, 720,
+        gMainWindow, nullptr, gInstance, nullptr);
+    if (!gScriptWindow) return;
+    ShowWindow(gScriptWindow, SW_SHOWNORMAL);
+    UpdateWindow(gScriptWindow);
+}
+
 static void rebuildViewMenu() {
     if (!gViewMenu) return;
     clearMenuItems(gViewMenu);
@@ -15965,6 +16590,8 @@ static void rebuildViewMenu() {
     CheckMenuRadioItem(gBackgroundMenu, ID_VIEW_BACKGROUND_LIGHT, ID_VIEW_BACKGROUND_DARK,
                        gEyeFriendlyPaneBackground ? ID_VIEW_BACKGROUND_DARK : ID_VIEW_BACKGROUND_LIGHT, MF_BYCOMMAND);
     AppendMenuW(gViewMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(gBackgroundMenu), L"Background");
+    AppendMenuW(gViewMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(gViewMenu, MF_STRING, ID_VIEW_SCRIPTING_CONSOLE, L"Scripting...");
     if (gMenuStrip) InvalidateRect(gMenuStrip, nullptr, TRUE);
 }
 
@@ -15979,7 +16606,6 @@ static void createMenuBar(HWND hwnd) {
     rebuildViewMenu();
 
     AppendMenuW(gHelpMenu, MF_STRING, ID_HELP_WIKI, L"Wiki");
-    AppendMenuW(gHelpMenu, MF_STRING, ID_HELP_SCRIPTING, L"Scripting Console...");
     AppendMenuW(gHelpMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(gHelpMenu, MF_STRING, ID_HELP_ABOUT, L"About Storyland...");
     AppendMenuW(gMainMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(gFileMenu), L"File");
@@ -16145,6 +16771,10 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         gActionSecondary = CreateWindowExW(0, L"BUTTON", L"Apply Animation...", WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 118, 28, hwnd, reinterpret_cast<HMENU>(ID_ACTION_SECONDARY), gInstance, nullptr);
         gActionTertiary = CreateWindowExW(0, L"BUTTON", L"Remove Material", WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 118, 28, hwnd, reinterpret_cast<HMENU>(ID_ACTION_TERTIARY), gInstance, nullptr);
         gActionQuaternary = CreateWindowExW(0, L"BUTTON", L"Validate Archive", WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 118, 28, hwnd, reinterpret_cast<HMENU>(ID_ACTION_QUATERNARY), gInstance, nullptr);
+        gMediaTimeline = CreateWindowExW(0, TRACKBAR_CLASSW, nullptr,
+            WS_CHILD | WS_TABSTOP | TBS_HORZ | TBS_NOTICKS | TBS_ENABLESELRANGE,
+            0, 0, 100, 28, hwnd, reinterpret_cast<HMENU>(ID_MEDIA_TIMELINE), gInstance, nullptr);
+        SendMessageW(gMediaTimeline, TBM_SETRANGE, TRUE, MAKELPARAM(0, 1));
         SetWindowSubclass(gTree, storylandPaneBorderSubclassProc, 1, 0);
         SetWindowSubclass(gPreview, storylandPaneBorderSubclassProc, 2, 0);
         SetWindowSubclass(gDetails, storylandPaneBorderSubclassProc, 3, 0);
@@ -16325,8 +16955,8 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                     if (!mediaError.empty()) setStatus(L"Video stopped: " + widen(mediaError));
                     updateActionBar();
                 }
-                collectMediaFilmFrame();
                 updateMediaVideoDetails();
+                updateMediaTimelineFromDecoder();
                 InvalidateRect(gPreview, nullptr, FALSE);
             }
             return 0;
@@ -16336,10 +16966,8 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             float elapsedSeconds = float(tick - gStoriesSkyLastTick) / 1000.0f;
             gStoriesSkyLastTick = tick;
             gStoriesSky.update(std::min(elapsedSeconds, 0.25f));
-            const bool cameraMoved = updateModelViewportCamera(elapsedSeconds);
             if ((gOpenGlRenderMode == StorylandOpenGlRenderMode::Stories && gStoriesSky.isEnabled()) ||
-                (gMode == StorylandMode::DtzArchive && gDtzEmbeddedPreviewKind == DtzEmbeddedPreviewKind::None && gOpenGlShow2dfxLights) ||
-                cameraMoved) {
+                (gMode == StorylandMode::DtzArchive && gDtzEmbeddedPreviewKind == DtzEmbeddedPreviewKind::None && gOpenGlShow2dfxLights)) {
                 InvalidateRect(gPreview, nullptr, FALSE);
             }
             return 0;
@@ -16349,6 +16977,19 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
     case WM_CONTEXTMENU:
         if (reinterpret_cast<HWND>(wParam) == gTree) {
             showTreeContextMenu(hwnd, lParam);
+            return 0;
+        }
+        if (reinterpret_cast<HWND>(wParam) == gPreview &&
+            gMode == StorylandMode::MediaFile && gMediaFile.kind() == StorylandMediaKind::Video) {
+            POINT pt{};
+            if (lParam == -1) GetCursorPos(&pt);
+            else { pt.x = GET_X_LPARAM(lParam); pt.y = GET_Y_LPARAM(lParam); }
+            HMENU menu = CreatePopupMenu();
+            if (menu) {
+                AppendMenuW(menu, MF_STRING, ID_MEDIA_REPLACE_CURRENT_FRAME, L"Replace Current Frame Image...");
+                TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, hwnd, nullptr);
+                DestroyMenu(menu);
+            }
             return 0;
         }
         break;
@@ -16361,7 +17002,6 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 
     case WM_ACTIVATE:
         if (LOWORD(wParam) == WA_INACTIVE) {
-            gModelMoveX = gModelMoveY = gModelMoveZ = 0.0f;
             if (gRenderPieWindow && IsWindow(gRenderPieWindow)) ShowWindow(gRenderPieWindow, SW_HIDE);
         } else {
             applyStorylandTitleTint(gTitleTint);
@@ -16374,6 +17014,31 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         case L'v': openStorylandTopMenu(gMenuStrip, 1); return 0;
         case L'h': openStorylandTopMenu(gMenuStrip, 2); return 0;
         default: break;
+        }
+        break;
+
+    case WM_HSCROLL:
+        if (reinterpret_cast<HWND>(lParam) == gMediaTimeline && !gMediaTimelineInternalUpdate &&
+            gMode == StorylandMode::MediaFile && gMediaFile.kind() == StorylandMediaKind::Video) {
+            const int code = LOWORD(wParam);
+            if (code == TB_THUMBTRACK || code == TB_THUMBPOSITION || code == TB_ENDTRACK ||
+                code == TB_LINEDOWN || code == TB_LINEUP || code == TB_PAGEDOWN || code == TB_PAGEUP) {
+                const int position = int(SendMessageW(gMediaTimeline, TBM_GETPOS, 0, 0));
+                const int maximum = std::max(1, int(SendMessageW(gMediaTimeline, TBM_GETRANGEMAX, 0, 0)));
+                const uint64_t totalFrames = gMediaFile.videoFrameCountEstimate();
+                uint64_t targetFrame = 0u;
+                if (totalFrames > 1u) targetFrame = (uint64_t(std::max(0, position)) * (totalFrames - 1u)) / uint64_t(maximum);
+                std::string mediaError;
+                if (!gMediaFile.seekVideoFrame(targetFrame, mediaError)) {
+                    if (!mediaError.empty()) setStatus(L"Video scrub failed: " + widen(mediaError));
+                } else {
+                    updateMediaVideoDetails();
+                    InvalidateRect(gPreview, nullptr, FALSE);
+                    setStatus(L"Video frame " + std::to_wstring(gMediaFile.videoFrameIndex()) + L" | " +
+                              std::to_wstring(gMediaFile.videoPositionSeconds()) + L" s");
+                }
+            }
+            return 0;
         }
         break;
 
@@ -16536,8 +17201,8 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 std::string mediaError;
                 if (!gMediaFile.stepVideoFrame(-1, mediaError))
                     MessageBoxW(gMainWindow, widen(mediaError).c_str(), L"Storyland video frame step", MB_ICONERROR);
-                collectMediaFilmFrame();
                 updateMediaVideoDetails();
+                updateMediaTimelineFromDecoder();
                 InvalidateRect(gPreview, nullptr, FALSE);
                 setStatus(L"Video frame " + std::to_wstring(gMediaFile.videoFrameIndex()) + L" | " +
                           formatMediaSeconds(gMediaFile.videoPositionSeconds()));
@@ -16555,8 +17220,8 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 std::string mediaError;
                 if (!gMediaFile.stepVideoFrame(1, mediaError))
                     MessageBoxW(gMainWindow, widen(mediaError).c_str(), L"Storyland video frame step", MB_ICONERROR);
-                collectMediaFilmFrame();
                 updateMediaVideoDetails();
+                updateMediaTimelineFromDecoder();
                 InvalidateRect(gPreview, nullptr, FALSE);
                 setStatus(L"Video frame " + std::to_wstring(gMediaFile.videoFrameIndex()) + L" | " +
                           formatMediaSeconds(gMediaFile.videoPositionSeconds()));
@@ -16578,6 +17243,8 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         case ID_ARCHIVE_CHANGE_SELECTED_MESH_RESOURCE_ID: changeSelectedMeshResourceId(); break;
         case ID_ARCHIVE_EXPORT_LVZ_IMG_PAIR: exportLvzImgPair(); break;
         case ID_ARCHIVE_OVERWRITE_LVZ_IMG_PAIR: overwriteCurrentLvzImgPair(); break;
+        case ID_ARCHIVE_TEST_LVZ_IMG_PAIR: testCurrentLvzImgPair(); break;
+        case ID_MEDIA_REPLACE_CURRENT_FRAME: replaceCurrentVideoFrameImage(); break;
         case ID_VIEW_BACKGROUND_LIGHT:
             gEyeFriendlyPaneBackground = false;
             CheckMenuRadioItem(gBackgroundMenu, ID_VIEW_BACKGROUND_LIGHT, ID_VIEW_BACKGROUND_DARK,
@@ -16623,6 +17290,9 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             InvalidateRect(gPreview, nullptr, FALSE);
             break;
         }
+        case ID_VIEW_SCRIPTING_CONSOLE:
+            showStorylandScriptingConsole();
+            break;
         case ID_VIEW_RENDER_STORIES:
             setOpenGlRenderMode(StorylandOpenGlRenderMode::Stories);
             CheckMenuRadioItem(gOpenGlMenu, ID_VIEW_RENDER_STORIES, ID_VIEW_RENDER_WIREFRAME, ID_VIEW_RENDER_STORIES, MF_BYCOMMAND);
@@ -16732,33 +17402,6 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         case ID_HELP_WIKI:
             ShellExecuteW(hwnd, L"open", L"https://github.com/spicybung/BLeeds/wiki", nullptr, nullptr, SW_SHOWNORMAL);
             break;
-        case ID_HELP_SCRIPTING: {
-            StorylandScriptHost host;
-            host.open = [](const std::wstring& path) {
-                if (!path.empty()) openStorylandFile(path);
-            };
-            host.pan = [](float x, float y) {
-                if (std::isfinite(x) && std::isfinite(y)) {
-                    gModelTargetPanX += x;
-                    gModelTargetPanY += y;
-                }
-            };
-            host.zoom = [](float scale) { if (std::isfinite(scale)) applyModelViewportZoom(scale); };
-            host.rotate = [](float degrees, float x, float y, float z) {
-                if (std::isfinite(degrees) && std::isfinite(x) && std::isfinite(y) &&
-                    std::isfinite(z) && x * x + y * y + z * z > 0.00001f)
-                    rotateModelViewport(degrees, x, y, z);
-            };
-            host.reset = [] { resetModelViewport(); InvalidateRect(gPreview, nullptr, FALSE); };
-            host.grid = [](bool enabled) {
-                if (gOpenGlShowGrid != enabled) SendMessageW(gMainWindow, WM_COMMAND, ID_VIEW_SHOW_GRID, 0);
-            };
-            host.dark = [](bool enabled) {
-                SendMessageW(gMainWindow, WM_COMMAND, enabled ? ID_VIEW_BACKGROUND_DARK : ID_VIEW_BACKGROUND_LIGHT, 0);
-            };
-            storylandShowScriptingConsole(hwnd, std::move(host));
-            break;
-        }
         }
         return 0;
     }
@@ -16768,6 +17411,12 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             NMTREEVIEWW* changed = reinterpret_cast<NMTREEVIEWW*>(lParam);
             StorylandTreePayload payload = payloadFromLParam(changed->itemNew.lParam);
             selectPayloadForCurrentMode(payload);
+            return 0;
+        }
+        if (header && header->idFrom == ID_TREE && header->code == NM_CLICK) {
+            DWORD messagePosition = GetMessagePos();
+            POINT screenPoint{GET_X_LPARAM(messagePosition), GET_Y_LPARAM(messagePosition)};
+            selectTreeItemAtScreenPoint(screenPoint);
             return 0;
         }
         if (header && header->idFrom == ID_TREE && header->code == NM_DBLCLK) {
@@ -16807,6 +17456,10 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             DeleteObject(gMenuBackgroundBrush);
             gMenuBackgroundBrush = nullptr;
         }
+        if (gScriptWindow && IsWindow(gScriptWindow)) DestroyWindow(gScriptWindow);
+        if (gScriptFont) { DeleteObject(gScriptFont); gScriptFont = nullptr; }
+        if (gScriptBackgroundBrush) { DeleteObject(gScriptBackgroundBrush); gScriptBackgroundBrush = nullptr; }
+        if (gScriptToolbarBrush) { DeleteObject(gScriptToolbarBrush); gScriptToolbarBrush = nullptr; }
         if (gMainMenu) {
             DestroyMenu(gMainMenu);
             gMainMenu = nullptr;
@@ -17469,6 +18122,11 @@ static int runStorylandApplication(HINSTANCE hInstance, HINSTANCE, LPWSTR comman
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
+        if (msg.message == WM_KEYDOWN && msg.hwnd == gScriptEditor && msg.wParam == VK_RETURN &&
+            (GetKeyState(VK_CONTROL) & 0x8000) != 0) {
+            runStorylandScriptEditor();
+            continue;
+        }
         if (msg.message == WM_KEYDOWN && msg.wParam == VK_BACK && gDtzReturnAvailable) {
             returnToGameDtz();
             continue;

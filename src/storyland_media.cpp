@@ -301,6 +301,36 @@ uint64_t StorylandMediaFile::videoFrameIndex() const {
         decodedVideoPosition <= 0.0 || decodedVideoFrameRate <= 0.0) return 0u;
     return uint64_t(std::llround(decodedVideoPosition * decodedVideoFrameRate));
 }
+uint64_t StorylandMediaFile::videoFrameCountEstimate() const {
+    if (!std::isfinite(decodedVideoDuration) || !std::isfinite(decodedVideoFrameRate) ||
+        decodedVideoDuration <= 0.0 || decodedVideoFrameRate <= 0.0) return 0u;
+    const long double estimate = std::ceil(static_cast<long double>(decodedVideoDuration) * static_cast<long double>(decodedVideoFrameRate));
+    if (estimate <= 0.0L) return 0u;
+    if (estimate >= static_cast<long double>(std::numeric_limits<uint64_t>::max())) return std::numeric_limits<uint64_t>::max();
+    return uint64_t(estimate);
+}
+
+bool StorylandMediaFile::currentVideoFrameIsOverridden() const {
+    return videoFrameOverrides.find(videoFrameIndex()) != videoFrameOverrides.end();
+}
+
+bool StorylandMediaFile::replaceCurrentVideoFrame(const StorylandVideoFrame& replacement, std::string& errorMessage) {
+    if (mediaKind != StorylandMediaKind::Video || !videoReady || frame.width == 0u || frame.height == 0u) {
+        errorMessage = "No decoded video frame is selected.";
+        return false;
+    }
+    if (replacement.width != frame.width || replacement.height != frame.height ||
+        replacement.bgra.size() != size_t(frame.width) * size_t(frame.height) * 4u) {
+        errorMessage = "Replacement frame dimensions do not match the decoded video frame.";
+        return false;
+    }
+    StorylandVideoFrame stored = replacement;
+    stored.timestamp100ns = frame.timestamp100ns;
+    videoFrameOverrides[videoFrameIndex()] = stored;
+    frame = std::move(stored);
+    errorMessage.clear();
+    return true;
+}
 bool StorylandMediaFile::videoDecoderReady() const { return videoReady; }
 bool StorylandMediaFile::isPlaying() const { return audioPlaying || videoPlaying; }
 
@@ -320,6 +350,7 @@ void StorylandMediaFile::close() {
     decodedVideoFrameRate = 30.0;
     nextVideoDecodeTickMs = 0;
     videoDecodePath.clear();
+    videoFrameOverrides.clear();
 }
 
 bool StorylandMediaFile::loadFromFile(const std::wstring& filePath, std::string& errorMessage) {
@@ -1569,6 +1600,14 @@ bool StorylandMediaFile::tickVideo(std::string& errorMessage) {
         decodedVideoWidth = frame.width;
         decodedVideoHeight = frame.height;
         decodedVideoStride = int32_t(decodedVideoWidth * 4u);
+        {
+            auto overrideIt = videoFrameOverrides.find(videoFrameIndex());
+            if (overrideIt != videoFrameOverrides.end()) {
+                const int64_t decodedTimestamp = frame.timestamp100ns;
+                frame = overrideIt->second;
+                frame.timestamp100ns = decodedTimestamp;
+            }
+        }
         const double frameMilliseconds = 1000.0 / std::max(1.0, decodedVideoFrameRate);
         nextVideoDecodeTickMs = nowMs + uint64_t(std::max(1.0, frameMilliseconds));
         errorMessage.clear();
@@ -1628,6 +1667,14 @@ bool StorylandMediaFile::tickVideo(std::string& errorMessage) {
     buffer->Release();
     sample->Release();
     decodedVideoPosition = double(timestamp) / 10000000.0;
+    {
+        auto overrideIt = videoFrameOverrides.find(videoFrameIndex());
+        if (overrideIt != videoFrameOverrides.end()) {
+            const int64_t decodedTimestamp = frame.timestamp100ns;
+            frame = overrideIt->second;
+            frame.timestamp100ns = decodedTimestamp;
+        }
+    }
     const double frameMilliseconds = 1000.0 / std::max(1.0, decodedVideoFrameRate);
     nextVideoDecodeTickMs = nowMs + uint64_t(std::max(1.0, frameMilliseconds));
     errorMessage.clear();
@@ -1740,56 +1787,73 @@ bool StorylandMediaFile::stepVideoFrame(int direction, std::string& errorMessage
 #endif
 }
 
-bool StorylandMediaFile::seekVideoFrame(uint64_t index, std::string& errorMessage) {
+
+bool StorylandMediaFile::seekVideoFrame(uint64_t frameIndex, std::string& errorMessage) {
 #ifdef _WIN32
     if (mediaKind != StorylandMediaKind::Video || !videoReady || (!sourceReader && !gameVideoDecoder)) {
         errorMessage = "No decoded video is open.";
         return false;
     }
+    const double fps = (std::isfinite(decodedVideoFrameRate) && decodedVideoFrameRate > 0.0)
+        ? decodedVideoFrameRate : 30.0;
+    const uint64_t frameCount = videoFrameCountEstimate();
+    if (frameCount > 0u && frameIndex >= frameCount) frameIndex = frameCount - 1u;
+    const double target = double(frameIndex) / fps;
+
     videoPlaying = false;
     nextVideoDecodeTickMs = 0;
-    if (index == videoFrameIndex() && !frame.bgra.empty()) {
-        errorMessage.clear();
-        return true;
-    }
-    const double fps = std::clamp(decodedVideoFrameRate, 1.0, 240.0);
-    const double target = std::max(0.0, std::min(double(index) / fps,
-        decodedVideoDuration > 0.0 ? decodedVideoDuration : double(index) / fps));
+    frame = {};
+
     if (gameVideoDecoder) {
-        if (!seekGameVideo(reinterpret_cast<GameVideoDecoder*>(gameVideoDecoder), target, errorMessage)) return false;
+        GameVideoDecoder* decoder = reinterpret_cast<GameVideoDecoder*>(gameVideoDecoder);
+        const double seekStart = std::max(0.0, target - 1.0 / fps);
+        if (!seekGameVideo(decoder, seekStart, errorMessage)) return false;
+        decodedVideoPosition = seekStart;
     } else {
         IMFSourceReader* reader = reinterpret_cast<IMFSourceReader*>(sourceReader);
         PROPVARIANT position;
         PropVariantInit(&position);
         position.vt = VT_I8;
-        position.hVal.QuadPart = LONGLONG(std::llround(target * 10000000.0));
-        const HRESULT result = reader->SetCurrentPosition(GUID_NULL, position);
+        position.hVal.QuadPart = LONGLONG(std::llround(std::max(0.0, target - 1.0 / fps) * 10000000.0));
+        const HRESULT seekResult = reader->SetCurrentPosition(GUID_NULL, position);
         PropVariantClear(&position);
-        if (FAILED(result)) {
-            errorMessage = "Video frame seek failed (" + hresultText(result) + ").";
+        if (FAILED(seekResult)) {
+            errorMessage = "Video frame seek failed (" + hresultText(seekResult) + ").";
             return false;
         }
+        decodedVideoPosition = std::max(0.0, target - 1.0 / fps);
     }
-    frame = {};
-    decodedVideoPosition = target;
-    for (unsigned attempt = 0; attempt < 600u; ++attempt) {
+
+    const double tolerance = (0.55 / fps);
+    for (unsigned attempt = 0; attempt < 1200u; ++attempt) {
         videoPlaying = true;
         nextVideoDecodeTickMs = 0;
-        if (!tickVideo(errorMessage)) { videoPlaying = false; return false; }
+        if (!tickVideo(errorMessage)) {
+            videoPlaying = false;
+            return false;
+        }
         videoPlaying = false;
-        if (!frame.bgra.empty() && decodedVideoPosition + 0.45 / fps >= target) {
+        if (!frame.bgra.empty() && decodedVideoPosition + tolerance >= target) {
+            auto overrideIt = videoFrameOverrides.find(frameIndex);
+            if (overrideIt != videoFrameOverrides.end()) {
+                const int64_t decodedTimestamp = frame.timestamp100ns;
+                frame = overrideIt->second;
+                frame.timestamp100ns = decodedTimestamp;
+            }
+            decodedVideoPosition = target;
             errorMessage.clear();
             return true;
         }
     }
-    errorMessage = "Video seek did not reach the selected frame.";
+    errorMessage = "Video scrubber could not decode the requested frame.";
     return false;
 #else
-    (void)index;
+    (void)frameIndex;
     errorMessage = "Video frame seeking is available in the Windows build.";
     return false;
 #endif
 }
+
 
 void StorylandMediaFile::closeVideoDecoder() {
 #ifdef _WIN32

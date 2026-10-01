@@ -279,6 +279,7 @@ StorylandSkyState interpolateState(const StorylandSkyState& a, const StorylandSk
     result.lower = mixColor(a.lower, b.lower, amount);
     result.fog = mixColor(a.fog, b.fog, amount);
     result.ambient = mixColor(a.ambient, b.ambient, amount);
+    result.objectAmbient = mixColor(a.objectAmbient, b.objectAmbient, amount);
     result.directional = mixColor(a.directional, b.directional, amount);
     result.sunCore = mixColor(a.sunCore, b.sunCore, amount);
     result.sunCorona = mixColor(a.sunCorona, b.sunCorona, amount);
@@ -402,6 +403,7 @@ bool StorylandSky::loadVcsTimecycleText(const std::string& text, std::string& er
 
         TimecycleRow row;
         row.ambient = byteColor(values, 0);
+        row.objectAmbient = byteColor(values, 3);
         row.directional = byteColor(values, 12);
         row.skyTop = byteColor(values, 15);
         row.skyBottom = byteColor(values, 18);
@@ -456,6 +458,7 @@ StorylandSkyState StorylandSky::evaluateVcsTimecycleState() const {
     result.lower = multiplyColor(result.horizon, 0.72f);
     result.fog = result.horizon;
     result.ambient = mixColor(first.ambient, second.ambient, amount);
+    result.objectAmbient = mixColor(first.objectAmbient, second.objectAmbient, amount);
     result.directional = mixColor(first.directional, second.directional, amount);
     result.sunCore = mixColor(first.sunCore, second.sunCore, amount);
     result.sunCorona = mixColor(first.sunCorona, second.sunCorona, amount);
@@ -545,6 +548,10 @@ void StorylandSky::evaluateState() {
     dawn.ambient = multiplyColor(dawn.horizon, 0.42f);
     day.ambient = multiplyColor(day.horizon, 0.62f);
     sunset.ambient = multiplyColor(sunset.horizon, 0.46f);
+    night.objectAmbient = night.ambient;
+    dawn.objectAmbient = dawn.ambient;
+    day.objectAmbient = day.ambient;
+    sunset.objectAmbient = sunset.ambient;
     night.directional = {0.22f, 0.24f, 0.34f, 1.0f};
     dawn.directional = {0.70f, 0.56f, 0.48f, 1.0f};
     day.directional = {0.95f, 0.92f, 0.84f, 1.0f};

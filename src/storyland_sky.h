@@ -37,6 +37,7 @@ struct StorylandSkyState {
     StorylandSkyColor lower;
     StorylandSkyColor fog;
     StorylandSkyColor ambient;
+    StorylandSkyColor objectAmbient;
     StorylandSkyColor directional;
     StorylandSkyColor sunCore;
     StorylandSkyColor sunCorona;
@@ -96,6 +97,7 @@ private:
 
     struct TimecycleRow {
         StorylandSkyColor ambient;
+        StorylandSkyColor objectAmbient;
         StorylandSkyColor directional;
         StorylandSkyColor skyTop;
         StorylandSkyColor skyBottom;

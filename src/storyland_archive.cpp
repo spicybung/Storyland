@@ -1,6 +1,7 @@
 #include "storyland_archive.h"
 #include "storyland_atomic_io.h"
 #include "storyland_dma_validator.h"
+#include "storyland_model.h"
 
 #include <algorithm>
 #include <array>
@@ -14,6 +15,7 @@
 #include <iterator>
 #include <set>
 #include <map>
+#include <sstream>
 #include <string>
 #include <system_error>
 #include <tuple>
@@ -2953,45 +2955,98 @@ void StorylandArchiveBrowser::buildWorldMeshes() {
         auto exact = exactMeshes.find(count.first);
         uint64_t rowKey = (uint64_t(resolution.sectorY) << 32) | uint64_t(resourceId);
         auto rowCandidates = meshesByRowResource.find(rowKey);
+        auto placementFitScore = [&](const CandidateMesh& candidate, const StorylandWorldPlacement& placement,
+                                     double& outRadiusRatio, double& outCenterError) -> double {
+            outRadiusRatio = std::numeric_limits<double>::infinity();
+            outCenterError = std::numeric_limits<double>::infinity();
+            if (candidate.mesh.vertices.empty()) return std::numeric_limits<double>::infinity();
+
+            float minX = candidate.mesh.vertices.front().x;
+            float maxX = minX;
+            float minY = candidate.mesh.vertices.front().y;
+            float maxY = minY;
+            float minZ = candidate.mesh.vertices.front().z;
+            float maxZ = minZ;
+            for (const auto& vertex : candidate.mesh.vertices) {
+                minX = std::min(minX, vertex.x); maxX = std::max(maxX, vertex.x);
+                minY = std::min(minY, vertex.y); maxY = std::max(maxY, vertex.y);
+                minZ = std::min(minZ, vertex.z); maxZ = std::max(maxZ, vertex.z);
+            }
+
+            double wx0 = std::numeric_limits<double>::infinity();
+            double wy0 = wx0;
+            double wz0 = wx0;
+            double wx1 = -wx0;
+            double wy1 = -wx0;
+            double wz1 = -wx0;
+            for (float x : {minX, maxX}) {
+                for (float y : {minY, maxY}) {
+                    for (float z : {minZ, maxZ}) {
+                        const double wx = placement.matrix[0] * x + placement.matrix[4] * y + placement.matrix[8] * z + placement.matrix[12];
+                        const double wy = placement.matrix[1] * x + placement.matrix[5] * y + placement.matrix[9] * z + placement.matrix[13];
+                        const double wz = placement.matrix[2] * x + placement.matrix[6] * y + placement.matrix[10] * z + placement.matrix[14];
+                        wx0 = std::min(wx0, wx); wx1 = std::max(wx1, wx);
+                        wy0 = std::min(wy0, wy); wy1 = std::max(wy1, wy);
+                        wz0 = std::min(wz0, wz); wz1 = std::max(wz1, wz);
+                    }
+                }
+            }
+
+            const double cx = (wx0 + wx1) * 0.5;
+            const double cy = (wy0 + wy1) * 0.5;
+            const double cz = (wz0 + wz1) * 0.5;
+            const double radius = std::sqrt((wx1 - cx) * (wx1 - cx) +
+                                            (wy1 - cy) * (wy1 - cy) +
+                                            (wz1 - cz) * (wz1 - cz));
+            const double targetRadius = std::max(0.0001, double(std::fabs(placement.boundRadius)));
+            outCenterError = std::sqrt((cx - placement.boundX) * (cx - placement.boundX) +
+                                       (cy - placement.boundY) * (cy - placement.boundY) +
+                                       (cz - placement.boundZ) * (cz - placement.boundZ));
+            outRadiusRatio = radius / targetRadius;
+            if (!std::isfinite(outCenterError) || !std::isfinite(outRadiusRatio) || outRadiusRatio <= 0.0) {
+                return std::numeric_limits<double>::infinity();
+            }
+            return outCenterError / targetRadius + std::fabs(std::log(outRadiusRatio));
+        };
+
+        auto candidateFitsPlacement = [&](const CandidateMesh& candidate, const StorylandWorldPlacement& placement,
+                                          double* outScore = nullptr) -> bool {
+            double radiusRatio = 0.0;
+            double centerError = 0.0;
+            const double score = placementFitScore(candidate, placement, radiusRatio, centerError);
+            if (outScore != nullptr) *outScore = score;
+            if (!std::isfinite(score)) return false;
+
+            const double targetRadius = std::max(0.0001, double(std::fabs(placement.boundRadius)));
+            const double normalizedCenterError = centerError / targetRadius;
+
+            // Retail WRLD placements carry a world-space bounding sphere.  A
+            // decoded payload which becomes only a tiny fraction of that sphere,
+            // or explodes far beyond it, is almost certainly a false mesh parse
+            // or a RES collision from another container.  This is especially
+            // visible on VCS UNDERWATER/seabed resources because their legitimate
+            // matrices intentionally use large 256/512 basis scales.
+            if (radiusRatio < 0.18 || radiusRatio > 2.75) return false;
+            if (normalizedCenterError > 1.75) return false;
+            return score <= 2.65;
+        };
+
         auto chooseByPlacement = [&](const std::vector<CandidateMesh>& candidates) -> const CandidateMesh* {
             if (candidates.empty()) return nullptr;
-            if (candidates.size() == 1) return &candidates.front();
             auto placementIt = firstPlacementByKey.find(count.first);
             if (placementIt == firstPlacementByKey.end() || placementIt->second == nullptr) return nullptr;
             const StorylandWorldPlacement& placement = *placementIt->second;
             const CandidateMesh* best = nullptr;
             double bestScore = std::numeric_limits<double>::infinity();
             for (const CandidateMesh& candidate : candidates) {
-                if (candidate.mesh.vertices.empty()) continue;
-                float minX = candidate.mesh.vertices.front().x, maxX = minX;
-                float minY = candidate.mesh.vertices.front().y, maxY = minY;
-                float minZ = candidate.mesh.vertices.front().z, maxZ = minZ;
-                for (const auto& vertex : candidate.mesh.vertices) {
-                    minX = std::min(minX, vertex.x); maxX = std::max(maxX, vertex.x);
-                    minY = std::min(minY, vertex.y); maxY = std::max(maxY, vertex.y);
-                    minZ = std::min(minZ, vertex.z); maxZ = std::max(maxZ, vertex.z);
+                double score = std::numeric_limits<double>::infinity();
+                if (!candidateFitsPlacement(candidate, placement, &score)) continue;
+                if (score < bestScore) {
+                    bestScore = score;
+                    best = &candidate;
                 }
-                double wx0 = std::numeric_limits<double>::infinity(), wy0 = wx0, wz0 = wx0;
-                double wx1 = -wx0, wy1 = -wx0, wz1 = -wx0;
-                for (float x : {minX, maxX}) for (float y : {minY, maxY}) for (float z : {minZ, maxZ}) {
-                    double wx = placement.matrix[0] * x + placement.matrix[4] * y + placement.matrix[8] * z + placement.matrix[12];
-                    double wy = placement.matrix[1] * x + placement.matrix[5] * y + placement.matrix[9] * z + placement.matrix[13];
-                    double wz = placement.matrix[2] * x + placement.matrix[6] * y + placement.matrix[10] * z + placement.matrix[14];
-                    wx0 = std::min(wx0, wx); wx1 = std::max(wx1, wx);
-                    wy0 = std::min(wy0, wy); wy1 = std::max(wy1, wy);
-                    wz0 = std::min(wz0, wz); wz1 = std::max(wz1, wz);
-                }
-                double cx = (wx0 + wx1) * 0.5, cy = (wy0 + wy1) * 0.5, cz = (wz0 + wz1) * 0.5;
-                double radius = std::sqrt((wx1 - cx) * (wx1 - cx) + (wy1 - cy) * (wy1 - cy) + (wz1 - cz) * (wz1 - cz));
-                double targetRadius = std::max(0.0001, double(std::fabs(placement.boundRadius)));
-                double centerError = std::sqrt((cx - placement.boundX) * (cx - placement.boundX) +
-                                               (cy - placement.boundY) * (cy - placement.boundY) +
-                                               (cz - placement.boundZ) * (cz - placement.boundZ));
-                double ratio = std::max(0.000001, radius / targetRadius);
-                double score = centerError / targetRadius + std::fabs(std::log(ratio));
-                if (std::isfinite(score) && score < bestScore) { bestScore = score; best = &candidate; }
             }
-            return bestScore <= 5.0 ? best : nullptr;
+            return best;
         };
 
         const CandidateMesh* officialChoice = official == officialAreaMeshes.end() ? nullptr : chooseByPlacement(official->second);
@@ -3003,17 +3058,30 @@ void StorylandArchiveBrowser::buildWorldMeshes() {
             linked.sectorIndex = sectorIndex;
             worldMeshCache.push_back(std::move(linked));
         } else if (exact != exactMeshes.end()) {
-            resolution.source = "same-sector";
             resolution.candidateCount = 1;
-            resolution.payloadOffset = exact->second.payloadOffset;
-            worldMeshCache.push_back(exact->second.mesh);
-        } else if (rowCandidates != meshesByRowResource.end() && rowCandidates->second.size() == 1) {
-            resolution.source = "same-row";
-            resolution.candidateCount = 1;
-            resolution.payloadOffset = rowCandidates->second.front().payloadOffset;
-            StorylandWorldMesh linked = rowCandidates->second.front().mesh;
-            linked.sectorIndex = sectorIndex;
-            worldMeshCache.push_back(std::move(linked));
+            std::vector<CandidateMesh> exactCandidate{exact->second};
+            const CandidateMesh* choice = chooseByPlacement(exactCandidate);
+            if (choice != nullptr) {
+                resolution.source = "same-sector verified";
+                resolution.payloadOffset = choice->payloadOffset;
+                StorylandWorldMesh linked = choice->mesh;
+                linked.sectorIndex = sectorIndex;
+                worldMeshCache.push_back(std::move(linked));
+            } else {
+                resolution.source = "same-sector rejected by bounds";
+            }
+        } else if (rowCandidates != meshesByRowResource.end() && !rowCandidates->second.empty()) {
+            resolution.candidateCount = uint32_t(rowCandidates->second.size());
+            const CandidateMesh* choice = chooseByPlacement(rowCandidates->second);
+            if (choice != nullptr) {
+                resolution.source = "same-row verified";
+                resolution.payloadOffset = choice->payloadOffset;
+                StorylandWorldMesh linked = choice->mesh;
+                linked.sectorIndex = sectorIndex;
+                worldMeshCache.push_back(std::move(linked));
+            } else {
+                resolution.source = "same-row rejected by bounds";
+            }
         } else if (master != masterLvzMeshes.end() && !master->second.empty()) {
             const CandidateMesh* choice = chooseByPlacement(master->second);
             if (choice != nullptr) {
@@ -3045,16 +3113,12 @@ void StorylandArchiveBrowser::buildWorldMeshes() {
             resolution.candidateCount = candidates == meshesByResource.end() ? 0u : uint32_t(candidates->second.size());
             if (candidates == meshesByResource.end() || candidates->second.empty()) {
                 resolution.source = "missing";
-            } else if (candidates->second.size() == 1) {
-                resolution.source = "unique linked sector";
-                resolution.payloadOffset = candidates->second.front().payloadOffset;
-                StorylandWorldMesh linked = candidates->second.front().mesh;
-                linked.sectorIndex = sectorIndex;
-                worldMeshCache.push_back(std::move(linked));
             } else {
                 const CandidateMesh* choice = chooseByPlacement(candidates->second);
                 if (choice != nullptr) {
-                    resolution.source = "placement-fit exact RES";
+                    resolution.source = candidates->second.size() == 1
+                        ? "unique linked sector verified"
+                        : "placement-fit exact RES";
                     resolution.payloadOffset = choice->payloadOffset;
                     StorylandWorldMesh linked = choice->mesh;
                     linked.sectorIndex = sectorIndex;
@@ -3764,57 +3828,50 @@ bool StorylandArchiveBrowser::replaceEntryBytes(size_t index, const std::vector<
         return false;
     }
 
-    StorylandArchiveEntry target = archiveEntries[index];
-    if (target.byteOffset > currentImgBytes.size()) {
-        errorMessage = "Target IMG offset is outside the IMG.";
+    const StorylandArchiveEntry target = archiveEntries[index];
+    if (target.byteOffset > currentImgBytes.size() ||
+        target.byteSize > uint64_t(currentImgBytes.size()) - target.byteOffset) {
+        errorMessage = "Target IMG byte range is invalid.";
         return false;
     }
 
-    bool replacementHasChunkHeader = replacementBytes.size() >= 0x20;
-    uint32_t replacementIdent = replacementHasChunkHeader ? readU32(replacementBytes, 0) : 0;
-    uint32_t replacementDeclaredSize = replacementHasChunkHeader ? readU32(replacementBytes, 8) : 0;
-    bool replacementIdentMatches =
+    const bool replacementHasChunkHeader = replacementBytes.size() >= 0x20u;
+    const uint32_t replacementIdent = replacementHasChunkHeader ? readU32(replacementBytes, 0x00u) : 0u;
+    const bool replacementIdentMatches =
         replacementIdent == target.chunkIdent ||
-        (isAreaIdent(replacementIdent) && isAreaIdent(target.chunkIdent)) ||
-        knownChunkIdent(replacementIdent);
+        (isAreaIdent(replacementIdent) && isAreaIdent(target.chunkIdent));
 
     std::vector<uint8_t> newImgBytes;
     std::vector<uint8_t> newLvzHeader;
 
     if (target.usesLvzChunkHeader) {
         if (replacementHasChunkHeader && replacementIdentMatches) {
-            newLvzHeader.assign(replacementBytes.begin(), replacementBytes.begin() + 0x20);
-            newImgBytes.assign(replacementBytes.begin() + 0x20, replacementBytes.end());
+            newLvzHeader.assign(replacementBytes.begin(), replacementBytes.begin() + 0x20u);
+            newImgBytes.assign(replacementBytes.begin() + 0x20u, replacementBytes.end());
         } else {
-            if (target.lvzHeaderOffset + 0x20 > currentLvzBytes.size()) {
+            if (target.lvzHeaderOffset + 0x20u > currentLvzBytes.size()) {
                 errorMessage = "Target LVZ chunk header offset is invalid.";
                 return false;
             }
-            newLvzHeader.assign(currentLvzBytes.begin() + target.lvzHeaderOffset, currentLvzBytes.begin() + target.lvzHeaderOffset + 0x20);
+            newLvzHeader.assign(
+                currentLvzBytes.begin() + target.lvzHeaderOffset,
+                currentLvzBytes.begin() + target.lvzHeaderOffset + 0x20u);
             newImgBytes = replacementBytes;
         }
 
-        if (newLvzHeader.size() != 0x20) {
+        if (newLvzHeader.size() != 0x20u) {
             errorMessage = "Could not build replacement LVZ chunk header.";
             return false;
         }
 
-        writeU32(newLvzHeader, 0x00, target.chunkIdent);
-        writeU32(newLvzHeader, 0x08, uint32_t(newImgBytes.size() + 0x20));
-        if (readU32(newLvzHeader, 0x0C) == 0 || readU32(newLvzHeader, 0x0C) > uint32_t(newImgBytes.size() + 0x20)) {
-            writeU32(newLvzHeader, 0x0C, uint32_t(newImgBytes.size()));
-        }
-        writeU32(newLvzHeader, 0x18, uint32_t(target.byteOffset));
+        writeU32(newLvzHeader, 0x00u, target.chunkIdent);
+        writeU32(newLvzHeader, 0x08u, uint32_t(newImgBytes.size() + 0x20u));
+        writeU32(newLvzHeader, 0x18u, uint32_t(target.byteOffset));
     } else {
-        if (replacementHasChunkHeader && replacementIdentMatches) {
-            newImgBytes = replacementBytes;
-        } else {
-            newImgBytes = replacementBytes;
-        }
-
-        if (isAreaIdent(target.chunkIdent) && !newImgBytes.empty() && newImgBytes.size() >= 0x20) {
-            writeU32(newImgBytes, 0x00, target.chunkIdent);
-            writeU32(newImgBytes, 0x08, uint32_t(newImgBytes.size()));
+        newImgBytes = replacementBytes;
+        if (isAreaIdent(target.chunkIdent) && newImgBytes.size() >= 0x20u) {
+            writeU32(newImgBytes, 0x00u, target.chunkIdent);
+            writeU32(newImgBytes, 0x08u, uint32_t(newImgBytes.size()));
         }
     }
 
@@ -3827,48 +3884,52 @@ bool StorylandArchiveBrowser::replaceEntryBytes(size_t index, const std::vector<
         return false;
     }
 
-    uint64_t oldStart64 = target.byteOffset;
-    uint64_t oldSize64 = target.byteSize;
-    uint64_t oldEnd64 = oldStart64 + oldSize64;
-    if (oldEnd64 > currentImgBytes.size() || oldEnd64 < oldStart64) {
-        errorMessage = "Target IMG byte range is invalid.";
+    const uint64_t oldStart = target.byteOffset;
+    const uint64_t oldSize = target.byteSize;
+    const uint64_t oldEnd = oldStart + oldSize;
+
+    // Retail LVZ/IMG contains pointer-backed structures that are not all represented
+    // by Storyland's reconstructed entry list. Shifting following IMG data therefore
+    // cannot be made safe merely by updating the visible sChunkHeader rows. Keep every
+    // existing IMG offset stable and replace only inside the target's proven allocation.
+    uint64_t allocationEnd = oldEnd;
+    uint64_t nextKnownOffset = uint64_t(currentImgBytes.size());
+    for (const StorylandArchiveEntry& entry : archiveEntries) {
+        if (entry.byteOffset > oldStart) nextKnownOffset = std::min<uint64_t>(nextKnownOffset, entry.byteOffset);
+    }
+
+    // Permit growth only into verified zero padding before the next known resource.
+    // This handles sector padding without moving any subsequent data or pointer.
+    if (nextKnownOffset > oldEnd) {
+        uint64_t zeroPaddingEnd = oldEnd;
+        while (zeroPaddingEnd < nextKnownOffset && zeroPaddingEnd < currentImgBytes.size() &&
+               currentImgBytes[size_t(zeroPaddingEnd)] == 0u) {
+            ++zeroPaddingEnd;
+        }
+        allocationEnd = zeroPaddingEnd;
+    }
+
+    const uint64_t capacity = allocationEnd - oldStart;
+    if (newImgBytes.size() > capacity) {
+        std::ostringstream message;
+        message << "Replacement is larger than the target's proven in-place IMG allocation.\r\n"
+                << "Target: " << target.name << "\r\n"
+                << "Old payload: " << oldSize << " bytes\r\n"
+                << "Verified in-place capacity: " << capacity << " bytes\r\n"
+                << "Replacement payload: " << newImgBytes.size() << " bytes\r\n\r\n"
+                << "Storyland refused to shift later IMG resources. Retail LVZ/IMG can contain pointer-backed references "
+                   "outside the reconstructed entry list, so moving later resources is not considered runtime-safe.";
+        errorMessage = message.str();
         return false;
     }
 
-    int64_t delta = int64_t(newImgBytes.size()) - int64_t(oldSize64);
-    if (delta != 0) {
-        if (delta > 0 && currentImgBytes.size() + uint64_t(delta) > 0xFFFFFFFFull) {
-            errorMessage = "Replacement would make IMG larger than 4 GiB.";
-            return false;
-        }
-        if (delta < 0 && uint64_t(-delta) > currentImgBytes.size()) {
-            errorMessage = "Replacement delta underflow.";
-            return false;
-        }
+    if (target.usesLvzChunkHeader && target.lvzHeaderOffset + 0x20u > currentLvzBytes.size()) {
+        errorMessage = "Target LVZ header is outside the editable LVZ buffer.";
+        return false;
     }
-
-    std::vector<StorylandArchiveEntry> oldEntries = archiveEntries;
-
-    // Validate every pointer update before touching either archive buffer.
-    for (const StorylandArchiveEntry& entry : oldEntries) {
-        if (entry.index == target.index) {
-            if (entry.usesLvzChunkHeader && entry.lvzHeaderOffset + 0x20 > currentLvzBytes.size()) {
-                errorMessage = "Target LVZ header is outside the editable LVZ buffer.";
-                return false;
-            }
-            continue;
-        }
-        if (delta == 0 || entry.byteOffset <= oldStart64) continue;
-        const int64_t shiftedSigned = int64_t(entry.byteOffset) + delta;
-        if (shiftedSigned < 0 || uint64_t(shiftedSigned) > 0xFFFFFFFFull) {
-            errorMessage = "A shifted LVZ/IMG resource offset exceeded 32-bit range.";
-            return false;
-        }
-        const size_t required = entry.usesLvzChunkHeader ? 0x1Cu : 8u;
-        if (entry.lvzHeaderOffset + required > currentLvzBytes.size()) {
-            errorMessage = "A later LVZ resource pointer field is outside the editable LVZ buffer.";
-            return false;
-        }
+    if (!target.usesLvzChunkHeader && target.lvzHeaderOffset + 12u > currentLvzBytes.size()) {
+        errorMessage = "Target AREA descriptor is outside the editable LVZ buffer.";
+        return false;
     }
 
     const std::vector<uint8_t> originalLvzBytes = currentLvzBytes;
@@ -3880,52 +3941,21 @@ bool StorylandArchiveBrowser::replaceEntryBytes(size_t index, const std::vector<
         rebuildParsedCaches(ignored);
     };
 
-    currentImgBytes.erase(currentImgBytes.begin() + size_t(oldStart64), currentImgBytes.begin() + size_t(oldEnd64));
-    currentImgBytes.insert(currentImgBytes.begin() + size_t(oldStart64), newImgBytes.begin(), newImgBytes.end());
+    std::copy(newImgBytes.begin(), newImgBytes.end(), currentImgBytes.begin() + size_t(oldStart));
+    std::fill(
+        currentImgBytes.begin() + size_t(oldStart + newImgBytes.size()),
+        currentImgBytes.begin() + size_t(allocationEnd),
+        0u);
 
-    for (const StorylandArchiveEntry& entry : oldEntries) {
-        if (entry.index == target.index) {
-            if (entry.usesLvzChunkHeader) {
-                if (entry.lvzHeaderOffset + 0x20 > currentLvzBytes.size()) {
-                    errorMessage = "Target LVZ header shifted outside the LVZ.";
-                    rollbackReplacement();
-                    return false;
-                }
-                std::copy(newLvzHeader.begin(), newLvzHeader.end(), currentLvzBytes.begin() + entry.lvzHeaderOffset);
-                writeU32(currentLvzBytes, entry.lvzHeaderOffset + 0x08, uint32_t(newImgBytes.size() + 0x20));
-                writeU32(currentLvzBytes, entry.lvzHeaderOffset + 0x18, uint32_t(oldStart64));
-            } else {
-                if (entry.lvzHeaderOffset + 12 <= currentLvzBytes.size()) {
-                    writeU32(currentLvzBytes, entry.lvzHeaderOffset + 0x04, uint32_t(oldStart64));
-                    writeU32(currentLvzBytes, entry.lvzHeaderOffset + 0x08, uint32_t(newImgBytes.size()));
-                }
-            }
-            continue;
-        }
-
-        if (delta == 0) continue;
-        if (entry.byteOffset <= oldStart64) continue;
-
-        uint64_t shifted = uint64_t(int64_t(entry.byteOffset) + delta);
-        if (shifted > 0xFFFFFFFFull) {
-            errorMessage = "A shifted LVZ/IMG resource offset exceeded 32-bit range.";
-            rollbackReplacement();
-            return false;
-        }
-
-        if (entry.usesLvzChunkHeader) {
-            if (entry.lvzHeaderOffset + 0x1C <= currentLvzBytes.size()) {
-                writeU32(currentLvzBytes, entry.lvzHeaderOffset + 0x18, uint32_t(shifted));
-            }
-        } else {
-            if (entry.lvzHeaderOffset + 8 <= currentLvzBytes.size()) {
-                writeU32(currentLvzBytes, entry.lvzHeaderOffset + 0x04, uint32_t(shifted));
-            }
-        }
-    }
-
-    if (currentLvzBytes.size() >= 0x0C) {
-        writeU32(currentLvzBytes, 0x08, uint32_t(currentLvzBytes.size()));
+    if (target.usesLvzChunkHeader) {
+        std::copy(newLvzHeader.begin(), newLvzHeader.end(), currentLvzBytes.begin() + target.lvzHeaderOffset);
+        writeU32(currentLvzBytes, target.lvzHeaderOffset + 0x08u, uint32_t(newImgBytes.size() + 0x20u));
+        writeU32(currentLvzBytes, target.lvzHeaderOffset + 0x18u, uint32_t(oldStart));
+    } else {
+        // AREA descriptor layout: id, IMG offset, file size, unknown/resource count.
+        // Preserve id/unknown and the original IMG offset; only the size changes.
+        writeU32(currentLvzBytes, target.lvzHeaderOffset + 0x04u, uint32_t(oldStart));
+        writeU32(currentLvzBytes, target.lvzHeaderOffset + 0x08u, uint32_t(newImgBytes.size()));
     }
 
     std::string rebuildError;
@@ -3935,14 +3965,48 @@ bool StorylandArchiveBrowser::replaceEntryBytes(size_t index, const std::vector<
         return false;
     }
 
+    // Verify that the edited record is still present at exactly the same IMG offset,
+    // that its size is the requested size, and that no bytes outside the target's
+    // proven allocation changed.
+    const StorylandArchiveEntry* rebuiltTarget = nullptr;
+    for (const StorylandArchiveEntry& entry : archiveEntries) {
+        if (entry.byteOffset != oldStart) continue;
+        if (entry.chunkIdent != target.chunkIdent && !(isAreaIdent(entry.chunkIdent) && isAreaIdent(target.chunkIdent))) continue;
+        rebuiltTarget = &entry;
+        break;
+    }
+    if (!rebuiltTarget || rebuiltTarget->byteSize != newImgBytes.size()) {
+        rollbackReplacement();
+        errorMessage = "Replacement verification failed: the rebuilt LVZ/IMG index did not preserve the target offset and replacement size.";
+        return false;
+    }
+
+    if (!std::equal(newImgBytes.begin(), newImgBytes.end(), currentImgBytes.begin() + size_t(oldStart))) {
+        rollbackReplacement();
+        errorMessage = "Replacement verification failed: IMG bytes do not match the requested replacement payload.";
+        return false;
+    }
+
+    for (size_t i = 0; i < originalImgBytes.size(); ++i) {
+        if (i >= size_t(oldStart) && i < size_t(allocationEnd)) continue;
+        if (currentImgBytes[i] != originalImgBytes[i]) {
+            rollbackReplacement();
+            errorMessage = "Replacement verification failed: bytes outside the target IMG allocation changed.";
+            return false;
+        }
+    }
+
     report =
-        "Replaced LVZ+IMG resource '" + target.name + "'\r\n"
-        "Old IMG offset: " + std::to_string(oldStart64) + "\r\n"
-        "Old stored bytes: " + std::to_string(oldSize64) + "\r\n"
-        "New stored bytes: " + std::to_string(newImgBytes.size()) + "\r\n"
-        "Delta: " + std::to_string(delta) + "\r\n"
-        "Later IMG-backed LVZ records shifted: " + std::string(delta == 0 ? "no" : "yes") + "\r\n"
-        "Replacement source treated as: " + std::string(target.usesLvzChunkHeader ? "sChunkHeader+payload for LVZ header record" : "whole IMG-backed chunk/payload") + "\r\n"
+        "Runtime-safe in-place LVZ+IMG replacement\r\n"
+        "Resource: " + target.name + "\r\n"
+        "IMG offset preserved: " + std::to_string(oldStart) + "\r\n"
+        "Old payload bytes: " + std::to_string(oldSize) + "\r\n"
+        "New payload bytes: " + std::to_string(newImgBytes.size()) + "\r\n"
+        "Verified in-place capacity: " + std::to_string(capacity) + "\r\n"
+        "Later IMG offsets shifted: no\r\n"
+        "IMG file size changed: no\r\n"
+        "Bytes outside target allocation changed: no\r\n"
+        "Reparse verification: PASS\r\n"
         "Right-click the archive tree to rebuild or overwrite the LVZ + IMG pair.";
 
     return true;
@@ -4143,6 +4207,25 @@ bool StorylandArchiveBrowser::replaceWorldMeshResourceBytes(uint32_t resourceId,
     if (!parseWorldOverlayMesh(replacementPayload, 0, replacementPayload.size(), 0, resourceId, validationMesh) ||
         validationMesh.vertices.empty() ||
         validationMesh.triangles.empty()) {
+        if (sourceLooksLikeLeedsChunk(replacementBytes) && sourceChunkIdentOrMdl(replacementBytes) == MDL_IDENT) {
+            StorylandModelFile replacementModel;
+            std::string modelError;
+            if (!replacementModel.loadFromMemory(replacementBytes, L"replacement.mdl", modelError)) {
+                errorMessage = "Replacement MDL could not be parsed as a Leeds model: " + modelError;
+                return false;
+            }
+            if (replacementModel.modelKind() != StorylandModelKind::SimpleModel) {
+                errorMessage =
+                    "LVZ/IMG WRLD resource replacement accepts SimpleModel MDLs only. "
+                    "Detected model kind: " + replacementModel.modelKindName() + ". "
+                    "Ped, cutscene, and vehicle MDLs carry runtime structures that cannot be converted into an sBuildingGeometry WRLD resource safely.";
+                return false;
+            }
+            if (replacementModel.previewTriangles().empty() || replacementModel.previewPoints().empty()) {
+                errorMessage = "Replacement SimpleModel has no parseable render geometry.";
+                return false;
+            }
+        }
         uint32_t fallbackTextureId = 0;
         for (const StorylandWorldMesh& mesh : worldMeshCache) {
             if (mesh.resourceIndex != resourceId) continue;
@@ -4181,10 +4264,11 @@ bool StorylandArchiveBrowser::replaceWorldMeshResourceBytes(uint32_t resourceId,
         replacementPayload,
         "replacement mesh resource " + std::to_string(resourceId)
     );
-    if (!dmaPreflight.safe()) {
+    if (!dmaPreflight.safe() || dmaPreflight.vifStreams == 0u || dmaPreflight.vifUnpacks == 0u) {
         errorMessage =
-            "Replacement failed the PS2 DMA/TLB preflight and was not applied.\r\n\r\n" +
-            dmaPreflight.text();
+            "Replacement failed the PS2 DMA/VIF/GIF/VU-consumption structural preflight and was not applied.\r\n\r\n" +
+            dmaPreflight.text() +
+            "\r\nWRLD SimpleModel conversion additionally requires at least one bounded VIF stream and one VIF UNPACK so the sector payload has proven vertex data for VU consumption.";
         return false;
     }
 
@@ -4338,11 +4422,25 @@ bool StorylandArchiveBrowser::replaceWorldMeshResourceBytes(uint32_t resourceId,
         parsedAfter++;
         trianglesAfter += uint32_t(mesh.triangles.size());
     }
+    if (parsedAfter == 0u || trianglesAfter == 0u) {
+        rollbackMeshReplacement();
+        errorMessage = "Replacement reparsed without a visible WRLD mesh. The LVZ/IMG transaction was rolled back.";
+        return false;
+    }
+
+    std::string pairReport;
+    std::string pairError;
+    if (!validateLvzImgPair(pairReport, pairError)) {
+        rollbackMeshReplacement();
+        errorMessage =
+            "Replacement failed the full Test LVZ/IMG Pair verification and was rolled back.\r\n\r\n" + pairError;
+        return false;
+    }
 
     report =
         "Runtime-safe real sector mesh replacement\r\n"
         "Resource id preserved: " + std::to_string(resourceId) + "\r\n"
-        "Input file converted to sector-resource payload: " + std::string(replacementWasConvertedFromMdl ? "yes; exact MDL VIF packets copied when possible; 24-byte sector material rows" : "no; already sector payload") + "\r\n"
+        "Input file converted to sector-resource payload: " + std::string(replacementWasConvertedFromMdl ? "yes; SimpleModel verified; exact MDL VIF packets copied when possible; 24-byte sector material rows" : "no; already sector payload") + "\r\n"
         "Sector Resource[] rows redirected: 0; existing Resource[] pointer was preserved\r\n"
         "Wrapper/pointer starts preserved: " + std::to_string(wrapperOffsetsPreserved) + "\r\n"
         "Occurrences replaced in-place: " + std::to_string(replacedCount) + "\r\n"
@@ -4353,15 +4451,162 @@ bool StorylandArchiveBrowser::replaceWorldMeshResourceBytes(uint32_t resourceId,
         "WRLD sector chunk sizes changed: no\r\n"
         "Parsed replacement mesh variants after rebuild: " + std::to_string(parsedAfter) + "\r\n"
         "Parsed replacement triangles after rebuild: " + std::to_string(trianglesAfter) + "\r\n"
-        "DMA/TLB preflight: PASS; tags=" + std::to_string(dmaPreflight.dmaTags) +
+        "DMA/VIF/GIF/VU-consumption structural preflight: PASS; tags=" + std::to_string(dmaPreflight.dmaTags) +
         " VIF_streams=" + std::to_string(dmaPreflight.vifStreams) +
+        " VIF_UNPACK=" + std::to_string(dmaPreflight.vifUnpacks) +
+        " GIF_tags=" + std::to_string(dmaPreflight.gifTags) +
         " warnings=" + std::to_string(dmaPreflight.warnings) + "\r\n"
         "This path avoids the TLB bug where the game read the first material row dword as a pointer.\r\n"
+        "Full Test LVZ/IMG Pair after replacement: PASS\r\n"
         "Right-click the archive tree to rebuild or overwrite the LVZ + IMG pair.";
 
     return true;
 }
 
+
+
+bool StorylandArchiveBrowser::validateLvzImgPair(std::string& report, std::string& errorMessage) const {
+    report.clear();
+    errorMessage.clear();
+    if (currentLvzBytes.empty() || currentImgBytes.empty() || currentLvzPath.empty() || currentImgPath.empty()) {
+        errorMessage = "Open a retail LVZ+IMG pair before running Test LVZ/IMG Pair.";
+        return false;
+    }
+
+    StorylandArchiveBrowser reparsed = *this;
+    std::string reparseError;
+    if (!reparsed.rebuildParsedCaches(reparseError)) {
+        errorMessage = "LVZ/IMG reparse failed: " + reparseError;
+        return false;
+    }
+
+    uint32_t fatal = 0;
+    uint32_t warnings = 0;
+    uint32_t checkedEntries = 0;
+    uint32_t checkedSectors = 0;
+    uint32_t checkedRows = 0;
+    uint32_t checkedMeshes = 0;
+    uint32_t dmaSafeMeshes = 0;
+    uint32_t vifBackedMeshes = 0;
+    uint32_t placementLinks = 0;
+    uint32_t missingPlacementLinks = 0;
+    std::ostringstream details;
+
+    uint64_t previousEntryEnd = 0;
+    std::vector<const StorylandArchiveEntry*> sortedEntries;
+    for (const auto& entry : reparsed.archiveEntries) sortedEntries.push_back(&entry);
+    std::sort(sortedEntries.begin(), sortedEntries.end(), [](const auto* a, const auto* b) {
+        if (a->byteOffset != b->byteOffset) return a->byteOffset < b->byteOffset;
+        return a->index < b->index;
+    });
+    for (const auto* entry : sortedEntries) {
+        ++checkedEntries;
+        if (entry->byteOffset > reparsed.currentImgBytes.size() ||
+            entry->byteSize > reparsed.currentImgBytes.size() - entry->byteOffset) {
+            ++fatal;
+            details << "FATAL archive entry outside IMG: " << entry->name << " offset=" << entry->byteOffset << " size=" << entry->byteSize << "\r\n";
+        }
+        if (entry->byteOffset < previousEntryEnd) {
+            ++warnings;
+            details << "WARN overlapping/reused archive allocation: " << entry->name << " starts=" << entry->byteOffset << " previous_end=" << previousEntryEnd << "\r\n";
+        }
+        previousEntryEnd = std::max(previousEntryEnd, entry->byteOffset + entry->byteSize);
+    }
+
+    std::set<uint32_t> resourceIds;
+    for (const auto& sector : reparsed.worldSectors) {
+        ++checkedSectors;
+        if (sector.imgOffset > reparsed.currentImgBytes.size() ||
+            sector.byteSize > reparsed.currentImgBytes.size() - sector.imgOffset || sector.byteSize < 8u) {
+            ++fatal;
+            details << "FATAL WRLD sector outside IMG: sector=" << sector.sectorIndex << " offset=" << sector.imgOffset << " size=" << sector.byteSize << "\r\n";
+        }
+    }
+    for (const auto& row : reparsed.imgResourceRowCache) {
+        ++checkedRows;
+        resourceIds.insert(row.resourceId);
+        if (row.payloadOffset >= reparsed.currentImgBytes.size() ||
+            row.payloadSize > reparsed.currentImgBytes.size() - row.payloadOffset) {
+            ++fatal;
+            details << "FATAL Resource[] payload outside IMG: RES=" << row.resourceId << " sector=" << row.sectorIndex << "\r\n";
+        }
+    }
+
+    for (const auto& placement : reparsed.worldPlacements) {
+        bool finite = std::isfinite(placement.boundX) && std::isfinite(placement.boundY) &&
+                      std::isfinite(placement.boundZ) && std::isfinite(placement.boundRadius);
+        for (float value : placement.matrix) finite = finite && std::isfinite(value);
+        if (!finite || placement.boundRadius < 0.0f) {
+            ++fatal;
+            details << "FATAL non-finite WRLD placement: RES=" << placement.resourceIndex << " sector=" << placement.sectorIndex << "\r\n";
+            continue;
+        }
+        if (resourceIds.count(placement.resourceIndex)) ++placementLinks;
+        else {
+            ++missingPlacementLinks;
+            ++warnings;
+        }
+    }
+
+    std::set<std::pair<uint32_t, uint64_t>> seenMeshes;
+    for (const auto& mesh : reparsed.worldMeshCache) {
+        if (!seenMeshes.insert({mesh.resourceIndex, mesh.rawOffset}).second) continue;
+        ++checkedMeshes;
+        if (mesh.vertices.empty() || mesh.triangles.empty()) {
+            ++fatal;
+            details << "FATAL empty parsed WRLD mesh: RES=" << mesh.resourceIndex << "\r\n";
+            continue;
+        }
+        bool indicesOk = true;
+        for (const auto& tri : mesh.triangles) {
+            if (tri.a >= mesh.vertices.size() || tri.b >= mesh.vertices.size() || tri.c >= mesh.vertices.size()) {
+                indicesOk = false;
+                break;
+            }
+        }
+        if (!indicesOk) {
+            ++fatal;
+            details << "FATAL triangle index outside vertex buffer: RES=" << mesh.resourceIndex << "\r\n";
+        }
+
+        std::vector<uint8_t> resourceBytes;
+        std::string extractError;
+        if (reparsed.extractWorldMeshResourceBytes(mesh.resourceIndex, resourceBytes, extractError) && !resourceBytes.empty()) {
+            const StorylandDmaTlbReport dma = storylandValidatePs2DmaTlb(resourceBytes, "LVZ/IMG RES " + std::to_string(mesh.resourceIndex));
+            if (dma.safe()) ++dmaSafeMeshes;
+            else {
+                ++fatal;
+                details << "FATAL DMA/VIF/GIF range failure for RES=" << mesh.resourceIndex << "\r\n";
+            }
+            if (dma.vifStreams > 0u && dma.vifUnpacks > 0u) ++vifBackedMeshes;
+        }
+    }
+
+    report =
+        "Test LVZ/IMG Pair\r\n"
+        "=================\r\n"
+        "LVZ: " + std::string(reparsed.currentLvzPath.begin(), reparsed.currentLvzPath.end()) + "\r\n"
+        "IMG: " + std::string(reparsed.currentImgPath.begin(), reparsed.currentImgPath.end()) + "\r\n"
+        "LVZ bytes (inflated): " + std::to_string(reparsed.currentLvzBytes.size()) + "\r\n"
+        "IMG bytes: " + std::to_string(reparsed.currentImgBytes.size()) + "\r\n"
+        "Archive entries checked: " + std::to_string(checkedEntries) + "\r\n"
+        "WRLD sectors checked: " + std::to_string(checkedSectors) + "\r\n"
+        "Resource[] rows checked: " + std::to_string(checkedRows) + "\r\n"
+        "Parsed mesh variants checked: " + std::to_string(checkedMeshes) + "\r\n"
+        "DMA/TLB-safe resource checks: " + std::to_string(dmaSafeMeshes) + "\r\n"
+        "VIF/VU-consumption-backed resource checks: " + std::to_string(vifBackedMeshes) + "\r\n"
+        "Placement->Resource links: " + std::to_string(placementLinks) + "\r\n"
+        "Missing placement links: " + std::to_string(missingPlacementLinks) + "\r\n"
+        "Warnings: " + std::to_string(warnings) + "\r\n"
+        "Fatals: " + std::to_string(fatal) + "\r\n\r\n" + details.str();
+
+    if (fatal != 0u) {
+        errorMessage = report + "\r\nRESULT: FAIL - the pair is not safe for replacement testing.";
+        return false;
+    }
+    report += "\r\nRESULT: PASS - structural ranges, WRLD resource links, parsed geometry, and PS2 DMA/VIF/GIF bounds passed. VIF-backed rows were additionally checked for UNPACK data expected to feed VU geometry processing.";
+    return true;
+}
 
 
 

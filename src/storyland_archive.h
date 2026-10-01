@@ -119,7 +119,7 @@ struct StorylandResourceResolution {
     uint32_t placementCount = 0;
     uint32_t candidateCount = 0;
     uint64_t payloadOffset = 0;
-    // "same-sector", "unique linked sector", "conflict", or "missing".
+    // Resolution source plus verification state, such as "same-sector verified", "official AERA", "conflict", or "missing".
     std::string source;
 };
 
@@ -151,6 +151,7 @@ public:
     bool changeWorldMeshResourceId(uint32_t oldResourceId, uint32_t newResourceId, std::string& report, std::string& errorMessage);
     bool saveLvzImgPair(const std::wstring& lvzPath, const std::wstring& imgPath, bool compressLvz, std::string& errorMessage) const;
     bool overwriteCurrentLvzImgPair(bool compressLvz, std::string& errorMessage) const;
+    bool validateLvzImgPair(std::string& report, std::string& errorMessage) const;
     bool findEntryByStemAndExtension(const std::wstring& stem, const std::initializer_list<std::wstring>& extensions, size_t& outIndex) const;
     bool findMobileLcsTextureDictionaryForEntry(size_t modelEntryIndex, size_t& outTextureEntryIndex) const;
 
