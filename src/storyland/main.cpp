@@ -63,34 +63,44 @@
 
 #pragma comment(lib, "Winmm.lib")
 
+static bool gStorylandVcsThemeContext = false;
+
 static void stopStorylandTheme() {
     // PlaySound uses the process-wide waveform channel. Passing nullptr stops
     // the currently playing asynchronous resource immediately.
     PlaySoundW(nullptr, nullptr, 0);
 }
 
-static bool playStorylandTheme(bool /*introSting*/) {
+static bool playStorylandTheme(bool /*introSting*/, bool vcsTheme = false) {
     HMODULE module = GetModuleHandleW(nullptr);
     if (!module) return false;
 
-    // The theme is embedded as a real WAVE resource.  This deliberately avoids
-    // MCI/Media Player codec registration: PlaySound sends the PCM WAVE resource
-    // directly through winmm, so the intro/error music works on a clean Windows
-    // install without extracting a temporary MP3 or depending on an MPEG MCI
-    // driver.
+    const int resourceId = vcsTheme ? IDR_VCS_ERROR_WARNING_THEME : IDR_REIGNS_ERROR_THEME;
+
+    // Both themes are embedded as PCM WAVE resources. PlaySound can stream them
+    // directly from the executable, so warning/error playback does not depend on
+    // a temporary file, Media Player registration, or an MPEG codec.
     return PlaySoundW(
-        MAKEINTRESOURCEW(IDR_REIGNS_ERROR_THEME),
+        MAKEINTRESOURCEW(resourceId),
         module,
         SND_RESOURCE | SND_ASYNC | SND_NODEFAULT
     ) != FALSE;
 }
 
 static int storylandMessageBoxW(HWND owner, LPCWSTR text, LPCWSTR caption, UINT type) {
-    if ((type & MB_ICONERROR) == MB_ICONERROR) {
-        // Restart the full theme from the beginning for every error. PlaySound
-        // automatically replaces any currently playing intro/error instance.
-        playStorylandTheme(false);
+    const bool isError = (type & MB_ICONERROR) == MB_ICONERROR;
+    const bool isWarning = (type & MB_ICONWARNING) == MB_ICONWARNING;
+
+    if (gStorylandVcsThemeContext && (isError || isWarning)) {
+        // VCS warnings and errors use the VCS-specific user-supplied 8-bit theme.
+        // Restarting it here also covers catastrophic errors while a VCS file is
+        // the active context.
+        playStorylandTheme(false, true);
+    } else if (isError) {
+        // Preserve the existing Reigns error theme for non-VCS errors.
+        playStorylandTheme(false, false);
     }
+
     return ::MessageBoxW(owner, text, caption, type);
 }
 
@@ -190,6 +200,10 @@ typedef void (APIENTRY *PFNGLACTIVETEXTUREPROC)(GLenum texture);
 #define ID_VIEW_RENDER_TEXTURED 1033
 #define ID_VIEW_RENDER_SOLID 1034
 #define ID_VIEW_RENDER_WIREFRAME 1035
+#define ID_VIEW_PRELIGHT_COMBINED 1110
+#define ID_VIEW_PRELIGHT_RAW 1111
+#define ID_VIEW_PRELIGHT_OFF 1112
+#define ID_MODEL_EDIT_PRELIGHT 1113
 #define ID_VIEW_SHOW_GRID 1036
 #define ID_VIEW_SHOW_BONES 1037
 #define ID_VIEW_SHOW_BOUNDS 1038
@@ -712,6 +726,9 @@ static StorylandVec3 gModelDragStartPoint = {};
 static float gModelDistance = 3.5f;
 static float gModelPanX = 0.0f;
 static float gModelPanY = 0.0f;
+enum class StorylandPrelightViewMode { Combined, Raw, Off };
+static StorylandPrelightViewMode gPrelightViewMode = StorylandPrelightViewMode::Combined;
+static int gSelectedPrelightVertex = -1;
 
 static enum class StorylandMode { Empty, TextureArchive, DtzArchive, ModelFile, WblFile, ArchiveFile, AnimFile, ScmFile, MediaFile } gMode = StorylandMode::Empty;
 static int gSelectedIndex = -1;
@@ -734,6 +751,7 @@ enum class StorylandTreeKind {
     DtzAreaReturn,
     ModelField,
     ModelBone,
+    ModelPrelight,
     WblOverview,
     WblSection,
     WblMesh,
@@ -863,6 +881,34 @@ static HTREEITEM addTreeItem(HTREEITEM parent, const std::wstring& text, Storyla
 
 static void expandTreeItem(HTREEITEM item) {
     if (item) SendMessageW(gTree, TVM_EXPAND, TVE_EXPAND, reinterpret_cast<LPARAM>(item));
+}
+
+
+static std::wstring selectedTreeDisplayText() {
+    if (!gTree) return {};
+    HTREEITEM selected = TreeView_GetSelection(gTree);
+    if (!selected) return {};
+    wchar_t buffer[512] = {};
+    TVITEMW item = {};
+    item.mask = TVIF_TEXT;
+    item.hItem = selected;
+    item.pszText = buffer;
+    item.cchTextMax = int(std::size(buffer));
+    if (!TreeView_GetItem(gTree, &item)) return {};
+    return buffer;
+}
+
+static void drawSelectedViewportLabel(HDC dc, const RECT& rc) {
+    std::wstring text = selectedTreeDisplayText();
+    if (text.empty()) return;
+    RECT box{rc.left + 10, rc.top + 10, rc.right - 10, rc.top + 38};
+    HBRUSH background = CreateSolidBrush(RGB(24, 26, 31));
+    FillRect(dc, &box, background);
+    DeleteObject(background);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(238, 240, 244));
+    RECT textRect{box.left + 8, box.top + 5, box.right - 8, box.bottom - 4};
+    DrawTextW(dc, text.c_str(), -1, &textRect, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER);
 }
 
 static HTREEITEM findTreePayloadItemRecursive(HTREEITEM item, StorylandTreeKind kind, int index) {
@@ -1074,6 +1120,7 @@ static COLORREF storylandBlendUiColor(COLORREF base, COLORREF accent, int accent
 
 static void applyStorylandTitleTint(StorylandTitleTint tint) {
     gTitleTint = tint;
+    gStorylandVcsThemeContext = (tint == StorylandTitleTint::VCS);
     if (!gMainWindow) return;
 
     DWORD captionColor = DWMWA_COLOR_DEFAULT;
@@ -2515,6 +2562,12 @@ static bool loadCompanionTextureForCurrentModel(const std::wstring& modelPath, s
         }
 
         gModelTexturePath = archivePath;
+        if (getExtensionLower(archivePath) == L".xtx") {
+            // A companion XTX positively identifies this Leeds model session as
+            // Vice City Stories even when the MDL itself has an ambiguous name
+            // such as plr.mdl or pump.mdl.
+            gStorylandVcsThemeContext = true;
+        }
         gModelTextureIndex = decodedIndex;
         gModelTextureLoaded = true;
         gModelTextureUploadNeeded = true;
@@ -2804,6 +2857,7 @@ static void updateModelTextureVAutoDetection() {
     const auto& points = gModelFile.previewPoints();
     const auto& triangles = gModelFile.previewTriangles();
     const auto& texcoords = gModelFile.previewTexcoords();
+    const auto& prelights = gModelFile.previewPrelights();
     if (!gModelTextureLoaded || gModelTextureRegions.empty() || gModelTextureImage.rgba.empty()) {
         gModelTextureVDetectionReason = L"Texture V: no matching texture is loaded; normal coordinates are kept.";
         return;
@@ -3166,7 +3220,15 @@ static bool handleModelViewportShortcut(WPARAM key) {
     if (!currentModeUsesInteractiveModelViewport()) return false;
     if (moveArchiveViewportKey(key)) return true;
 
+    const bool fastMove = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+    const float panStep = std::max(0.025f, gModelDistance * (fastMove ? 0.12f : 0.045f));
     switch (key) {
+    case 'W': applyModelViewportZoom(fastMove ? 0.68f : 0.88f); setStatus(L"Viewport dolly: W/S. A/D strafe, Q/E vertical, Shift = faster."); return true;
+    case 'S': applyModelViewportZoom(fastMove ? 1.46f : 1.14f); setStatus(L"Viewport dolly: W/S. A/D strafe, Q/E vertical, Shift = faster."); return true;
+    case 'A': gModelPanX += panStep; if (gPreview) InvalidateRect(gPreview, nullptr, FALSE); return true;
+    case 'D': gModelPanX -= panStep; if (gPreview) InvalidateRect(gPreview, nullptr, FALSE); return true;
+    case 'Q': gModelPanY -= panStep; if (gPreview) InvalidateRect(gPreview, nullptr, FALSE); return true;
+    case 'E': gModelPanY += panStep; if (gPreview) InvalidateRect(gPreview, nullptr, FALSE); return true;
     case VK_OEM_4: // [
         stepStoriesSkyTime(-1.0f);
         return true;
@@ -3400,6 +3462,13 @@ static bool beginStoriesShaderProgram(bool useTexture) {
         else if (gOpenGlRenderMode == StorylandOpenGlRenderMode::Solid) mode = 2;
         else if (gOpenGlRenderMode == StorylandOpenGlRenderMode::Wireframe) mode = 3;
         pglUniform1i(loc, mode);
+    }
+    loc = pglGetUniformLocation(gStoriesShaderProgram, "uPrelightMode");
+    if (loc >= 0) {
+        int prelightMode = 0;
+        if (gPrelightViewMode == StorylandPrelightViewMode::Raw) prelightMode = 1;
+        else if (gPrelightViewMode == StorylandPrelightViewMode::Off) prelightMode = 2;
+        pglUniform1i(loc, prelightMode);
     }
     loc = pglGetUniformLocation(gStoriesShaderProgram, "uFogColor");
     if (loc >= 0) {
@@ -4453,6 +4522,95 @@ static void selectModelDffGraphNode(int index) {
     InvalidateRect(gPreview, nullptr, FALSE);
 }
 
+
+static void addModelPrelightTree(HTREEITEM parent) {
+    const auto& prelights = gModelFile.previewPrelights();
+    size_t validCount = 0u;
+    for (const StorylandModelPrelight& c : prelights) if (c.valid) ++validCount;
+    if (validCount == 0u) return;
+
+    std::wostringstream title;
+    title << L"Prelight / vertex colours  " << validCount << L"/" << prelights.size();
+    HTREEITEM prelightRoot = addTreeItem(parent, title.str());
+    HTREEITEM group = nullptr;
+    size_t currentGroup = size_t(-1);
+    for (size_t i = 0u; i < prelights.size(); ++i) {
+        const StorylandModelPrelight& c = prelights[i];
+        if (!c.valid) continue;
+        const size_t groupIndex = i / 256u;
+        if (groupIndex != currentGroup) {
+            currentGroup = groupIndex;
+            std::wostringstream groupLabel;
+            groupLabel << L"vertices " << groupIndex * 256u << L"-" << (groupIndex * 256u + 255u);
+            group = addTreeItem(prelightRoot, groupLabel.str());
+        }
+        std::wostringstream line;
+        line << L"#" << i << L"  RGBA(" << unsigned(c.red) << L", " << unsigned(c.green) << L", " << unsigned(c.blue) << L", " << unsigned(c.alpha) << L")";
+        if (c.fileOffset != 0xFFFFFFFFu) line << L"  @ " << hexWide(c.fileOffset, 8);
+        addTreeItem(group ? group : prelightRoot, line.str(), StorylandTreeKind::ModelPrelight, int(i));
+    }
+    expandTreeItem(prelightRoot);
+}
+
+static void selectModelPrelight(int index) {
+    const auto& prelights = gModelFile.previewPrelights();
+    if (index < 0 || size_t(index) >= prelights.size() || !prelights[size_t(index)].valid) return;
+    gSelectedKind = StorylandTreeKind::ModelPrelight;
+    gSelectedIndex = index;
+    gSelectedPrelightVertex = index;
+    const StorylandModelPrelight& c = prelights[size_t(index)];
+    std::wostringstream ss;
+    ss << L"PRELIGHT / VERTEX COLOUR\r\n\r\n"
+       << L"Vertex: " << index << L"\r\n"
+       << L"RGBA: " << unsigned(c.red) << L", " << unsigned(c.green) << L", " << unsigned(c.blue) << L", " << unsigned(c.alpha) << L"\r\n";
+    if (c.fileOffset != 0xFFFFFFFFu) ss << L"Source offset: " << hexWide(c.fileOffset, 8) << L"\r\n";
+    ss << L"\r\nDouble-click this row to edit RGB. Alpha is preserved exactly.";
+    setDetails(ss.str());
+    if (gPreview) InvalidateRect(gPreview, nullptr, FALSE);
+}
+
+static void editSelectedModelPrelight() {
+    if (gSelectedPrelightVertex < 0) return;
+    const auto& prelights = gModelFile.previewPrelights();
+    if (size_t(gSelectedPrelightVertex) >= prelights.size()) return;
+    const StorylandModelPrelight before = prelights[size_t(gSelectedPrelightVertex)];
+    if (!before.valid) return;
+
+    static COLORREF customColours[16] = {};
+    CHOOSECOLORW picker = {};
+    picker.lStructSize = sizeof(picker);
+    picker.hwndOwner = gMainWindow;
+    picker.rgbResult = RGB(before.red, before.green, before.blue);
+    picker.lpCustColors = customColours;
+    picker.Flags = CC_FULLOPEN | CC_RGBINIT;
+    if (!ChooseColorW(&picker)) return;
+
+    std::string error;
+    if (!gModelFile.setPreviewPrelightColor(
+            size_t(gSelectedPrelightVertex),
+            GetRValue(picker.rgbResult), GetGValue(picker.rgbResult), GetBValue(picker.rgbResult), before.alpha,
+            error)) {
+        MessageBoxW(gMainWindow, widen(error).c_str(), L"Prelight edit failed", MB_OK | MB_ICONERROR);
+        return;
+    }
+    const auto& updated = gModelFile.previewPrelights();
+    if (size_t(gSelectedPrelightVertex) < updated.size()) {
+        const StorylandModelPrelight& c = updated[size_t(gSelectedPrelightVertex)];
+        HTREEITEM selected = gTree ? TreeView_GetSelection(gTree) : nullptr;
+        if (selected) {
+            std::wostringstream label;
+            label << L"#" << gSelectedPrelightVertex << L"  RGBA(" << unsigned(c.red) << L", " << unsigned(c.green) << L", " << unsigned(c.blue) << L", " << unsigned(c.alpha) << L")";
+            if (c.fileOffset != 0xFFFFFFFFu) label << L"  @ " << hexWide(c.fileOffset, 8);
+            std::wstring labelText = label.str();
+            TVITEMW item = {};
+            item.mask = TVIF_TEXT; item.hItem = selected; item.pszText = labelText.data();
+            TreeView_SetItem(gTree, &item);
+        }
+        selectModelPrelight(gSelectedPrelightVertex);
+    }
+    setStatus(L"Prelight vertex colour edited in the model byte stream. Export to save the change.");
+}
+
 static bool populateModelDffStructureTree() {
     if (!gModelFile.isPspNativeDff() && !gModelFile.isMobileLcsDff()) {
         std::wstring extension = std::filesystem::path(gModelFile.sourcePath()).extension().wstring();
@@ -4496,6 +4654,7 @@ static bool populateModelDffStructureTree() {
     }
 
     if (!treeItems.empty() && treeItems[0]) {
+        addModelPrelightTree(treeItems[0]);
         TreeView_Expand(gTree, treeItems[0], TVE_EXPAND);
 
         // Match the useful RW Analyze presentation: expose the immediate
@@ -4538,6 +4697,7 @@ static void populateModelList() {
     else if (gModelFile.isPspNativeDff()) summary << L"LCS PSP beta RenderWare DFF / ";
     summary << widen(gModelFile.modelKindName()) << L"  size=" << gModelFile.fileSize() << L" bytes";
     addTreeItem(root, summary.str());
+    addModelPrelightTree(root);
 
     const auto& bones = gModelFile.armatureBones();
     HTREEITEM armatureRoot = nullptr;
@@ -11896,9 +12056,10 @@ static void runCurrentModelTest() {
             ++warnings;
             extraWarnings.push_back("DMA tags were found, but no VIF command stream was recognized.");
         }
-        if (dmaReport.vifStreams > 0 && dmaReport.gifTags == 0) {
+        if (dmaReport.directTransfers > 0 && dmaReport.gifTags == 0) {
             ++warnings;
-            extraWarnings.push_back("VIF data was found, but no GIF tag was recognized.");
+            extraWarnings.push_back(
+                "VIF DIRECT/DIRECTHL data was found, but no GIF tag was recognized inside the direct transfer.");
         }
 
         if (loadedModelUsesPspGeometry()) {
@@ -13477,6 +13638,7 @@ static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
     glFlush();
     SwapBuffers(dc);
     drawOpenGlViewCubeLabels(hwnd, dc);
+    drawSelectedViewportLabel(dc, rc);
     wglMakeCurrent(nullptr, nullptr);
 
     std::wstring title = L"OpenGL LVZ+IMG mesh viewport  |  ";
@@ -13783,6 +13945,7 @@ static void drawModelPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
     const bool staticDecodedModelPreview = !usingAnimatedMeshPreview;
     const auto& tris = gModelFile.previewTriangles();
     const auto& texcoords = gModelFile.previewTexcoords();
+    const auto& prelights = gModelFile.previewPrelights();
     const auto& bones = gModelFile.armatureBones();
     const auto& lights2dfx = gModelFile.preview2dfxLights();
     if (!gOpenGlReady && !initializeOpenGlPreview(hwnd)) {
@@ -14006,8 +14169,19 @@ static void drawModelPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
             glPolygonOffset(1.0f, 1.0f);
             glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
             glBegin(GL_TRIANGLES);
-            if (gOpenGlRenderMode == StorylandOpenGlRenderMode::Solid) glColor3f(0.76f, 0.78f, 0.74f);
-            else glColor3f(1.0f, 1.0f, 1.0f);
+            auto setVertexPrelight = [&](uint32_t vertexIndex) {
+                if (gOpenGlRenderMode == StorylandOpenGlRenderMode::Solid) {
+                    glColor4f(0.76f, 0.78f, 0.74f, 1.0f);
+                    return;
+                }
+                if (gPrelightViewMode == StorylandPrelightViewMode::Off ||
+                    vertexIndex >= prelights.size() || !prelights[vertexIndex].valid) {
+                    glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+                    return;
+                }
+                const StorylandModelPrelight& c = prelights[vertexIndex];
+                glColor4ub(c.red, c.green, c.blue, c.alpha);
+            };
             for (const auto& tri : tris) {
                 if (tri.a >= pts.size() || tri.b >= pts.size() || tri.c >= pts.size()) continue;
                 const auto& a = pts[tri.a];
@@ -14019,10 +14193,13 @@ static void drawModelPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
                 const StorylandModelPoint& normalB = tri.b < gouraudNormals.size() ? gouraudNormals[tri.b] : faceNormal;
                 const StorylandModelPoint& normalC = tri.c < gouraudNormals.size() ? gouraudNormals[tri.c] : faceNormal;
                 int textureRegion = wantsTexture ? chooseModelTextureRegionForTriangle(tri, pts, minX, minY, minZ, spanX, spanY, spanZ) : -1;
+                setVertexPrelight(tri.a);
                 if (wantsTexture) emitModelPreviewTexcoordInRegion(tri.a, textureRegion, pts, texcoords, hasRealTexcoords, minX, minY, minZ, spanX, spanY, spanZ);
                 emitPreviewVertexWithNormal(a, normalA);
+                setVertexPrelight(tri.b);
                 if (wantsTexture) emitModelPreviewTexcoordInRegion(tri.b, textureRegion, pts, texcoords, hasRealTexcoords, minX, minY, minZ, spanX, spanY, spanZ);
                 emitPreviewVertexWithNormal(b, normalB);
+                setVertexPrelight(tri.c);
                 if (wantsTexture) emitModelPreviewTexcoordInRegion(tri.c, textureRegion, pts, texcoords, hasRealTexcoords, minX, minY, minZ, spanX, spanY, spanZ);
                 emitPreviewVertexWithNormal(c, normalC);
             }
@@ -14287,6 +14464,7 @@ static void drawModelPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
         TextOutW(dc, halfW + 10, 8, L"Right", 5);
         TextOutW(dc, 10, halfH + 8, L"Top", 3);
         TextOutW(dc, halfW + 10, halfH + 8, L"Perspective", 11);
+        drawSelectedViewportLabel(dc, rc);
         wglMakeCurrent(nullptr, nullptr);
         return;
     }
@@ -14296,6 +14474,7 @@ static void drawModelPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
     glFlush();
     SwapBuffers(dc);
     drawOpenGlViewCubeLabels(hwnd, dc);
+    drawSelectedViewportLabel(dc, rc);
     wglMakeCurrent(nullptr, nullptr);
 }
 
@@ -15027,7 +15206,8 @@ static LRESULT CALLBACK previewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             return 0;
         }
         if (gModelRightDrag) {
-            float panScale = (gMode == StorylandMode::ArchiveFile) ? std::max(0.006f, gModelDistance * 0.004f) : 0.005f;
+            float panScale = std::max(0.0025f, gModelDistance * 0.0045f);
+            if ((GetKeyState(VK_SHIFT) & 0x8000) != 0) panScale *= 2.5f;
             gModelPanX += float(dx) * panScale;
             gModelPanY -= float(dy) * panScale;
             InvalidateRect(hwnd, nullptr, FALSE);
@@ -15040,7 +15220,7 @@ static LRESULT CALLBACK previewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         return 0;
     }
     if (msg == WM_LBUTTONDBLCLK && currentModeUsesInteractiveModelViewport()) {
-        resetModelViewport();
+        fitModelViewportCloser();
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     }
@@ -15404,6 +15584,7 @@ static void selectPayloadForCurrentMode(const StorylandTreePayload& payload) {
     else if (gMode == StorylandMode::DtzArchive) selectDtzPayload(payload);
     else if (gMode == StorylandMode::ModelFile && payload.kind == StorylandTreeKind::ModelField) selectModelField(payload.index);
     else if (gMode == StorylandMode::ModelFile && payload.kind == StorylandTreeKind::ModelBone) selectModelBone(payload.index);
+    else if (gMode == StorylandMode::ModelFile && payload.kind == StorylandTreeKind::ModelPrelight) selectModelPrelight(payload.index);
     else if (gMode == StorylandMode::ModelFile && (payload.kind == StorylandTreeKind::AnimOverview || payload.kind == StorylandTreeKind::AnimClip || payload.kind == StorylandTreeKind::AnimTrack || payload.kind == StorylandTreeKind::AnimField || payload.kind == StorylandTreeKind::AnimString)) selectAnimPayload(payload);
     else if (gMode == StorylandMode::ArchiveFile) selectArchivePayload(payload);
     else if (gMode == StorylandMode::WblFile) selectWblPayload(payload);
@@ -16648,6 +16829,13 @@ static void rebuildViewMenu() {
         else if (gOpenGlRenderMode == StorylandOpenGlRenderMode::Wireframe) checkedRender = ID_VIEW_RENDER_WIREFRAME;
         CheckMenuRadioItem(gOpenGlMenu, ID_VIEW_RENDER_STORIES, ID_VIEW_RENDER_WIREFRAME, checkedRender, MF_BYCOMMAND);
         AppendMenuW(gOpenGlMenu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(gOpenGlMenu, MF_STRING, ID_VIEW_PRELIGHT_COMBINED, L"Prelight: combined with timecycle");
+        AppendMenuW(gOpenGlMenu, MF_STRING, ID_VIEW_PRELIGHT_RAW, L"Prelight: raw vertex colours");
+        AppendMenuW(gOpenGlMenu, MF_STRING, ID_VIEW_PRELIGHT_OFF, L"Prelight: disabled");
+        UINT checkedPrelight = gPrelightViewMode == StorylandPrelightViewMode::Raw ? ID_VIEW_PRELIGHT_RAW :
+                               gPrelightViewMode == StorylandPrelightViewMode::Off ? ID_VIEW_PRELIGHT_OFF : ID_VIEW_PRELIGHT_COMBINED;
+        CheckMenuRadioItem(gOpenGlMenu, ID_VIEW_PRELIGHT_COMBINED, ID_VIEW_PRELIGHT_OFF, checkedPrelight, MF_BYCOMMAND);
+        AppendMenuW(gOpenGlMenu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(gOpenGlMenu, MF_STRING, ID_VIEW_SHOW_GRID, L"Grid");
         AppendMenuW(gOpenGlMenu, MF_STRING, ID_VIEW_SHOW_BONES, L"Bones");
         AppendMenuW(gOpenGlMenu, MF_STRING, ID_VIEW_SHOW_BOUNDS, L"Bounds");
@@ -17430,6 +17618,24 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             setOpenGlRenderMode(StorylandOpenGlRenderMode::Wireframe);
             CheckMenuRadioItem(gOpenGlMenu, ID_VIEW_RENDER_STORIES, ID_VIEW_RENDER_WIREFRAME, ID_VIEW_RENDER_WIREFRAME, MF_BYCOMMAND);
             break;
+        case ID_VIEW_PRELIGHT_COMBINED:
+            gPrelightViewMode = StorylandPrelightViewMode::Combined;
+            CheckMenuRadioItem(gOpenGlMenu, ID_VIEW_PRELIGHT_COMBINED, ID_VIEW_PRELIGHT_OFF, ID_VIEW_PRELIGHT_COMBINED, MF_BYCOMMAND);
+            InvalidateRect(gPreview, nullptr, FALSE);
+            setStatus(L"Prelight: source vertex colours combined with Stories timecycle lighting.");
+            break;
+        case ID_VIEW_PRELIGHT_RAW:
+            gPrelightViewMode = StorylandPrelightViewMode::Raw;
+            CheckMenuRadioItem(gOpenGlMenu, ID_VIEW_PRELIGHT_COMBINED, ID_VIEW_PRELIGHT_OFF, ID_VIEW_PRELIGHT_RAW, MF_BYCOMMAND);
+            InvalidateRect(gPreview, nullptr, FALSE);
+            setStatus(L"Prelight: raw source vertex colours, no timecycle light/fog modulation.");
+            break;
+        case ID_VIEW_PRELIGHT_OFF:
+            gPrelightViewMode = StorylandPrelightViewMode::Off;
+            CheckMenuRadioItem(gOpenGlMenu, ID_VIEW_PRELIGHT_COMBINED, ID_VIEW_PRELIGHT_OFF, ID_VIEW_PRELIGHT_OFF, MF_BYCOMMAND);
+            InvalidateRect(gPreview, nullptr, FALSE);
+            setStatus(L"Prelight disabled for viewport inspection.");
+            break;
         case ID_VIEW_SHOW_GRID:
             gOpenGlShowGrid = !gOpenGlShowGrid;
             CheckMenuItem(gOpenGlMenu, ID_VIEW_SHOW_GRID, MF_BYCOMMAND | (gOpenGlShowGrid ? MF_CHECKED : MF_UNCHECKED));
@@ -17541,6 +17747,10 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             return 0;
         }
         if (header && header->idFrom == ID_TREE && header->code == NM_DBLCLK) {
+            if (gMode == StorylandMode::ModelFile && gSelectedKind == StorylandTreeKind::ModelPrelight) {
+                editSelectedModelPrelight();
+                return 0;
+            }
             if (gMode == StorylandMode::DtzArchive && gSelectedKind == StorylandTreeKind::DtzDataField && gSelectedIndex >= 0) {
                 const auto& fields = gDtzArchive.dataFields();
                 if (size_t(gSelectedIndex) < fields.size() && fields[size_t(gSelectedIndex)].editable) {

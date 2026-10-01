@@ -5661,6 +5661,153 @@ bool StorylandModelFile::parseGtaSaDff() {
     return true;
 }
 
+
+static uint8_t expand5To8(uint32_t value) {
+    value &= 31u;
+    return uint8_t((value << 3u) | (value >> 2u));
+}
+
+void StorylandModelFile::collectPreviewPrelights() {
+    prelights.clear();
+    if (points.empty()) return;
+
+    auto appendWhite = [&](size_t count) {
+        prelights.insert(prelights.end(), count, StorylandModelPrelight{});
+    };
+
+    // Ordinary RenderWare Geometry Struct prelights are a direct RGBA byte array
+    // immediately after the 16-byte geometry header.  Preserve byte offsets so
+    // editing changes the actual source stream rather than a preview-only copy.
+    if (data.size() >= 12u && modelReadU32(data, 0u) == 0x10u) {
+        StorylandRwChunkView root;
+        if (readStorylandRwChunk(data, 0u, data.size(), root) && root.type == 0x10u) {
+            for (const StorylandRwChunkView& child : storylandRwChildren(data, root)) {
+                if (child.type != 0x1Au) continue;
+                for (const StorylandRwChunkView& geometry : storylandRwChildren(data, child)) {
+                    if (geometry.type != 0x0Fu) continue;
+                    const auto geometryChildren = storylandRwChildren(data, geometry);
+                    if (geometryChildren.empty() || geometryChildren.front().type != 1u || geometryChildren.front().size < 16u) continue;
+                    const StorylandRwChunkView& st = geometryChildren.front();
+                    const uint32_t flags = modelReadU32(data, st.payload + 0u);
+                    const uint32_t vertexCount = modelReadU32(data, st.payload + 8u);
+                    if (vertexCount == 0u || vertexCount > points.size()) continue;
+                    if ((flags & 0x01000000u) != 0u) continue;
+                    if ((flags & 0x00000008u) == 0u) {
+                        appendWhite(vertexCount);
+                        continue;
+                    }
+                    const size_t colors = st.payload + 16u;
+                    if (!modelRangeFits(colors, size_t(vertexCount) * 4u, st.end)) {
+                        appendWhite(vertexCount);
+                        continue;
+                    }
+                    for (uint32_t i = 0; i < vertexCount; ++i) {
+                        const size_t off = colors + size_t(i) * 4u;
+                        StorylandModelPrelight c;
+                        c.red = data[off + 0u]; c.green = data[off + 1u]; c.blue = data[off + 2u]; c.alpha = data[off + 3u];
+                        c.fileOffset = uint32_t(off); c.encoding = StorylandPrelightEncoding::Rgba8888; c.valid = true;
+                        prelights.push_back(c);
+                    }
+                }
+            }
+            if (prelights.size() == points.size()) return;
+            prelights.clear();
+        }
+    }
+
+    // Leeds PS2 VIF strips: V4-8 UNPACK (0x6E signed / 0x7E unsigned) following
+    // the normal V3-8 payload is the per-vertex RGBA/prelight stream.  Only accept
+    // a complete exact-payload walk; otherwise leave the model uncoloured instead
+    // of fabricating colors from unrelated packet bytes.
+    std::vector<StorylandModelPrelight> vifColors;
+    size_t lastAcceptedEnd = 0u;
+    for (size_t marker = 0; marker + 0x34u <= data.size(); marker += 4u) {
+        if (modelReadU32(data, marker) != 0x6C018000u || marker < lastAcceptedEnd) continue;
+        const uint8_t vertexCount = data[marker + 0x32u];
+        if (vertexCount < 3u || vertexCount > 128u) continue;
+        size_t cursor = alignModelOffset4(marker + 0x34u + size_t(vertexCount) * 6u);
+        if (cursor + 0x20u > data.size() || modelReadU32(data, cursor) != 0x20000000u || modelReadU32(data, cursor + 8u) != 0x30000000u) continue;
+        cursor += 0x1Cu;
+        if (cursor + 4u > data.size() || data[cursor + 3u] != 0x76u) continue;
+        uint8_t uvCount = data[cursor + 2u]; if (uvCount == 0u || uvCount > 128u) uvCount = vertexCount;
+        cursor = alignModelOffset4(cursor + 4u + size_t(uvCount) * 2u);
+        if (cursor + 4u > data.size() || data[cursor + 3u] != 0x6Au) continue;
+        uint8_t normalCount = data[cursor + 2u]; if (normalCount == 0u || normalCount > 128u) normalCount = vertexCount;
+        cursor = alignModelOffset4(cursor + 4u + size_t(normalCount) * 3u);
+
+        std::vector<StorylandModelPrelight> strip(vertexCount);
+        if (cursor + 4u <= data.size() && (data[cursor + 3u] == 0x6Eu || data[cursor + 3u] == 0x7Eu)) {
+            uint8_t colorCount = data[cursor + 2u]; if (colorCount == 0u || colorCount > 128u) colorCount = vertexCount;
+            const size_t payload = cursor + 4u;
+            if (colorCount >= vertexCount && modelRangeFits(payload, size_t(colorCount) * 4u, data.size())) {
+                for (uint32_t i = 0u; i < vertexCount; ++i) {
+                    const size_t off = payload + size_t(i) * 4u;
+                    strip[i].red = data[off + 0u]; strip[i].green = data[off + 1u]; strip[i].blue = data[off + 2u]; strip[i].alpha = data[off + 3u];
+                    strip[i].fileOffset = uint32_t(off); strip[i].encoding = StorylandPrelightEncoding::Ps2VifRgba8888; strip[i].valid = true;
+                }
+                cursor = alignModelOffset4(payload + size_t(colorCount) * 4u);
+            }
+        }
+        vifColors.insert(vifColors.end(), strip.begin(), strip.end());
+        lastAcceptedEnd = marker + 0x34u + size_t(vertexCount) * 6u;
+    }
+    if (vifColors.size() == points.size()) {
+        prelights.swap(vifColors);
+        return;
+    }
+
+    // PSP native color type 5 is the 16-bit 5:5:5:1 stream already described by
+    // the native vertex layout. Decode it only when the complete strip walk lines
+    // up one-for-one with the preview vertices.
+    std::vector<StorylandModelPrelight> pspColors;
+    for (size_t atomicOffset = 0; atomicOffset + 0x38u <= data.size(); atomicOffset += 4u) {
+        const uint32_t sectionId = modelReadU32(data, atomicOffset);
+        if (sectionId != 0x01050001u && sectionId != 0x0004AA01u && sectionId != 0x0000AA01u && ((sectionId & 0xFFFF00FFu) != 0x00040001u)) continue;
+        const uint32_t geometryOffset = modelReadU32(data, atomicOffset + 0x14u);
+        uint32_t headerOffset = 0u;
+        if (!modelPointerLooksValid(data, geometryOffset) || !pspNativeGeometryHeaderLooksValid(data, geometryOffset, headerOffset)) continue;
+        const uint32_t flags = modelReadU32(data, headerOffset + 0x04u);
+        const uint32_t numStrips = modelReadU32(data, headerOffset + 0x08u);
+        const uint32_t vertexBaseOffset = modelReadU32(data, headerOffset + 0x40u);
+        PspNativeVertexLayout layout;
+        if (!buildPspNativeVertexLayout(flags, layout)) continue;
+        for (uint32_t stripIndex = 0u; stripIndex < numStrips; ++stripIndex) {
+            const size_t sh = size_t(headerOffset) + 0x48u + size_t(stripIndex) * 0x30u;
+            if (sh + 0x30u > data.size()) continue;
+            const uint32_t vertexCount = uint32_t(modelReadU16(data, sh + 0x04u)) + 2u;
+            const size_t stream = size_t(headerOffset) + size_t(vertexBaseOffset) + size_t(modelReadU32(data, sh));
+            if (vertexCount < 3u || stream >= data.size() || vertexCount > (data.size() - stream) / layout.stride) continue;
+            for (uint32_t i = 0u; i < vertexCount; ++i) {
+                StorylandModelPrelight c;
+                if (layout.colorOffset != SIZE_MAX) {
+                    const size_t off = stream + size_t(i) * layout.stride + layout.colorOffset;
+                    const uint16_t packed = modelReadU16(data, off);
+                    c.red = expand5To8(packed >> 0u); c.green = expand5To8(packed >> 5u); c.blue = expand5To8(packed >> 10u); c.alpha = (packed & 0x8000u) ? 255u : 0u;
+                    c.fileOffset = uint32_t(off); c.encoding = StorylandPrelightEncoding::Psp5551; c.valid = true;
+                }
+                pspColors.push_back(c);
+            }
+        }
+    }
+    if (pspColors.size() == points.size()) prelights.swap(pspColors);
+}
+
+bool StorylandModelFile::setPreviewPrelightColor(size_t vertexIndex, uint8_t red, uint8_t green, uint8_t blue, uint8_t alpha, std::string& errorMessage) {
+    if (vertexIndex >= prelights.size()) { errorMessage = "Prelight vertex index is out of range."; return false; }
+    StorylandModelPrelight& c = prelights[vertexIndex];
+    if (!c.valid || c.fileOffset == 0xFFFFFFFFu) { errorMessage = "This vertex has no editable source prelight."; return false; }
+    const size_t off = c.fileOffset;
+    if (c.encoding == StorylandPrelightEncoding::Rgba8888 || c.encoding == StorylandPrelightEncoding::Ps2VifRgba8888) {
+        if (!modelRangeFits(off, 4u, data.size())) { errorMessage = "Prelight source offset is outside the model."; return false; }
+        data[off+0u]=red; data[off+1u]=green; data[off+2u]=blue; data[off+3u]=alpha;
+    } else if (c.encoding == StorylandPrelightEncoding::Psp5551) {
+        if (!modelRangeFits(off, 2u, data.size())) { errorMessage = "PSP prelight source offset is outside the model."; return false; }
+        uint16_t packed = uint16_t((red >> 3u) | ((green >> 3u) << 5u) | ((blue >> 3u) << 10u) | (alpha >= 128u ? 0x8000u : 0u));
+        data[off+0u]=uint8_t(packed & 0xFFu); data[off+1u]=uint8_t(packed >> 8u);
+    } else { errorMessage = "Unsupported prelight encoding."; return false; }
+    c.red=red; c.green=green; c.blue=blue; c.alpha=alpha; errorMessage.clear(); return true;
+}
+
 void StorylandModelFile::parse() {
     outputLines.clear();
     fieldRows.clear();
@@ -5670,15 +5817,16 @@ void StorylandModelFile::parse() {
     pspNativeDff = false;
     gtaSaDff = false;
     lights2dfx.clear();
-    if (parsePmlcMdl()) return;
-    if (parseMobileLcsDff()) return;
-    if (parsePspStandardDff()) return;
-    if (parsePspNativeDff()) return;
-    if (parseGtaSaDff()) return;
+    if (parsePmlcMdl()) { collectPreviewPrelights(); return; }
+    if (parseMobileLcsDff()) { collectPreviewPrelights(); return; }
+    if (parsePspStandardDff()) { collectPreviewPrelights(); return; }
+    if (parsePspNativeDff()) { collectPreviewPrelights(); return; }
+    if (parseGtaSaDff()) { collectPreviewPrelights(); return; }
     collectRenderWare2dfxLights();
     detectModelKind();
     collectTextureNameHints();
     collectPreviewPoints();
+    collectPreviewPrelights();
     collectArmatureBones();
 
     // PSP strips store a small per-strip skin palette.  Each vertex weight selects
@@ -6319,6 +6467,7 @@ bool StorylandModelFile::isEmptyDraft() const { return emptyDraft; }
 
 const std::vector<StorylandModelTriangle>& StorylandModelFile::previewTriangles() const { return triangles; }
 const std::vector<StorylandModelTexcoord>& StorylandModelFile::previewTexcoords() const { return texcoords; }
+const std::vector<StorylandModelPrelight>& StorylandModelFile::previewPrelights() const { return prelights; }
 const std::vector<StorylandModelSkinWeights>& StorylandModelFile::previewSkinWeights() const { return skinWeights; }
 const std::vector<StorylandModelBone>& StorylandModelFile::armatureBones() const { return bones; }
 const std::vector<StorylandModelLight2dfx>& StorylandModelFile::preview2dfxLights() const { return lights2dfx; }

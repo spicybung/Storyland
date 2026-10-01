@@ -42,6 +42,23 @@ struct StorylandModelTexcoord {
     float v = 0.0f;
 };
 
+enum class StorylandPrelightEncoding {
+    None,
+    Rgba8888,
+    Psp5551,
+    Ps2VifRgba8888
+};
+
+struct StorylandModelPrelight {
+    uint8_t red = 255;
+    uint8_t green = 255;
+    uint8_t blue = 255;
+    uint8_t alpha = 255;
+    uint32_t fileOffset = 0xFFFFFFFFu;
+    StorylandPrelightEncoding encoding = StorylandPrelightEncoding::None;
+    bool valid = false;
+};
+
 struct StorylandModelSkinInfluence {
     uint32_t boneIndex = 0xFFFFFFFFu;
     uint32_t rawMatrixIndex = 0xFFFFFFFFu;
@@ -118,6 +135,8 @@ public:
     const std::vector<StorylandModelPoint>& previewPoints() const;
     const std::vector<StorylandModelTriangle>& previewTriangles() const;
     const std::vector<StorylandModelTexcoord>& previewTexcoords() const;
+    const std::vector<StorylandModelPrelight>& previewPrelights() const;
+    bool setPreviewPrelightColor(size_t vertexIndex, uint8_t red, uint8_t green, uint8_t blue, uint8_t alpha, std::string& errorMessage);
     const std::vector<StorylandModelSkinWeights>& previewSkinWeights() const;
     const std::vector<StorylandModelBone>& armatureBones() const;
     const std::vector<StorylandModelLight2dfx>& preview2dfxLights() const;
@@ -154,6 +173,7 @@ private:
     std::vector<StorylandModelPoint> points;
     std::vector<StorylandModelTriangle> triangles;
     std::vector<StorylandModelTexcoord> texcoords;
+    std::vector<StorylandModelPrelight> prelights;
     std::vector<StorylandModelSkinWeights> skinWeights;
     std::vector<StorylandModelBone> bones;
     std::vector<StorylandModelLight2dfx> lights2dfx;
@@ -176,6 +196,7 @@ private:
     bool parsePspNativeDff();
     void collectRenderWare2dfxLights();
     void collectPreviewPoints();
+    void collectPreviewPrelights();
     void collectArmatureBones();
     void collectTextureNameHints();
     void detectModelKind();

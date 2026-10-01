@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <chrono>
 #include <cwctype>
+#include <iomanip>
+#include <sstream>
 #include <filesystem>
 #include <fstream>
 #include <set>
@@ -24,6 +26,109 @@ struct StorylandOutputFile {
 };
 
 namespace storyland_atomic_io_detail {
+
+inline std::string formatByteCount(uint64_t bytes) {
+    static const char* units[] = {"bytes", "KiB", "MiB", "GiB", "TiB"};
+    double value = static_cast<double>(bytes);
+    size_t unit = 0;
+    while (value >= 1024.0 && unit + 1 < 5) {
+        value /= 1024.0;
+        ++unit;
+    }
+    std::ostringstream ss;
+    if (unit == 0) ss << bytes << " " << units[unit];
+    else ss << std::fixed << std::setprecision(value < 10.0 ? 2 : value < 100.0 ? 1 : 0) << value << " " << units[unit];
+    return ss.str();
+}
+
+#ifdef _WIN32
+inline std::string windowsErrorDescription(DWORD code) {
+    switch (code) {
+        case ERROR_DISK_FULL:
+        case ERROR_HANDLE_DISK_FULL:
+            return "The destination drive is out of free space.";
+        case ERROR_ACCESS_DENIED:
+            return "Windows denied access to the destination. Check folder permissions, Controlled Folder Access, or antivirus protection.";
+        case ERROR_SHARING_VIOLATION:
+            return "Another program has the destination file open and is preventing Storyland from writing it.";
+        case ERROR_LOCK_VIOLATION:
+            return "Another program has locked part of the destination file.";
+        case ERROR_WRITE_PROTECT:
+            return "The destination drive or folder is write-protected.";
+        case ERROR_PATH_NOT_FOUND:
+            return "The destination folder no longer exists or is unavailable.";
+        case ERROR_FILE_NOT_FOUND:
+            return "Windows could not find the destination file or one of its required path components.";
+        case ERROR_FILENAME_EXCED_RANGE:
+            return "The destination path is too long for this Windows configuration.";
+        case ERROR_NOT_READY:
+            return "The destination drive is not ready.";
+        case ERROR_DEVICE_NOT_CONNECTED:
+            return "The destination drive or device was disconnected.";
+#ifdef ERROR_NOT_ENOUGH_QUOTA
+        case ERROR_NOT_ENOUGH_QUOTA:
+            return "The storage quota for this destination has been exceeded.";
+#endif
+        default:
+            break;
+    }
+
+    LPWSTR buffer = nullptr;
+    const DWORD length = FormatMessageW(
+        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        nullptr, code, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+        reinterpret_cast<LPWSTR>(&buffer), 0, nullptr);
+    if (length == 0 || buffer == nullptr) return "Windows reported an I/O error.";
+
+    std::wstring wide(buffer, length);
+    LocalFree(buffer);
+    while (!wide.empty() && (wide.back() == L'\r' || wide.back() == L'\n' || wide.back() == L' ' || wide.back() == L'.')) wide.pop_back();
+
+    if (wide.empty()) return "Windows reported an I/O error.";
+    int needed = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()), nullptr, 0, nullptr, nullptr);
+    if (needed <= 0) return "Windows reported an I/O error.";
+    std::string text(static_cast<size_t>(needed), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()), text.data(), needed, nullptr, nullptr);
+    return text + ".";
+}
+
+inline bool queryFreeBytesForPath(const std::filesystem::path& path, uint64_t& freeBytes) {
+    std::filesystem::path probe = path.parent_path();
+    if (probe.empty()) probe = path.root_path();
+    if (probe.empty()) probe = L".";
+
+    ULARGE_INTEGER available = {};
+    if (!GetDiskFreeSpaceExW(probe.c_str(), &available, nullptr, nullptr)) return false;
+    freeBytes = available.QuadPart;
+    return true;
+}
+
+inline std::string makeWindowsWriteError(const std::filesystem::path& path,
+                                         DWORD code,
+                                         uint64_t written,
+                                         uint64_t total,
+                                         const char* operation) {
+    std::ostringstream ss;
+    ss << windowsErrorDescription(code) << "\n\n";
+    ss << "Storyland " << operation << ".\n";
+    if (total != 0) {
+        ss << "File size: " << formatByteCount(total) << " (" << total << " bytes)\n";
+        ss << "Written before failure: " << formatByteCount(written) << " (" << written << " bytes)\n";
+    }
+
+    uint64_t freeBytes = 0;
+    if (queryFreeBytesForPath(path, freeBytes)) {
+        ss << "Free space reported by Windows: " << formatByteCount(freeBytes) << " (" << freeBytes << " bytes)\n";
+    }
+
+    ss << "Windows error: " << code << "\n";
+    ss << "Path: " << path.string();
+    if (code == ERROR_DISK_FULL || code == ERROR_HANDLE_DISK_FULL) {
+        ss << "\n\nFree some space on that drive, then retry. If this path is inside your Windows TEMP folder, clearing old temporary files can also help.";
+    }
+    return ss.str();
+}
+#endif
 
 inline bool writeAndVerify(const std::filesystem::path& path, const std::vector<uint8_t>& bytes, std::string& error) {
     std::error_code ec;
@@ -48,7 +153,8 @@ inline bool writeAndVerify(const std::filesystem::path& path, const std::vector<
     HANDLE handle = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (handle == INVALID_HANDLE_VALUE) {
-        error = "Could not create staged output file (Windows error " + std::to_string(GetLastError()) + "): " + path.string();
+        const DWORD winerr = GetLastError();
+        error = makeWindowsWriteError(path, winerr, 0, bytes.size(), "could not create the temporary output file");
         return false;
     }
     size_t writtenTotal = 0;
@@ -59,8 +165,8 @@ inline bool writeAndVerify(const std::filesystem::path& path, const std::vector<
             const DWORD winerr = GetLastError();
             CloseHandle(handle);
             DeleteFileW(path.c_str());
-            error = "Could not completely write staged output file after " + std::to_string(writtenTotal + wrote) +
-                    " of " + std::to_string(bytes.size()) + " bytes (Windows error " + std::to_string(winerr) + "): " + path.string();
+            error = makeWindowsWriteError(path, winerr, writtenTotal + wrote, bytes.size(),
+                                          "could not finish writing the temporary output file");
             return false;
         }
         writtenTotal += size_t(wrote);
@@ -69,7 +175,8 @@ inline bool writeAndVerify(const std::filesystem::path& path, const std::vector<
         const DWORD winerr = GetLastError();
         CloseHandle(handle);
         DeleteFileW(path.c_str());
-        error = "Could not flush staged output file (Windows error " + std::to_string(winerr) + "): " + path.string();
+        error = makeWindowsWriteError(path, winerr, bytes.size(), bytes.size(),
+                                      "wrote the temporary output but Windows could not flush it safely to disk");
         return false;
     }
     CloseHandle(handle);
