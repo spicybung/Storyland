@@ -2595,13 +2595,31 @@ void StorylandDtzArchive::rebuildDataBlocksAndFields() {
         uint32_t end = inferNextHeaderPointerEnd(unpackedData, timecycOffset);
         if (end > timecycOffset + 4) {
             uint32_t size = end - timecycOffset;
+            bool looksLikeHourlyFloatRows = false;
             if ((size % 36u) == 0 && (size / 36u) >= 24u && (size / 36u) <= 96u) {
+                const uint32_t rowCount = size / 36u;
+                uint32_t saneFloats = 0u;
+                uint32_t testedFloats = 0u;
+                for (uint32_t row = 0u; row < rowCount; ++row) {
+                    for (uint32_t channel = 0u; channel < 9u; ++channel) {
+                        const float value = readFloat32(unpackedData, timecycOffset + row * 36u + channel * 4u);
+                        ++testedFloats;
+                        if (std::isfinite(value) && value >= -4096.0f && value <= 4096.0f) ++saneFloats;
+                    }
+                }
+                // Merely being 36-byte aligned is not enough. Retail VCS GAME.DTZ
+                // can have a 0x360-byte compiled timecycle block containing
+                // pointers, sentinels and vectors after an initial float table.
+                looksLikeHourlyFloatRows = testedFloats != 0u && saneFloats * 100u >= testedFloats * 95u;
+            }
+
+            if (looksLikeHourlyFloatRows) {
                 uint32_t rowCount = size / 36u;
-                size_t blockIndex = appendDtzDataBlock(dataBlocksCache, "timecyc.dat hourly 3D-era compact rows", "timecyc-3d-era-36-byte-hourly-rows", 0xB0, timecycOffset, end, 36, rowCount, true, "real header pointer 0xB0; parsed as 36-byte hourly rows: 9 float channels, shown as three RGB triplets instead of anonymous dwords");
+                size_t blockIndex = appendDtzDataBlock(dataBlocksCache, "timecyc.dat hourly float rows", "timecyc-3d-era-36-byte-hourly-rows", 0xB0, timecycOffset, end, 36, rowCount, true, "header pointer 0xB0; every 36-byte row passed float-range validation before being exposed as hourly RGB triplets");
                 appendTimecycFields(unpackedData, dataFieldsCache, blockIndex, dataBlocksCache[blockIndex]);
             } else {
                 uint32_t dwordCount = size / 4;
-                size_t blockIndex = appendDtzDataBlock(dataBlocksCache, "timecyc.dat real scanned range", "timecyc-real-dword-view", 0xB0, timecycOffset, end, 4, dwordCount, true, "real header pointer 0xB0; fallback raw float/u32 view because this build does not match the 36-byte hourly compact layout");
+                size_t blockIndex = appendDtzDataBlock(dataBlocksCache, "timecyc.dat compiled VCS block", "timecyc-real-dword-view", 0xB0, timecycOffset, end, 4, dwordCount, true, "header pointer 0xB0; compiled retail VCS layout retained as raw float/u32 fields because the block contains mixed pointers, sentinels and vectors and must not be mislabelled as 24 hourly RGB rows");
                 appendTimecycFields(unpackedData, dataFieldsCache, blockIndex, dataBlocksCache[blockIndex]);
             }
         }

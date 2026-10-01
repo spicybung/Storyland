@@ -83,7 +83,7 @@ static bool playStorylandTheme(bool /*introSting*/, bool vcsTheme = false) {
     return PlaySoundW(
         MAKEINTRESOURCEW(resourceId),
         module,
-        SND_RESOURCE | SND_ASYNC | SND_NODEFAULT
+        SND_RESOURCE | SND_ASYNC | SND_NODEFAULT | (vcsTheme ? SND_LOOP : 0)
     ) != FALSE;
 }
 
@@ -101,7 +101,9 @@ static int storylandMessageBoxW(HWND owner, LPCWSTR text, LPCWSTR caption, UINT 
         playStorylandTheme(false, false);
     }
 
-    return ::MessageBoxW(owner, text, caption, type);
+    const int result = ::MessageBoxW(owner, text, caption, type);
+    if (isError || isWarning) stopStorylandTheme();
+    return result;
 }
 
 #define MessageBoxW storylandMessageBoxW
@@ -474,10 +476,10 @@ static int gModelTextureIndex = -1;
 static bool gModelTextureLoaded = false;
 static bool gModelTextureUploadNeeded = false;
 static GLuint gModelTextureId = 0;
-static bool gModelTextureVAuto = true;
+static bool gModelTextureVAuto = false;
 static bool gModelFlipTextureV = false;
 static bool gModelDetectedFlipTextureV = false;
-static std::wstring gModelTextureVDetectionReason = L"Auto V orientation has not been evaluated yet.";
+static std::wstring gModelTextureVDetectionReason;
 
 enum class StorylandOpenGlRenderMode { Stories, Textured, Solid, Wireframe };
 static StorylandOpenGlRenderMode gOpenGlRenderMode = StorylandOpenGlRenderMode::Stories;
@@ -884,17 +886,56 @@ static void expandTreeItem(HTREEITEM item) {
 }
 
 
+static std::wstring widenResourceName(const std::string& text);
+
 static std::wstring selectedTreeDisplayText() {
     if (!gTree) return {};
     HTREEITEM selected = TreeView_GetSelection(gTree);
     if (!selected) return {};
+
     wchar_t buffer[512] = {};
     TVITEMW item = {};
-    item.mask = TVIF_TEXT;
+    item.mask = TVIF_TEXT | TVIF_PARAM;
     item.hItem = selected;
     item.pszText = buffer;
     item.cchTextMax = int(std::size(buffer));
     if (!TreeView_GetItem(gTree, &item)) return {};
+
+    const StorylandTreePayload payload = payloadFromLParam(item.lParam);
+
+    // The viewport label must use the authoritative resource name rather than
+    // whatever descriptive text the tree row happens to contain.  Tree rows may
+    // include offsets, ids and binary-derived annotations that are useful in the
+    // browser but are not valid file names.
+    if (payload.index >= 0) {
+        const size_t index = size_t(payload.index);
+        if (payload.kind == StorylandTreeKind::DtzDirEntry) {
+            const auto& entries = gDtzArchive.dirEntries();
+            if (index < entries.size()) {
+                return widenResourceName(entries[index].name);
+            }
+        }
+        if (payload.kind == StorylandTreeKind::ArchiveEntry) {
+            const auto& entries = gArchiveBrowser.entries();
+            if (index < entries.size()) {
+                return widenResourceName(entries[index].name);
+            }
+        }
+    }
+
+    if (gDtzEmbeddedPreviewKind != DtzEmbeddedPreviewKind::None &&
+        gDtzEmbeddedPreviewIndex >= 0) {
+        if (!gDtzEmbeddedPreviewPath.empty()) {
+            const std::wstring fileName = std::filesystem::path(gDtzEmbeddedPreviewPath).filename().wstring();
+            if (!fileName.empty()) return fileName;
+        }
+        const auto& entries = gDtzArchive.dirEntries();
+        const size_t index = size_t(gDtzEmbeddedPreviewIndex);
+        if (index < entries.size()) {
+            return widenResourceName(entries[index].name);
+        }
+    }
+
     return buffer;
 }
 
@@ -942,12 +983,40 @@ static bool selectTreePayloadItem(StorylandTreeKind kind, int index) {
 
 static std::wstring widen(const std::string& text) {
     if (text.empty()) return L"";
-    int size = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, nullptr, 0);
-    if (size <= 1) return L"";
-    std::wstring result(size_t(size), L'\0');
-    if (MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, result.data(), size) <= 0) return L"";
-    result.resize(size_t(size - 1));
+
+    auto convert = [&](UINT codePage, DWORD flags) -> std::wstring {
+        const int size = MultiByteToWideChar(codePage, flags, text.data(), int(text.size()), nullptr, 0);
+        if (size <= 0) return {};
+        std::wstring result(size_t(size), L'\0');
+        if (MultiByteToWideChar(codePage, flags, text.data(), int(text.size()), result.data(), size) != size) return {};
+        return result;
+    };
+
+    std::wstring result = convert(CP_UTF8, MB_ERR_INVALID_CHARS);
+    if (result.empty()) result = convert(1252, 0);
+    if (result.empty()) {
+        result.reserve(text.size());
+        for (unsigned char ch : text) result.push_back(ch >= 0x20 && ch < 0x7f ? wchar_t(ch) : L'?');
+    }
+
+    for (wchar_t& ch : result) {
+        if (ch < 0x20 && ch != L'\t') ch = L' ';
+        if (ch >= 0xD800 && ch <= 0xDFFF) ch = L'?';
+    }
     return result;
+}
+
+static std::wstring widenResourceName(const std::string& text) {
+    if (text.empty()) return L"";
+    std::wstring result;
+    result.reserve(text.size());
+    for (unsigned char ch : text) {
+        if (ch == 0) break;
+        if (ch >= 0x20 && ch < 0x7f) result.push_back(wchar_t(ch));
+        else result.push_back(L'?');
+    }
+    while (!result.empty() && (result.back() == L' ' || result.back() == L'?')) result.pop_back();
+    return result.empty() ? L"unnamed" : result;
 }
 
 static std::string narrow(const std::wstring& text) {
@@ -1440,8 +1509,7 @@ static std::wstring buildModelStatusLine() {
         status << L" | " << std::filesystem::path(gModelTexturePath).filename().wstring()
                << L" | " << gModelTextureRegions.size() << L" textures"
                << L" | sheet " << gModelTextureImage.width << L"x" << gModelTextureImage.height
-               << L" | V " << (gModelTextureVAuto ? L"auto:" : L"manual:")
-               << (effectiveModelTextureVFlip() ? L"flipped" : L"normal");
+               << L" | Flip V " << (gModelFlipTextureV ? L"on" : L"off");
     } else {
         status << L" | no textures";
     }
@@ -2222,7 +2290,7 @@ static void clearModelTexture() {
     gModelTextureRegions.clear();
     gModelTextureId = 0;
     gModelDetectedFlipTextureV = false;
-    gModelTextureVDetectionReason = L"Auto V orientation: no model texture is loaded.";
+    gModelTextureVDetectionReason.clear();
 }
 
 static int scoreModelTextureEntry(const LeedsTextureEntry& entry, const std::vector<std::string>& hints, const std::string& modelStem) {
@@ -2584,7 +2652,6 @@ static bool loadCompanionTextureForCurrentModel(const std::wstring& modelPath, s
         }
         statusOut = ss.str();
         gModelTextureStatus = statusOut;
-        updateModelTextureVAutoDetection();
         return true;
     }
 
@@ -2650,7 +2717,7 @@ static bool modelTexcoordsLookUsable(const std::vector<StorylandModelTexcoord>& 
 }
 
 static bool effectiveModelTextureVFlip() {
-    return gModelTextureVAuto ? gModelDetectedFlipTextureV : gModelFlipTextureV;
+    return gModelFlipTextureV;
 }
 
 static float applyModelTextureVOption(float v) {
@@ -2930,7 +2997,7 @@ static void updateModelTextureVAutoDetection() {
         if (difference * 100ull >= maximumScore * 4ull) {
             gModelDetectedFlipTextureV = flippedAlpha > normalAlpha;
             std::wstringstream ss;
-            ss << L"Auto V orientation: alpha coverage selected "
+            ss << L"Texture V check selected "
                << (gModelDetectedFlipTextureV ? L"flipped V" : L"native V")
                << L" (normal score=" << normalAlpha
                << L", flipped score=" << flippedAlpha
@@ -2941,7 +3008,7 @@ static void updateModelTextureVAutoDetection() {
     }
 
     gModelDetectedFlipTextureV = false;
-    gModelTextureVDetectionReason = L"Auto V orientation: " + modelTextureVFormatFallbackReason();
+    gModelTextureVDetectionReason = L"Texture V check: " + modelTextureVFormatFallbackReason();
 }
 
 static void emitModelPreviewTexcoordInRegion(
@@ -3622,12 +3689,10 @@ static void setPerspectiveProjection(double fovDegrees, double aspect, double zN
 }
 
 static void setStoriesViewportClearColor() {
-    const StorylandSkyColor& lower = gStoriesSky.state().lower;
-    if (gOpenGlRenderMode == StorylandOpenGlRenderMode::Stories && gStoriesSky.isEnabled()) {
-        glClearColor(lower.r, lower.g, lower.b, 1.0f);
-    } else {
-        glClearColor(0.115f, 0.120f, 0.128f, 1.0f);
-    }
+    // The visible Stories atmosphere is drawn as a full-screen timecycle gradient.
+    // Keep the framebuffer clear neutral so a failed/disabled sky pass cannot turn
+    // the whole viewport into one flat timecycle colour.
+    glClearColor(0.115f, 0.120f, 0.128f, 1.0f);
 }
 
 static void drawStoriesViewportSky(float radius) {
@@ -3640,6 +3705,77 @@ static void drawOpenGlTextOverlayFallback(HDC dc, const RECT& rc, const std::wst
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, RGB(230, 230, 230));
     TextOutW(dc, rc.left + 8, rc.top + 8, text.c_str(), int(text.size()));
+}
+
+static std::string viewportLabelAscii(const std::wstring& text) {
+    std::string result;
+    result.reserve(text.size());
+    for (wchar_t ch : text) {
+        if (ch >= 0x20 && ch <= 0x7e) result.push_back(char(ch));
+        else if (ch == L'\t') result.push_back(' ');
+        else result.push_back('?');
+    }
+    return result;
+}
+
+static void drawSelectedViewportLabelOpenGl(HDC dc, int width, int height) {
+    const std::wstring wideText = selectedTreeDisplayText();
+    if (wideText.empty() || width <= 0 || height <= 0) return;
+    const std::string text = viewportLabelAscii(wideText);
+    if (text.empty()) return;
+
+    HFONT font = CreateFontW(
+        -16, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, ANSI_CHARSET,
+        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        FIXED_PITCH | FF_DONTCARE, L"Consolas");
+    if (!font) return;
+    HGDIOBJ oldFont = SelectObject(dc, font);
+
+    GLuint listBase = glGenLists(96);
+    if (listBase == 0 || !wglUseFontBitmapsW(dc, 32, 96, listBase)) {
+        if (listBase != 0) glDeleteLists(listBase, 96);
+        SelectObject(dc, oldFont);
+        DeleteObject(font);
+        return;
+    }
+
+    glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_CURRENT_BIT | GL_TRANSFORM_BIT);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_LIGHTING);
+    glDisable(GL_TEXTURE_2D);
+    glDisable(GL_BLEND);
+
+    glMatrixMode(GL_PROJECTION);
+    glPushMatrix();
+    glLoadIdentity();
+    glOrtho(0.0, double(width), 0.0, double(height), -1.0, 1.0);
+    glMatrixMode(GL_MODELVIEW);
+    glPushMatrix();
+    glLoadIdentity();
+
+    const float boxWidth = std::min(float(width - 20), 18.0f + float(text.size()) * 8.5f);
+    glColor4f(0.095f, 0.102f, 0.122f, 1.0f);
+    glBegin(GL_QUADS);
+    glVertex2f(10.0f, float(height) - 38.0f);
+    glVertex2f(10.0f + boxWidth, float(height) - 38.0f);
+    glVertex2f(10.0f + boxWidth, float(height) - 10.0f);
+    glVertex2f(10.0f, float(height) - 10.0f);
+    glEnd();
+
+    glColor3f(0.93f, 0.94f, 0.96f);
+    glRasterPos2f(18.0f, float(height) - 29.0f);
+    glListBase(listBase - 32);
+    glCallLists(GLsizei(text.size()), GL_UNSIGNED_BYTE, text.data());
+
+    glPopMatrix();
+    glMatrixMode(GL_PROJECTION);
+    glPopMatrix();
+    glMatrixMode(GL_MODELVIEW);
+    glPopAttrib();
+
+    glDeleteLists(listBase, 96);
+    SelectObject(dc, oldFont);
+    DeleteObject(font);
 }
 
 
@@ -3974,7 +4110,7 @@ static bool buildDtzTextureNameIndex(std::wstring& summaryOut) {
     for (size_t entryIndex = 0; entryIndex < entries.size(); ++entryIndex) {
         const auto& entry = entries[entryIndex];
         std::wstring resourceName = safeEmbeddedFileName(
-            canonicalDtzImgResourceName(widen(entry.name)), L"resource.bin");
+            canonicalDtzImgResourceName(widenResourceName(entry.name)), L"resource.bin");
         const std::wstring extension = getExtensionLower(resourceName);
         if (!isDtzTextureArchiveExtension(extension)) continue;
 
@@ -4325,7 +4461,7 @@ static void populateDtzList() {
         size_t textureShown = 0;
         for (size_t i = 0; i < dirEntries.size(); ++i) {
             const auto& entry = dirEntries[i];
-            std::wstring entryName = widen(entry.name);
+            std::wstring entryName = widenResourceName(entry.name);
             std::wstring resourceName = safeEmbeddedFileName(canonicalDtzImgResourceName(entryName), L"resource.bin");
             std::wstring ext = getExtensionLower(resourceName);
             if (ext == L".mdl" || ext == L".dff" || ext == L".xtx" || ext == L".chk" || ext == L".tex" || ext == L".txd") {
@@ -4353,7 +4489,7 @@ static void populateDtzList() {
             const auto& entry = dirEntries[i];
             std::wstringstream line;
             uint64_t imgBytes = uint64_t(entry.sectorCount) * 2048ull;
-            line << widen(entry.name)
+            line << widenResourceName(entry.name)
                  << L"  [" << entry.startSector << L"-" << (entry.startSector + entry.sectorCount) << L"]"
                  << L"  +" << entry.sectorCount << L" sectors"
                  << L"  " << ((imgBytes + 1023ull) / 1024ull) << L" KiB";
@@ -4389,7 +4525,7 @@ static void populateDtzList() {
     for (size_t i = 0; i < records.size() && shown < 500; ++i) {
         const auto& r = records[i];
         std::wstringstream line;
-        if (!r.resourceName.empty()) line << widen(r.resourceName) << L"  ";
+        if (!r.resourceName.empty()) line << widenResourceName(r.resourceName) << L"  ";
         else line << L"record " << i << L"  ";
         line << L"start=" << r.startSector
              << L"  count=" << r.sectorCount
@@ -5035,7 +5171,7 @@ static void selectWblPayload(const StorylandTreePayload& payload) {
 
 static void addArchiveEntryTreeItem(HTREEITEM parent, const StorylandArchiveEntry& entry, size_t entryIndex) {
     std::wstringstream line;
-    line << widen(entry.name)
+    line << widenResourceName(entry.name)
          << L" | start=" << entry.startSector
          << L" count=" << entry.sectorCount
          << L" bytes=" << entry.byteSize
@@ -5475,7 +5611,7 @@ static void selectArchiveEntry(int index) {
 
     std::wstringstream ss;
     ss << (gArchiveBrowser.hasLvzContext() ? L"LVZ + IMG entry\r\n\r\n" : L"IMG archive entry\r\n\r\n")
-       << L"Name: " << widen(entry.name) << L"\r\n"
+       << L"Name: " << widenResourceName(entry.name) << L"\r\n"
        << L"Kind: " << ext << L"\r\n"
        << L"Index: " << entry.index << L"\r\n"
        << L"Start sector: " << entry.startSector << L"\r\n"
@@ -5639,7 +5775,7 @@ static void selectArchiveAnimationResource(int listIndex) {
     ss << L"LVZ + IMG animation resource\r\n\r\n";
     if (entryIndex >= 0 && size_t(entryIndex) < gArchiveBrowser.entries().size()) {
         const auto& entry = gArchiveBrowser.entries()[size_t(entryIndex)];
-        ss << L"Name: " << widen(entry.name) << L"\r\n"
+        ss << L"Name: " << widenResourceName(entry.name) << L"\r\n"
            << L"Entry index: " << entry.index << L"\r\n"
            << L"Byte offset: " << entry.byteOffset << L"\r\n"
            << L"Byte size: " << entry.byteSize << L"\r\n";
@@ -8799,7 +8935,7 @@ static bool prepareDtzDirEntryPreview(int index, std::wstring& previewSummary) {
     }
 
     const auto& entry = entries[size_t(index)];
-    std::wstring entryName = widen(entry.name);
+    std::wstring entryName = widenResourceName(entry.name);
     std::wstring resourceName = safeEmbeddedFileName(canonicalDtzImgResourceName(entryName), L"resource.bin");
     std::wstring entryExt = getExtensionLower(resourceName);
     bool previewableTexture = (entryExt == L".xtx" || entryExt == L".chk" || entryExt == L".tex" || entryExt == L".txd");
@@ -8876,7 +9012,7 @@ static bool prepareDtzDirEntryPreview(int index, std::wstring& previewSummary) {
     gAnimPlaying = false;
     gAnimCurrentTime = 0.0f;
 
-    gModelTextureVAuto = true;
+    gModelTextureVAuto = false;
     gModelFlipTextureV = false;
     gModelDetectedFlipTextureV = false;
     if (!gModelFile.loadFromFile(primaryPath, error)) {
@@ -8896,11 +9032,7 @@ static bool prepareDtzDirEntryPreview(int index, std::wstring& previewSummary) {
        << L"Preview source: " << primaryPath << L"\r\n"
        << L"Detected model family: " << widen(gModelFile.modelKindName()) << L"\r\n"
        << L"Texture status: " << textureStatus << L"\r\n"
-       << L"V orientation: " << (gModelTextureVAuto ? L"automatic / " : L"manual / ")
-       << (effectiveModelTextureVFlip() ? L"flipped" : L"normal") << L"\r\n";
-    if (gModelTextureVAuto) {
-        ss << gModelTextureVDetectionReason << L"\r\n";
-    }
+       << L"Flip V coordinate: " << (gModelFlipTextureV ? L"on" : L"off") << L"\r\n";
     if (!extractedCompanionTexturePath.empty()) {
         ss << L"DTZ companion texture: " << extractedCompanionTexturePath << L" (" << companionTextureReason << L")\r\n";
     } else {
@@ -8920,7 +9052,7 @@ static void openDtzDirEntryStandaloneByIndex(int entryIndex, int preferredTextur
     const auto& entries = gDtzArchive.dirEntries();
     if (size_t(entryIndex) >= entries.size()) return;
     const auto& entry = entries[size_t(entryIndex)];
-    std::wstring entryName = widen(entry.name);
+    std::wstring entryName = widenResourceName(entry.name);
     std::wstring resourceName = safeEmbeddedFileName(canonicalDtzImgResourceName(entryName), L"resource.bin");
     std::wstring entryExt = getExtensionLower(resourceName);
     if (!(entryExt == L".mdl" || entryExt == L".dff" || entryExt == L".xtx" || entryExt == L".chk" || entryExt == L".tex" || entryExt == L".txd" || entryExt == L".dtz")) {
@@ -9005,7 +9137,7 @@ static void selectDtzDirEntry(int index) {
 
     std::wstringstream ss;
     ss << L"GAME.DTZ + gta3ps*.img directory entry\r\n\r\n"
-       << L"Name: " << widen(entry.name) << L"\r\n"
+       << L"Name: " << widenResourceName(entry.name) << L"\r\n"
        << L"Internal map index: " << entry.dirIndex << L"\r\n"
        << L"Start sector: " << entry.startSector << L"\r\n"
        << L"Sector count: " << entry.sectorCount << L"\r\n"
@@ -9059,7 +9191,7 @@ static void selectDtzDirEntry(int index) {
         ss << L"\r\nPreview section\r\n\r\n" << previewSummary << L"\r\n";
     }
 
-    std::wstring ext = getDtzImgResourceExtensionLower(widen(entry.name));
+    std::wstring ext = getDtzImgResourceExtensionLower(widenResourceName(entry.name));
     if (ext == L".mdl" || ext == L".dff" || ext == L".xtx" || ext == L".chk" || ext == L".tex" || ext == L".txd") {
         ss << L"\r\nTip: double-click this entry in the tree to open it as a standalone extracted file too.\r\n";
     }
@@ -9083,7 +9215,7 @@ static void selectDtzFindResult(int index) {
     std::wstring previewSummary;
     if (result.dirEntryIndex >= 0 && size_t(result.dirEntryIndex) < gDtzArchive.dirEntries().size()) {
         const auto& entry = gDtzArchive.dirEntries()[size_t(result.dirEntryIndex)];
-        ss << L"Internal IMG entry: " << widen(entry.name) << L"\r\n"
+        ss << L"Internal IMG entry: " << widenResourceName(entry.name) << L"\r\n"
            << L"Start sector: " << entry.startSector << L"\r\n"
            << L"Sector count: " << entry.sectorCount << L"\r\n"
            << L"IMG byte offset: " << entry.byteOffset << L"\r\n";
@@ -9175,7 +9307,7 @@ static void performDtzFind() {
     const auto& entries = gDtzArchive.dirEntries();
     for (size_t entryIndex = 0; entryIndex < entries.size() && gDtzFindResults.size() < kMaxResults; ++entryIndex) {
         const auto& entry = entries[entryIndex];
-        const std::wstring entryName = widen(entry.name);
+        const std::wstring entryName = widenResourceName(entry.name);
         const std::wstring cleanedName = canonicalDtzImgResourceName(entryName);
         if (!containsWideNoCase(entryName, query) && !containsWideNoCase(cleanedName, query)) continue;
         StorylandDtzFindResult result;
@@ -9335,7 +9467,7 @@ static void selectDtzSectorRecord(int index) {
     gSelectedKind = StorylandTreeKind::DtzSectorRecord;
     std::wstringstream ss;
     ss << L"GAME.DTZ + gta3ps*.img directory record\r\n\r\n";
-    if (!r.resourceName.empty()) ss << L"Known target: " << widen(r.resourceName) << L"\r\n";
+    if (!r.resourceName.empty()) ss << L"Known target: " << widenResourceName(r.resourceName) << L"\r\n";
     ss << L"Record offset: " << hexWide(r.recordOffset, 6) << L"\r\n"
        << L"Start field offset: " << hexWide(r.startOffset, 6) << L"\r\n"
        << L"Count field offset: " << hexWide(r.countOffset, 6) << L"\r\n"
@@ -11042,11 +11174,25 @@ static void openStorylandFile(const std::wstring& path) {
     }
 
     if (ext == L".mdl" || ext == L".dff") {
+        // A standalone model opened from File > Open must completely replace any
+        // GAME.DTZ/IMG embedded-resource selection.  Otherwise the details pane
+        // and renderer label can continue to describe the previously selected
+        // resource (for example plr.mdl) after another MDL has been opened.
+        clearDtzEmbeddedPreviewState();
+        gActiveAreaArchive = -1;
+        gSelectedKind = StorylandTreeKind::None;
+        gSelectedIndex = -1;
+        gDtzReturnAvailable = false;
+        gDtzReturnSelectedIndex = -1;
+        gDtzReturnTreeKind = StorylandTreeKind::None;
+        gDtzReturnTreeIndex = -1;
+        setDetails(L"");
+
         gModelAnimLoaded = false;
         gModelAnimPath.clear();
         gModelAnimStatus.clear();
 
-        gModelTextureVAuto = true;
+        gModelTextureVAuto = false;
         gModelFlipTextureV = false;
         gModelDetectedFlipTextureV = false;
         if (!gModelFile.loadFromFile(path, error)) {
@@ -11056,7 +11202,7 @@ static void openStorylandFile(const std::wstring& path) {
         gMode = StorylandMode::ModelFile;
         resetModelViewport();
         populateModelList();
-
+        selectModelField(0);
 
         std::wstring textureStatus;
         loadCompanionTextureForCurrentModel(path, textureStatus);
@@ -11150,7 +11296,7 @@ static void openSelectedArchiveEntry() {
     if (size_t(gSelectedIndex) >= entries.size()) return;
     const auto& entry = entries[size_t(gSelectedIndex)];
 
-    std::wstring displayName = widen(entry.name);
+    std::wstring displayName = widenResourceName(entry.name);
     std::wstring name = safeEmbeddedFileName(displayName, L"resource.bin");
     std::wstring ext = getExtensionLower(name);
     if (ext == L".wrld" || ext == L".area") {
@@ -11358,7 +11504,7 @@ static std::wstring buildExportLogText() {
         }
         ss << L"\r\nDIR sector map\r\n--------------\r\n";
         for (const auto& entry : gDtzArchive.dirEntries()) {
-            ss << widen(entry.name) << L" | index=" << entry.dirIndex
+            ss << widenResourceName(entry.name) << L" | index=" << entry.dirIndex
                << L" start=" << entry.startSector
                << L" count=" << entry.sectorCount
                << L" end=" << (entry.startSector + entry.sectorCount)
@@ -11367,7 +11513,7 @@ static std::wstring buildExportLogText() {
         }
         ss << L"\r\nRaw sector pairs\r\n----------------\r\n";
         for (const auto& r : gDtzArchive.sectorRecords()) {
-            ss << hexWide(r.recordOffset, 6) << L" | " << widen(r.resourceName)
+            ss << hexWide(r.recordOffset, 6) << L" | " << widenResourceName(r.resourceName)
                << L" start=" << r.startSector
                << L" count=" << r.sectorCount
                << L" end=" << (r.startSector + r.sectorCount)
@@ -11425,7 +11571,7 @@ static std::wstring buildExportLogText() {
 
         ss << L"\r\nEntries\r\n-------\r\n";
         for (const auto& entry : gArchiveBrowser.entries()) {
-            ss << widen(entry.name)
+            ss << widenResourceName(entry.name)
                << L" | index=" << entry.index
                << L" start=" << entry.startSector
                << L" count=" << entry.sectorCount
@@ -11836,7 +11982,7 @@ static void exportSelectedResourceBytes() {
         gSelectedKind == StorylandTreeKind::ArchiveEntry && gSelectedIndex >= 0 &&
         size_t(gSelectedIndex) < gArchiveBrowser.entries().size()) {
         const StorylandArchiveEntry& entry = gArchiveBrowser.entries()[size_t(gSelectedIndex)];
-        suggestedName = widen(entry.name);
+        suggestedName = widenResourceName(entry.name);
         if (!gArchiveBrowser.extractEntryBytes(size_t(gSelectedIndex), bytes, error)) {
             MessageBoxW(gMainWindow, widen(error).c_str(), L"Resource export failed", MB_ICONERROR);
             return;
@@ -12130,80 +12276,138 @@ static void runCurrentModelTest() {
     }
 
     std::ostringstream report;
-    report << (renderWareDff ? "DFF TEST\r\n" : "MODEL TEST\r\n");
-    report << (errors ? "RESULT: FAIL" : warnings ? "RESULT: PASS WITH WARNINGS" : "RESULT: PASS") << "\r\n";
-    report << "Errors: " << errors << " | Warnings: " << warnings << "\r\n\r\n";
+    const char* overallStatus = errors ? "FAIL" : warnings ? "PASS WITH WARNINGS" : "PASS";
 
-    report << "Model\r\n";
-    report << "  Container: "
-           << (renderWareDff ? "RenderWare DFF" : leedsMdl ? "Leeds MDL" : "unknown")
-           << "\r\n";
-    report << "  File bytes: " << bytes.size() << "\r\n";
-    report << "  Vertices: " << modelReport.vertices
-           << " | Triangles: " << modelReport.triangles
-           << " | Degenerate: " << modelReport.degenerateTriangles << "\r\n";
-    report << "  Bones/frames: " << modelReport.bones
-           << " | Roots: " << modelReport.rootBones << "\r\n";
-    report << "  Skin influences: " << modelReport.skinInfluences
-           << " | Weighted vertices: " << modelReport.weightedVertices << "\r\n";
-    report << "  Texture references: " << textureReferences
-           << " | Companion archive: " << (gModelTextureLoaded ? "loaded" : "not loaded") << "\r\n\r\n";
+    report << "============================================================\r\n"
+           << "MODEL TEST  |  " << overallStatus << "\r\n"
+           << "============================================================\r\n"
+           << "File       : " << pathLabel << "\r\n"
+           << "Container  : " << (renderWareDff ? "RenderWare DFF" : leedsMdl ? "Leeds MDL" : "Unknown") << "\r\n"
+           << "Size       : " << bytes.size() << " bytes\r\n"
+           << "Errors     : " << errors << "\r\n"
+           << "Warnings   : " << warnings << "\r\n\r\n";
+
+    report << "============================================================\r\n"
+           << "GEOMETRY\r\n"
+           << "============================================================\r\n"
+           << "Vertices          : " << modelReport.vertices << "\r\n"
+           << "Triangles         : " << modelReport.triangles << "\r\n"
+           << "Degenerate        : " << modelReport.degenerateTriangles << "\r\n"
+           << "Bones / frames    : " << modelReport.bones << "\r\n"
+           << "Root bones        : " << modelReport.rootBones << "\r\n"
+           << "Skin influences   : " << modelReport.skinInfluences << "\r\n"
+           << "Weighted vertices : " << modelReport.weightedVertices << "/" << modelReport.vertices << "\r\n\r\n";
+
+    report << "============================================================\r\n"
+           << "TEXTURES\r\n"
+           << "============================================================\r\n"
+           << "References        : " << textureReferences << "\r\n"
+           << "Companion archive : " << (gModelTextureLoaded ? "loaded" : "not loaded") << "\r\n\r\n";
 
     if (renderWareDff) {
-        report << "RenderWare structure\r\n";
-        report << "  Build/version: 0x"
-               << std::hex << std::uppercase << read32(8u) << std::dec << "\r\n";
-        report << "  Graph nodes/chunks: " << rwChunkCount
-               << " | Geometry: " << rwGeometryCount
-               << " | FrameList: " << rwFrameCount
-               << " | HAnim PLG: " << rwHAnimCount
-               << " | Skin PLG: " << rwSkinCount << "\r\n";
-        report << "  Validation path: RenderWare chunk graph + decoded geometry/frame/skin integrity\r\n\r\n";
+        report << "============================================================\r\n"
+               << "RENDERWARE\r\n"
+               << "============================================================\r\n"
+               << "Build / version   : 0x" << std::hex << std::uppercase << read32(8u) << std::dec << "\r\n"
+               << "Chunks             : " << rwChunkCount << "\r\n"
+               << "Geometry chunks    : " << rwGeometryCount << "\r\n"
+               << "FrameList chunks   : " << rwFrameCount << "\r\n"
+               << "HAnim chunks       : " << rwHAnimCount << "\r\n"
+               << "Skin chunks        : " << rwSkinCount << "\r\n\r\n";
     } else {
-        report << "Relocations\r\n";
-        report << "  Declared: " << modelReport.declaredRelocationFields
-               << " | Trailing omitted: " << modelReport.recoveredTrailingRelocations
-               << " | Required missing: " << modelReport.missingRequiredRelocations << "\r\n";
-        report << "  Targets: file-local " << modelReport.fileLocalPointers
-               << " | runtime " << modelReport.runtimePointers
-               << " | suspicious " << modelReport.suspiciousPointers << "\r\n\r\n";
+        report << "============================================================\r\n"
+               << "RELOCATIONS\r\n"
+               << "============================================================\r\n"
+               << "Declared fields    : " << modelReport.declaredRelocationFields << "\r\n"
+               << "Missing required   : " << modelReport.missingRequiredRelocations << "\r\n"
+               << "Trailing recovered : " << modelReport.recoveredTrailingRelocations << "\r\n"
+               << "File-local targets : " << modelReport.fileLocalPointers << "\r\n"
+               << "Runtime targets    : " << modelReport.runtimePointers << "\r\n"
+               << "Suspicious targets : " << modelReport.suspiciousPointers << "\r\n\r\n";
     }
 
     if (ranPs2PacketValidation) {
-        report << "PS2 DMA / VIF / GIF\r\n";
-        report << "  DMA tags: " << dmaReport.dmaTags
-               << " | Chains: " << dmaReport.dmaChains
-               << " | Payload: " << dmaReport.dmaPayloadBytes << " bytes\r\n";
-        report << "  VIF streams: " << dmaReport.vifStreams
-               << " | Commands: " << dmaReport.vifCommands
-               << " | UNPACK: " << dmaReport.vifUnpacks
-               << " | DIRECT/DIRECTHL: " << dmaReport.directTransfers << "\r\n";
-        report << "  GIF tags: " << dmaReport.gifTags
-               << " | Packets: " << dmaReport.gifPackets
-               << " | Payload: " << dmaReport.gifPayloadBytes << " bytes\r\n\r\n";
-    }
-
-    if (ranPspMdlValidation) {
-        report << "PSP Leeds geometry\r\n";
-        report << "  Geometry blocks: " << pspReport.geometryBlocks
-               << " | Mesh streams: " << pspReport.meshStreams
-               << " | Vertex streams: " << pspReport.vertexStreams << "\r\n\r\n";
-    }
-
-    if (!extraErrors.empty() || !extraWarnings.empty()) {
-        report << "Diagnostics\r\n";
-        for (const std::string& message : extraErrors) {
-            report << "  ERROR: " << message << "\r\n";
-        }
-        for (const std::string& message : extraWarnings) {
-            report << "  WARNING: " << message << "\r\n";
+        report << "============================================================\r\n"
+               << "PS2 DMA / VIF / GIF / VU1\r\n"
+               << "============================================================\r\n"
+               << "DMA tags           : " << dmaReport.dmaTags << "\r\n"
+               << "DMA chains         : " << dmaReport.dmaChains << "\r\n"
+               << "DMA payload        : " << dmaReport.dmaPayloadBytes << " bytes\r\n"
+               << "VIF streams        : " << dmaReport.vifStreams << "\r\n"
+               << "VIF commands       : " << dmaReport.vifCommands << "\r\n"
+               << "UNPACK commands    : " << dmaReport.vifUnpacks << "\r\n"
+               << "DIRECT transfers   : " << dmaReport.directTransfers << "\r\n"
+               << "GIF tags           : " << dmaReport.gifTags << "\r\n"
+               << "GIF packets        : " << dmaReport.gifPackets << "\r\n"
+               << "GS register writes : " << dmaReport.gsRegisterWrites << "\r\n"
+               << "GS primitive kicks : " << dmaReport.gsPrimitiveKicks << "\r\n"
+               << "VU1 data qwords    : " << dmaReport.vu1DataQwordsWritten << "\r\n"
+               << "VU1 MPG uploaded   : " << dmaReport.vu1MicroInstructionsUploaded << "\r\n"
+               << "VU1 MSCAL calls    : " << dmaReport.vu1MicroCalls << "\r\n"
+               << "Resident-code calls: " << dmaReport.vu1MicroCallsExternal << "\r\n";
+        if (dmaReport.vifStreams != 0u && dmaReport.directTransfers == 0u && dmaReport.gifTags == 0u && dmaReport.vu1MicroCalls != 0u) {
+            report << "Packet route       : VIF -> resident VU1 microcode (no inline GIF expected)\r\n";
         }
         report << "\r\n";
     }
 
-    report << modelReport.text();
-    if (ranPs2PacketValidation) report << "\r\n" << dmaReport.text();
-    if (ranPspMdlValidation) report << "\r\n" << pspReport.text();
+    if (ranPspMdlValidation) {
+        report << "============================================================\r\n"
+               << "PSP GEOMETRY\r\n"
+               << "============================================================\r\n"
+               << "Geometry blocks    : " << pspReport.geometryBlocks << "\r\n"
+               << "Mesh streams       : " << pspReport.meshStreams << "\r\n"
+               << "Vertex streams     : " << pspReport.vertexStreams << "\r\n\r\n";
+    }
+
+    report << "============================================================\r\n"
+           << "ISSUES\r\n"
+           << "============================================================\r\n";
+    bool wroteIssue = false;
+    for (const StorylandModelIntegrityIssue& issue : modelReport.issues) {
+        report << (issue.severity == StorylandModelIssueSeverity::Fatal ? "ERROR   " : "WARNING ")
+               << "0x" << std::hex << std::uppercase << issue.offset << std::dec
+               << "  " << issue.message << "\r\n";
+        wroteIssue = true;
+    }
+    if (ranPs2PacketValidation) {
+        for (const StorylandDmaIssue& issue : dmaReport.issues) {
+            if (issue.severity == StorylandDmaIssueSeverity::Info) continue;
+            report << (issue.severity == StorylandDmaIssueSeverity::Fatal ? "ERROR   " : "WARNING ")
+                   << "0x" << std::hex << std::uppercase << issue.offset << std::dec
+                   << "  " << issue.message << "\r\n";
+            wroteIssue = true;
+        }
+    }
+    if (ranPspMdlValidation) {
+        for (const StorylandDmaIssue& issue : pspReport.issues) {
+            if (issue.severity == StorylandDmaIssueSeverity::Info) continue;
+            report << (issue.severity == StorylandDmaIssueSeverity::Fatal ? "ERROR   " : "WARNING ")
+                   << "0x" << std::hex << std::uppercase << issue.offset << std::dec
+                   << "  " << issue.message << "\r\n";
+            wroteIssue = true;
+        }
+    }
+    for (const std::string& message : extraErrors) {
+        report << "ERROR        " << message << "\r\n";
+        wroteIssue = true;
+    }
+    for (const std::string& message : extraWarnings) {
+        report << "WARNING      " << message << "\r\n";
+        wroteIssue = true;
+    }
+    if (!wroteIssue) report << "None.\r\n";
+
+    report << "\r\n============================================================\r\n"
+           << "RESULT\r\n"
+           << "============================================================\r\n";
+    if (errors != 0u) {
+        report << "FAIL - structural errors were detected.\r\n";
+    } else if (warnings != 0u) {
+        report << "PASS WITH WARNINGS - validated ranges are safe; review ISSUES.\r\n";
+    } else {
+        report << "PASS - all applicable checks completed without warnings.\r\n";
+    }
 
     setDetails(widen(report.str()));
     if (errors != 0u) {
@@ -13634,11 +13838,11 @@ static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
     }
 
     drawOpenGlViewCube(hwnd, width, height);
+    drawSelectedViewportLabelOpenGl(dc, width, height);
 
     glFlush();
     SwapBuffers(dc);
     drawOpenGlViewCubeLabels(hwnd, dc);
-    drawSelectedViewportLabel(dc, rc);
     wglMakeCurrent(nullptr, nullptr);
 
     std::wstring title = L"OpenGL LVZ+IMG mesh viewport  |  ";
@@ -14069,8 +14273,8 @@ static void drawModelPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
     float largestSpan = std::max(spanX, std::max(spanY, spanZ));
     float modelScale = 2.0f / std::max(0.001f, largestSpan);
 
-    canUseTexture = textureAvailable && !pts.empty();
-    usingProjectedTexcoords = canUseTexture && !hasRealTexcoords;
+    canUseTexture = textureAvailable && !pts.empty() && hasRealTexcoords;
+    usingProjectedTexcoords = false;
 
     glScalef(modelScale, modelScale, modelScale);
     glTranslatef(-centerX, -centerY, -centerZ);
@@ -14456,6 +14660,7 @@ static void drawModelPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
         glVertex2f(0.0f, float(halfH)); glVertex2f(float(width), float(halfH));
         glEnd();
 
+        drawSelectedViewportLabelOpenGl(dc, width, height);
         glFlush();
         SwapBuffers(dc);
         SetBkMode(dc, TRANSPARENT);
@@ -14464,17 +14669,16 @@ static void drawModelPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
         TextOutW(dc, halfW + 10, 8, L"Right", 5);
         TextOutW(dc, 10, halfH + 8, L"Top", 3);
         TextOutW(dc, halfW + 10, halfH + 8, L"Perspective", 11);
-        drawSelectedViewportLabel(dc, rc);
         wglMakeCurrent(nullptr, nullptr);
         return;
     }
 
     drawOpenGlViewCube(hwnd, width, height);
+    drawSelectedViewportLabelOpenGl(dc, width, height);
 
     glFlush();
     SwapBuffers(dc);
     drawOpenGlViewCubeLabels(hwnd, dc);
-    drawSelectedViewportLabel(dc, rc);
     wglMakeCurrent(nullptr, nullptr);
 }
 
@@ -15719,7 +15923,7 @@ static bool collectCurrentAnalyzeResource(
         gSelectedIndex >= 0 &&
         size_t(gSelectedIndex) < gArchiveBrowser.entries().size()) {
         const auto& entry = gArchiveBrowser.entries()[size_t(gSelectedIndex)];
-        displayName = widen(entry.name);
+        displayName = widenResourceName(entry.name);
         return gArchiveBrowser.extractEntryBytes(size_t(gSelectedIndex), bytes, errorMessage);
     }
 
@@ -15728,7 +15932,7 @@ static bool collectCurrentAnalyzeResource(
         gSelectedIndex >= 0 &&
         size_t(gSelectedIndex) < gDtzArchive.dirEntries().size()) {
         const auto& entry = gDtzArchive.dirEntries()[size_t(gSelectedIndex)];
-        displayName = widen(entry.name);
+        displayName = widenResourceName(entry.name);
         return gDtzArchive.extractDirEntryBytes(size_t(gSelectedIndex), bytes, errorMessage);
     }
 
@@ -16535,8 +16739,129 @@ static std::wstring scriptUnquote(std::wstring value) {
     return value;
 }
 
-static void runStorylandScriptEditor() {
-    const std::wstring source = scriptControlText(gScriptEditor);
+static std::wstring storylandScriptTempDirectory() {
+    wchar_t tempPath[MAX_PATH] = {};
+    DWORD length = GetTempPathW(MAX_PATH, tempPath);
+    std::filesystem::path root = length > 0 ? std::filesystem::path(tempPath) : std::filesystem::temp_directory_path();
+    root /= L"StorylandScripts";
+    std::error_code ec;
+    std::filesystem::create_directories(root, ec);
+    return root.wstring();
+}
+
+static std::wstring findExecutableOnPath(const wchar_t* name) {
+    wchar_t found[32768] = {};
+    DWORD length = SearchPathW(nullptr, name, nullptr, DWORD(std::size(found)), found, nullptr);
+    if (length > 0 && length < std::size(found)) return found;
+    return {};
+}
+
+static bool runCapturedProcess(const std::wstring& executable,
+                               const std::vector<std::wstring>& arguments,
+                               const std::wstring& workingDirectory,
+                               DWORD& exitCode,
+                               std::wstring& output,
+                               std::wstring& error) {
+    SECURITY_ATTRIBUTES security{};
+    security.nLength = sizeof(security);
+    security.bInheritHandle = TRUE;
+
+    HANDLE readPipe = nullptr;
+    HANDLE writePipe = nullptr;
+    if (!CreatePipe(&readPipe, &writePipe, &security, 0)) {
+        error = L"Could not create the script output pipe. Win32 error " + std::to_wstring(GetLastError()) + L".";
+        return false;
+    }
+    SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
+
+    std::wstring commandLine = quoteCommandArgument(executable);
+    for (const std::wstring& argument : arguments) {
+        commandLine += L" ";
+        commandLine += quoteCommandArgument(argument);
+    }
+    std::vector<wchar_t> mutableCommand(commandLine.begin(), commandLine.end());
+    mutableCommand.push_back(L'\0');
+
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
+    startup.wShowWindow = SW_HIDE;
+    startup.hStdOutput = writePipe;
+    startup.hStdError = writePipe;
+    startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+
+    PROCESS_INFORMATION process{};
+    BOOL created = CreateProcessW(
+        executable.c_str(), mutableCommand.data(), nullptr, nullptr, TRUE,
+        CREATE_NO_WINDOW, nullptr,
+        workingDirectory.empty() ? nullptr : workingDirectory.c_str(),
+        &startup, &process);
+    CloseHandle(writePipe);
+    writePipe = nullptr;
+    if (!created) {
+        error = L"Could not start " + executable + L". Win32 error " + std::to_wstring(GetLastError()) + L".";
+        CloseHandle(readPipe);
+        return false;
+    }
+
+    std::string bytes;
+    char buffer[4096];
+    for (;;) {
+        DWORD available = 0;
+        if (!PeekNamedPipe(readPipe, nullptr, 0, nullptr, &available, nullptr)) break;
+        if (available > 0) {
+            DWORD read = 0;
+            if (ReadFile(readPipe, buffer, std::min<DWORD>(DWORD(sizeof(buffer)), available), &read, nullptr) && read > 0)
+                bytes.append(buffer, buffer + read);
+        } else {
+            if (WaitForSingleObject(process.hProcess, 15) == WAIT_OBJECT_0) break;
+            Sleep(1);
+        }
+    }
+    for (;;) {
+        DWORD read = 0;
+        if (!ReadFile(readPipe, buffer, DWORD(sizeof(buffer)), &read, nullptr) || read == 0) break;
+        bytes.append(buffer, buffer + read);
+    }
+
+    WaitForSingleObject(process.hProcess, INFINITE);
+    exitCode = 0xFFFFFFFFu;
+    GetExitCodeProcess(process.hProcess, &exitCode);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    CloseHandle(readPipe);
+
+    if (!bytes.empty()) {
+        int chars = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes.data(), int(bytes.size()), nullptr, 0);
+        UINT codePage = CP_UTF8;
+        DWORD flags = MB_ERR_INVALID_CHARS;
+        if (chars <= 0) {
+            codePage = GetOEMCP();
+            flags = 0;
+            chars = MultiByteToWideChar(codePage, flags, bytes.data(), int(bytes.size()), nullptr, 0);
+        }
+        if (chars > 0) {
+            output.resize(size_t(chars));
+            MultiByteToWideChar(codePage, flags, bytes.data(), int(bytes.size()), output.data(), chars);
+        }
+    }
+    return true;
+}
+
+static bool sourceIsStorylandCommandsOnly(const std::wstring& source) {
+    std::wistringstream stream(source);
+    std::wstring line;
+    bool any = false;
+    while (std::getline(stream, line)) {
+        line = trimScriptLine(line);
+        if (line.empty() || line.rfind(L"#", 0) == 0 || line.rfind(L"//", 0) == 0) continue;
+        any = true;
+        if (line.rfind(L"storyland.", 0) != 0) return false;
+    }
+    return any;
+}
+
+static void runStorylandViewportCommands(const std::wstring& source) {
     std::wistringstream stream(source);
     std::wstring line;
     std::wstringstream output;
@@ -16547,90 +16872,121 @@ static void runStorylandScriptEditor() {
         ++lineNumber;
         line = trimScriptLine(line);
         if (line.empty() || line.rfind(L"#", 0) == 0 || line.rfind(L"//", 0) == 0) continue;
-
         std::wstring argument;
         bool handled = false;
-
         if (line == L"storyland.reset()") {
-            resetModelViewport();
-            handled = true;
-            output << L"> reset viewport\r\n";
+            resetModelViewport(); handled = true; output << L"> reset viewport\r\n";
         } else if (scriptExtractCallArgument(line, L"storyland.zoom(", argument)) {
             float scale = 0.0f;
-            if (!scriptParseFloat(argument, scale) || scale <= 0.0f) {
-                output << L"Line " << lineNumber << L": zoom() requires a positive number.\r\n";
-                continue;
-            }
-            applyModelViewportZoom(scale);
-            handled = true;
-            output << L"> zoom " << scale << L"\r\n";
+            if (!scriptParseFloat(argument, scale) || scale <= 0.0f) { output << L"Line " << lineNumber << L": zoom() requires a positive number.\r\n"; continue; }
+            applyModelViewportZoom(scale); handled = true; output << L"> zoom " << scale << L"\r\n";
         } else if (scriptExtractCallArgument(line, L"storyland.pan(", argument)) {
             float x = 0.0f, y = 0.0f;
-            if (!scriptParseTwoFloats(argument, x, y)) {
-                output << L"Line " << lineNumber << L": pan() requires x, y.\r\n";
-                continue;
-            }
-            gModelPanX += x;
-            gModelPanY += y;
-            handled = true;
-            output << L"> pan " << x << L", " << y << L"\r\n";
+            if (!scriptParseTwoFloats(argument, x, y)) { output << L"Line " << lineNumber << L": pan() requires x, y.\r\n"; continue; }
+            gModelPanX += x; gModelPanY += y; handled = true; output << L"> pan " << x << L", " << y << L"\r\n";
         } else if (scriptExtractCallArgument(line, L"storyland.rotate(", argument)) {
             float degrees = 0.0f, x = 0.0f, y = 0.0f, z = 0.0f;
-            if (!scriptParseFourFloats(argument, degrees, x, y, z)) {
-                output << L"Line " << lineNumber << L": rotate() requires degrees, x, y, z.\r\n";
-                continue;
-            }
-            rotateModelViewport(degrees, x, y, z);
-            handled = true;
-            output << L"> rotate " << degrees << L" degrees\r\n";
+            if (!scriptParseFourFloats(argument, degrees, x, y, z)) { output << L"Line " << lineNumber << L": rotate() requires degrees, x, y, z.\r\n"; continue; }
+            rotateModelViewport(degrees, x, y, z); handled = true; output << L"> rotate " << degrees << L" degrees\r\n";
         } else if (scriptExtractCallArgument(line, L"storyland.grid(", argument)) {
             const std::wstring value = trimScriptLine(argument);
             if (value == L"True" || value == L"true" || value == L"1") gOpenGlShowGrid = true;
             else if (value == L"False" || value == L"false" || value == L"0") gOpenGlShowGrid = false;
-            else {
-                output << L"Line " << lineNumber << L": grid() requires True or False.\r\n";
-                continue;
-            }
-            handled = true;
-            output << L"> grid " << (gOpenGlShowGrid ? L"on" : L"off") << L"\r\n";
-        } else if (scriptExtractCallArgument(line, L"storyland.dark(", argument)) {
-            const std::wstring value = trimScriptLine(argument);
-            bool dark = gEyeFriendlyPaneBackground;
-            if (value == L"True" || value == L"true" || value == L"1") dark = true;
-            else if (value == L"False" || value == L"false" || value == L"0") dark = false;
-            else {
-                output << L"Line " << lineNumber << L": dark() requires True or False.\r\n";
-                continue;
-            }
-            if (dark != gEyeFriendlyPaneBackground) {
-                gEyeFriendlyPaneBackground = dark;
-                applyStorylandPaneBackground(gMainWindow);
-                rebuildViewMenu();
-            }
-            handled = true;
-            output << L"> UI " << (dark ? L"dark" : L"light") << L"\r\n";
+            else { output << L"Line " << lineNumber << L": grid() requires True or False.\r\n"; continue; }
+            handled = true; output << L"> grid " << (gOpenGlShowGrid ? L"on" : L"off") << L"\r\n";
         } else if (scriptExtractCallArgument(line, L"storyland.open(", argument)) {
             const std::wstring path = scriptUnquote(argument);
-            if (path.empty()) {
-                output << L"Line " << lineNumber << L": open() requires a quoted path.\r\n";
-                continue;
-            }
-            openStorylandFile(path);
-            handled = true;
-            output << L"> opened " << path << L"\r\n";
+            if (path.empty()) { output << L"Line " << lineNumber << L": open() requires a quoted path.\r\n"; continue; }
+            openStorylandFile(path); handled = true; output << L"> opened " << path << L"\r\n";
         }
-
-        if (!handled) {
-            output << L"Line " << lineNumber << L": unsupported statement: " << line << L"\r\n";
-            continue;
-        }
+        if (!handled) { output << L"Line " << lineNumber << L": unsupported Storyland command: " << line << L"\r\n"; continue; }
         ++executed;
     }
-
-    if (executed == 0 && output.str().empty()) output << L"Nothing to run.\r\n";
-    else output << L"\r\nExecuted " << executed << L" Storyland API statement" << (executed == 1 ? L"." : L"s.") << L"\r\n";
+    output << L"\r\nExecuted " << executed << L" command" << (executed == 1 ? L"." : L"s.") << L"\r\n";
     setScriptOutput(output.str());
-    InvalidateRect(gPreview, nullptr, FALSE);
+    if (gPreview) InvalidateRect(gPreview, nullptr, FALSE);
+}
+
+static void runStorylandScriptEditor() {
+    const std::wstring source = scriptControlText(gScriptEditor);
+    if (trimScriptLine(source).empty()) { setScriptOutput(L"Nothing to run.\r\n"); return; }
+    if (sourceIsStorylandCommandsOnly(source)) { runStorylandViewportCommands(source); return; }
+
+    const bool cFamily = source.find(L"#include") != std::wstring::npos ||
+                         source.find(L"int main(") != std::wstring::npos ||
+                         source.find(L"int main (") != std::wstring::npos;
+    const std::filesystem::path tempRoot(storylandScriptTempDirectory());
+    const std::wstring stamp = std::to_wstring(GetCurrentProcessId()) + L"_" + std::to_wstring(GetTickCount64());
+    std::error_code ec;
+
+    if (!cFamily) {
+        std::wstring python = findExecutableOnPath(L"py.exe");
+        std::vector<std::wstring> args;
+        if (!python.empty()) args.push_back(L"-3");
+        if (python.empty()) python = findExecutableOnPath(L"python.exe");
+        if (python.empty()) {
+            setScriptOutput(L"Python was not found. Install Python or make py.exe/python.exe available on PATH.\r\n");
+            return;
+        }
+        std::filesystem::path scriptPath = tempRoot / (L"script_" + stamp + L".py");
+        {
+            std::ofstream file(scriptPath, std::ios::binary | std::ios::trunc);
+            const std::string utf8 = narrow(source);
+            file.write(utf8.data(), std::streamsize(utf8.size()));
+        }
+        args.push_back(scriptPath.wstring());
+        DWORD exitCode = 0;
+        std::wstring processOutput, processError;
+        if (!runCapturedProcess(python, args, tempRoot.wstring(), exitCode, processOutput, processError)) setScriptOutput(processError + L"\r\n");
+        else {
+            if (processOutput.empty()) processOutput = L"(no output)\r\n";
+            processOutput += L"\r\nPython exit code: " + std::to_wstring(exitCode) + L"\r\n";
+            setScriptOutput(processOutput);
+        }
+        std::filesystem::remove(scriptPath, ec);
+        return;
+    }
+
+    std::wstring compiler = findExecutableOnPath(L"cl.exe");
+    enum class CompilerKind { Msvc, Clang, Gnu } kind = CompilerKind::Msvc;
+    if (compiler.empty()) { compiler = findExecutableOnPath(L"clang++.exe"); kind = CompilerKind::Clang; }
+    if (compiler.empty()) { compiler = findExecutableOnPath(L"g++.exe"); kind = CompilerKind::Gnu; }
+    if (compiler.empty()) {
+        setScriptOutput(L"No C/C++ compiler was found. Start Storyland from a Visual Studio developer environment or put cl.exe, clang++.exe, or g++.exe on PATH.\r\n");
+        return;
+    }
+
+    const std::filesystem::path sourcePath = tempRoot / (L"script_" + stamp + L".cpp");
+    const std::filesystem::path exePath = tempRoot / (L"script_" + stamp + L".exe");
+    {
+        std::ofstream file(sourcePath, std::ios::binary | std::ios::trunc);
+        const std::string utf8 = narrow(source);
+        file.write(utf8.data(), std::streamsize(utf8.size()));
+    }
+    std::vector<std::wstring> compileArgs;
+    if (kind == CompilerKind::Msvc) compileArgs = {L"/nologo", L"/EHsc", L"/std:c++17", sourcePath.wstring(), L"/Fe:" + exePath.wstring()};
+    else compileArgs = {L"-std=c++17", sourcePath.wstring(), L"-o", exePath.wstring()};
+    DWORD compileExit = 0;
+    std::wstring compileOutput, processError;
+    if (!runCapturedProcess(compiler, compileArgs, tempRoot.wstring(), compileExit, compileOutput, processError)) {
+        setScriptOutput(processError + L"\r\n");
+    } else if (compileExit != 0 || !std::filesystem::exists(exePath)) {
+        if (compileOutput.empty()) compileOutput = L"Compilation failed without compiler output.\r\n";
+        setScriptOutput(compileOutput + L"\r\nCompiler exit code: " + std::to_wstring(compileExit) + L"\r\n");
+    } else {
+        DWORD runExit = 0;
+        std::wstring runOutput, runError;
+        if (!runCapturedProcess(exePath.wstring(), {}, tempRoot.wstring(), runExit, runOutput, runError)) setScriptOutput(runError + L"\r\n");
+        else {
+            std::wstring combined;
+            if (!compileOutput.empty()) combined += compileOutput + L"\r\n";
+            combined += runOutput.empty() ? L"(no output)\r\n" : runOutput;
+            combined += L"\r\nProgram exit code: " + std::to_wstring(runExit) + L"\r\n";
+            setScriptOutput(combined);
+        }
+    }
+    std::filesystem::remove(sourcePath, ec);
+    std::filesystem::remove(exePath, ec);
 }
 
 static void loadStorylandScriptFile() {
@@ -16648,7 +17004,7 @@ static void loadStorylandScriptFile() {
 }
 
 static void saveStorylandScriptFile() {
-    const std::wstring path = saveFileDialog(L"Python-style Storyland script\0*.py\0Text files\0*.txt\0All files\0*.*\0", L"py");
+    const std::wstring path = saveFileDialog(L"Script files\0*.py;*.cpp;*.c;*.txt\0Python\0*.py\0C/C++\0*.c;*.cpp\0Text\0*.txt\0All files\0*.*\0", L"py");
     if (path.empty()) return;
     std::wofstream file{std::filesystem::path(path), std::ios::trunc};
     if (!file) {
@@ -16683,7 +17039,7 @@ static LRESULT CALLBACK storylandScriptProc(HWND hwnd, UINT message, WPARAM wPar
         CreateWindowExW(0, L"BUTTON", L"Open", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 72, 7, 62, 25, hwnd, reinterpret_cast<HMENU>(ID_SCRIPT_OPEN), gInstance, nullptr);
         CreateWindowExW(0, L"BUTTON", L"Save", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 140, 7, 62, 25, hwnd, reinterpret_cast<HMENU>(ID_SCRIPT_SAVE), gInstance, nullptr);
         CreateWindowExW(0, L"BUTTON", L"Run Script", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, 214, 7, 86, 25, hwnd, reinterpret_cast<HMENU>(ID_SCRIPT_RUN), gInstance, nullptr);
-        CreateWindowExW(0, L"STATIC", L"Storyland API", WS_CHILD | WS_VISIBLE, 316, 10, 160, 22, hwnd, nullptr, gInstance, nullptr);
+        CreateWindowExW(0, L"STATIC", L"Python / C / C++ / Storyland", WS_CHILD | WS_VISIBLE, 316, 10, 160, 22, hwnd, nullptr, gInstance, nullptr);
 
         const DWORD editStyle = WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | WS_HSCROLL |
             ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_WANTRETURN | ES_NOHIDESEL;
@@ -16707,14 +17063,10 @@ static LRESULT CALLBACK storylandScriptProc(HWND hwnd, UINT message, WPARAM wPar
         SendMessageW(gScriptEditor, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(10, 10));
         SendMessageW(gScriptOutput, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(10, 10));
         SetWindowTextW(gScriptEditor,
-            L"# Storyland scripting workspace\r\n"
-            L"# Ctrl+Enter runs the current script.\r\n"
-            L"storyland.zoom(0.85)\r\n"
-            L"# storyland.pan(0.05, 0.0)\r\n"
-            L"# storyland.rotate(15.0, 0.0, 0.0, 1.0)\r\n"
-            L"# storyland.grid(True)\r\n"
-            L"# storyland.reset()\r\n");
-        setScriptOutput(L"Storyland scripting output\r\nThe editor uses Python-style Storyland API calls and keeps code and output in one workspace.\r\n");
+            L"# Python example\r\n"
+            L"import os\r\n"
+            L"print(os.getcwd())\r\n");
+        setScriptOutput(L"Output\r\nPython, C and C++ source can be run here. Storyland viewport commands are also supported.\r\n");
         layoutStorylandScriptWindow(hwnd);
         return 0;
     }
@@ -16841,26 +17193,19 @@ static void rebuildViewMenu() {
         AppendMenuW(gOpenGlMenu, MF_STRING, ID_VIEW_SHOW_BOUNDS, L"Bounds");
         AppendMenuW(gOpenGlMenu, MF_STRING, ID_VIEW_SHOW_2DFX_LIGHTS, L"2DFX lights");
         AppendMenuW(gOpenGlMenu, MF_STRING, ID_VIEW_SHOW_VIEWCUBE, L"View cube");
+        if (gMode == StorylandMode::ModelFile ||
+            (gMode == StorylandMode::DtzArchive && gDtzEmbeddedPreviewKind == DtzEmbeddedPreviewKind::ModelFile)) {
+            AppendMenuW(gOpenGlMenu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(gOpenGlMenu, MF_STRING, ID_VIEW_FLIP_MODEL_TEXTURE_V, L"Flip V coordinate");
+            CheckMenuItem(gOpenGlMenu, ID_VIEW_FLIP_MODEL_TEXTURE_V,
+                          MF_BYCOMMAND | (gModelFlipTextureV ? MF_CHECKED : MF_UNCHECKED));
+        }
         CheckMenuItem(gOpenGlMenu, ID_VIEW_SHOW_GRID, MF_BYCOMMAND | (gOpenGlShowGrid ? MF_CHECKED : MF_UNCHECKED));
         CheckMenuItem(gOpenGlMenu, ID_VIEW_SHOW_BONES, MF_BYCOMMAND | (gOpenGlShowBones ? MF_CHECKED : MF_UNCHECKED));
         CheckMenuItem(gOpenGlMenu, ID_VIEW_SHOW_BOUNDS, MF_BYCOMMAND | (gOpenGlShowBounds ? MF_CHECKED : MF_UNCHECKED));
         CheckMenuItem(gOpenGlMenu, ID_VIEW_SHOW_2DFX_LIGHTS, MF_BYCOMMAND | (gOpenGlShow2dfxLights ? MF_CHECKED : MF_UNCHECKED));
         CheckMenuItem(gOpenGlMenu, ID_VIEW_SHOW_VIEWCUBE, MF_BYCOMMAND | (gOpenGlShowViewCube ? MF_CHECKED : MF_UNCHECKED));
-        AppendMenuW(gViewMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(gOpenGlMenu), L"Viewport");
-    }
-
-    const bool modelTexturePreviewActive =
-        gMode == StorylandMode::ModelFile ||
-        (gMode == StorylandMode::DtzArchive && gDtzEmbeddedPreviewKind == DtzEmbeddedPreviewKind::ModelFile);
-
-    if (modelTexturePreviewActive) {
-        AppendMenuW(gViewMenu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(gViewMenu, MF_STRING, ID_VIEW_AUTO_MODEL_TEXTURE_V, L"Auto-detect V orientation");
-        CheckMenuItem(gViewMenu, ID_VIEW_AUTO_MODEL_TEXTURE_V,
-                      MF_BYCOMMAND | (gModelTextureVAuto ? MF_CHECKED : MF_UNCHECKED));
-        AppendMenuW(gViewMenu, MF_STRING, ID_VIEW_FLIP_MODEL_TEXTURE_V, L"Flip V coordinate");
-        CheckMenuItem(gViewMenu, ID_VIEW_FLIP_MODEL_TEXTURE_V,
-                      MF_BYCOMMAND | (effectiveModelTextureVFlip() ? MF_CHECKED : MF_UNCHECKED));
+        AppendMenuW(gViewMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(gOpenGlMenu), L"Viewport options");
     }
 
     if (gMode == StorylandMode::TextureArchive) {
@@ -17138,6 +17483,9 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         if (wParam == SIZE_MINIMIZED && gRenderPieWindow && IsWindow(gRenderPieWindow))
             ShowWindow(gRenderPieWindow, SW_HIDE);
         layoutChildren(hwnd);
+        if (wParam != SIZE_MINIMIZED) {
+            RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+        }
         return 0;
 
     case WM_ERASEBKGND: {
@@ -17576,26 +17924,13 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             InvalidateRect(gPreview, nullptr, FALSE);
             break;
         case ID_VIEW_AUTO_MODEL_TEXTURE_V:
-            if (gModelTextureVAuto) {
-                gModelFlipTextureV = gModelDetectedFlipTextureV;
-                gModelTextureVAuto = false;
-                setStatus(L"Model texture V: automatic choice off; current setting kept.");
-            } else {
-                gModelTextureVAuto = true;
-                updateModelTextureVAutoDetection();
-                setStatus(gModelTextureVDetectionReason);
-            }
-            rebuildViewMenu();
-            InvalidateRect(gPreview, nullptr, FALSE);
+            gModelTextureVAuto = false;
             break;
         case ID_VIEW_FLIP_MODEL_TEXTURE_V: {
-            const bool currentFlip = effectiveModelTextureVFlip();
             gModelTextureVAuto = false;
-            gModelFlipTextureV = !currentFlip;
+            gModelFlipTextureV = !gModelFlipTextureV;
             rebuildViewMenu();
-            setStatus(gModelFlipTextureV
-                ? L"Model texture V orientation: manual Flip V coordinate enabled."
-                : L"Model texture V: normal coordinates.");
+            setStatus(gModelFlipTextureV ? L"Flip V coordinate: on." : L"Flip V coordinate: off.");
             InvalidateRect(gPreview, nullptr, FALSE);
             break;
         }
@@ -17684,7 +18019,12 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             InvalidateRect(gPreview, nullptr, FALSE);
             break;
         case ID_VIEW_SKY_DAWN:
-            gStoriesSky.setTime(6.0f);
+            // VCS' strongest dawn transition sits between the 5AM and 6AM
+            // timecycle rows.  Sampling exactly 6AM pushes the preview too far
+            // into the cyan morning row and no longer resembles retail dawn.
+            // Keep LCS at 6AM; use 05:30 for VCS so both warm horizon colour
+            // and the near-horizon sun/moon transition are visible.
+            gStoriesSky.setTime(gStoriesSky.game() == StorylandSkyGame::Vcs ? 5.5f : 6.0f);
             InvalidateRect(gPreview, nullptr, FALSE);
             break;
         case ID_VIEW_SKY_NOON:
@@ -18694,7 +19034,16 @@ static int runStorylandApplication(HINSTANCE hInstance, HINSTANCE, LPWSTR comman
                 continue;
             }
         }
-        if (msg.message == WM_KEYDOWN && handleModelViewportShortcut(msg.wParam)) {
+        const bool typingInScriptEditor = gScriptEditor && (msg.hwnd == gScriptEditor || IsChild(gScriptEditor, msg.hwnd));
+        const bool typingInEditControl = [] (HWND hwnd) {
+            if (!hwnd) return false;
+            wchar_t className[32] = {};
+            GetClassNameW(hwnd, className, int(std::size(className)));
+            return _wcsicmp(className, L"Edit") == 0 || _wcsicmp(className, L"RichEdit20W") == 0 ||
+                   _wcsicmp(className, L"RichEdit50W") == 0;
+        }(msg.hwnd);
+        if (!typingInScriptEditor && !typingInEditControl &&
+            msg.message == WM_KEYDOWN && handleModelViewportShortcut(msg.wParam)) {
             continue;
         }
         TranslateMessage(&msg);

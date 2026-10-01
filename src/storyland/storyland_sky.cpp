@@ -241,31 +241,45 @@ void drawStars(float radius, float intensity) {
 
 void drawCloudBands(float radius, const StorylandSkyState& state) {
     if (state.cloudOpacity <= 0.001f) return;
-    constexpr int SegmentCount = 96;
+
+    constexpr int SegmentCount = 160;
     constexpr int BandCount = 3;
+    const float lowerDegrees[BandCount] = {12.0f, 22.0f, 34.0f};
+    const float upperDegrees[BandCount] = {22.0f, 34.0f, 48.0f};
+
     for (int band = 0; band < BandCount; ++band) {
-        float lowerElevation = (11.0f + float(band) * 8.0f) * Pi / 180.0f;
-        float upperElevation = lowerElevation + 5.0f * Pi / 180.0f;
-        float phase = state.cloudOffset * Pi * 2.0f * (0.55f + float(band) * 0.18f) + float(band) * 1.7f;
+        const float lowerElevation = lowerDegrees[band] * Pi / 180.0f;
+        const float upperElevation = upperDegrees[band] * Pi / 180.0f;
+        const float lowerRingRadius = std::cos(lowerElevation) * radius;
+        const float upperRingRadius = std::cos(upperElevation) * radius;
+        const float lowerZ = std::sin(lowerElevation) * radius;
+        const float upperZ = std::sin(upperElevation) * radius;
+        const float phase = state.cloudOffset * Pi * 2.0f * (0.32f + float(band) * 0.11f) + float(band) * 1.91f;
+
         glBegin(GL_QUAD_STRIP);
         for (int segment = 0; segment <= SegmentCount; ++segment) {
-            float angle = float(segment) / float(SegmentCount) * Pi * 2.0f;
-            float noise = std::sin(angle * 3.0f + phase) * 0.45f +
-                          std::sin(angle * 7.0f - phase * 1.8f) * 0.30f +
-                          std::sin(angle * 13.0f + phase * 0.7f) * 0.25f;
-            float opacity = clampValue((noise + 0.55f) * state.cloudOpacity * 0.42f, 0.0f, 0.72f);
+            const float angle = float(segment) / float(SegmentCount) * Pi * 2.0f;
+            const float shape = 0.54f +
+                0.20f * std::sin(angle * 2.0f + phase) +
+                0.12f * std::sin(angle * 3.0f - phase * 0.63f) +
+                0.07f * std::sin(angle * 5.0f + phase * 0.27f);
+            const float coverage = smoothStep(0.20f, 0.82f, shape);
+            // Never collapse a sunny cloud layer into isolated dots.  The retail
+            // Stories sky reads as broad translucent masses, not sparse particles.
+            const float body = 0.20f + coverage * 0.80f;
+            const float bandStrength = 0.34f + float(band) * 0.07f;
+
             StorylandSkyColor lowerColor = state.cloud;
             StorylandSkyColor upperColor = state.cloud;
-            lowerColor.a = opacity * 0.35f;
-            upperColor.a = opacity;
-            float lowerRingRadius = std::cos(lowerElevation) * radius;
-            float upperRingRadius = std::cos(upperElevation) * radius;
+            lowerColor.a = state.cloudOpacity * body * bandStrength * 0.42f;
+            upperColor.a = state.cloudOpacity * body * bandStrength * 0.66f;
+
+            const float cosine = std::cos(angle);
+            const float sine = std::sin(angle);
             setColor(lowerColor);
-            glVertex3f(std::cos(angle) * lowerRingRadius, std::sin(angle) * lowerRingRadius,
-                       std::sin(lowerElevation) * radius);
+            glVertex3f(cosine * lowerRingRadius, sine * lowerRingRadius, lowerZ);
             setColor(upperColor);
-            glVertex3f(std::cos(angle) * upperRingRadius, std::sin(angle) * upperRingRadius,
-                       std::sin(upperElevation) * radius);
+            glVertex3f(cosine * upperRingRadius, sine * upperRingRadius, upperZ);
         }
         glEnd();
     }
@@ -462,20 +476,29 @@ StorylandSkyState StorylandSky::evaluateVcsTimecycleState() const {
     result.directional = mixColor(first.directional, second.directional, amount);
     result.sunCore = mixColor(first.sunCore, second.sunCore, amount);
     result.sunCorona = mixColor(first.sunCorona, second.sunCorona, amount);
-    result.moon = {0.72f, 0.78f, 1.0f, 0.78f};
+    float moonVisibility = std::max(1.0f - smoothStep(4.5f, 6.5f, currentHour),
+                                    smoothStep(18.5f, 20.5f, currentHour));
+    result.moon = {0.72f, 0.78f, 1.0f, 0.78f * moonVisibility};
     StorylandSkyColor lowCloud = mixColor(first.lowCloud, second.lowCloud, amount);
     StorylandSkyColor topCloud = mixColor(first.topCloud, second.topCloud, amount);
     StorylandSkyColor bottomCloud = mixColor(first.bottomCloud, second.bottomCloud, amount);
-    result.cloud = mixColor(mixColor(lowCloud, topCloud, 0.55f), bottomCloud, 0.25f);
-    result.sunSize = clampValue((first.sunSize + (second.sunSize - first.sunSize) * amount) / 110.0f,
-                                0.025f, 0.16f);
+    StorylandSkyColor timecycleCloud = mixColor(mixColor(lowCloud, topCloud, 0.55f), bottomCloud, 0.25f);
+    // Keep procedural preview clouds in the same atmospheric range as the
+    // timecycle sky.  Raw timecyc cloud RGB can be extremely bright and looked
+    // like opaque white discs/bands in the editor's untextured sky preview.
+    result.cloud = mixColor(timecycleCloud, result.upper, 0.38f);
+    // timecyc SunSz is a game tuning value, not a fraction of the sky dome.
+    // Dividing by 110 made values around 10 produce a billboard almost a third
+    // of the viewport wide.  Keep the editor representation compact.
+    const float rawSunSize = first.sunSize + (second.sunSize - first.sunSize) * amount;
+    result.sunSize = clampValue(rawSunSize / 250.0f, 0.018f, 0.055f);
     result.worldFarClip = std::max(100.0f, first.farClip + (second.farClip - first.farClip) * amount);
     result.worldFogStart = std::max(0.0f, first.fogStart + (second.fogStart - first.fogStart) * amount);
     result.previewFogStart = 4.0f;
     result.previewFarClip = 12.0f;
-    result.cloudOpacity = weather == 0 ? 0.24f : weather == 1 ? 0.72f : weather == 2 ? 0.95f : 0.38f;
-    result.starIntensity = std::max(1.0f - smoothStep(5.0f, 8.0f, currentHour),
-                                    smoothStep(19.0f, 22.0f, currentHour));
+    result.cloudOpacity = weather == 0 ? 0.055f : weather == 1 ? 0.28f : weather == 2 ? 0.46f : 0.16f;
+    result.starIntensity = std::max(1.0f - smoothStep(4.5f, 6.25f, currentHour),
+                                    smoothStep(19.25f, 21.0f, currentHour));
     if (weather == 2) result.starIntensity = 0.0f;
     else if (weather == 3) result.starIntensity *= 0.2f;
     return result;
@@ -660,48 +683,100 @@ void StorylandSky::drawBackground(const StorylandSkyRotation& viewRotation, floa
     glDepthMask(GL_FALSE);
     glShadeModel(GL_SMOOTH);
 
+    // Draw the atmospheric colour bands in screen space.  The old implementation
+    // used a camera-centred sphere and the sphere itself could become visible as
+    // one huge circular object.  A full-screen gradient gives the same timecycle
+    // colour transitions without introducing any sky geometry that can intersect
+    // the camera or appear as a disc.
+    glMatrixMode(GL_PROJECTION);
+    glPushMatrix();
+    glLoadIdentity();
+    glOrtho(-1.0, 1.0, -1.0, 1.0, -1.0, 1.0);
+
     glMatrixMode(GL_MODELVIEW);
+    glPushMatrix();
+    glLoadIdentity();
+
+    struct ScreenBand {
+        float y;
+        StorylandSkyColor color;
+    };
+
+    const std::array<ScreenBand, 9> bands = {{
+        {-1.00f, currentState.lower},
+        {-0.56f, currentState.lower},
+        {-0.30f, mixColor(currentState.lower, currentState.horizon, 0.70f)},
+        {-0.10f, currentState.horizon},
+        { 0.18f, currentState.horizon},
+        { 0.40f, mixColor(currentState.horizon, currentState.upper, 0.55f)},
+        { 0.62f, currentState.upper},
+        { 0.82f, currentState.zenith},
+        { 1.00f, currentState.zenith}
+    }};
+
+    glDisable(GL_BLEND);
+    glBegin(GL_QUAD_STRIP);
+    for (const ScreenBand& band : bands) {
+        setColor(band.color);
+        glVertex2f(-1.0f, band.y);
+        glVertex2f( 1.0f, band.y);
+    }
+    glEnd();
+
+    glPopMatrix();
+    glMatrixMode(GL_PROJECTION);
+    glPopMatrix();
+    glMatrixMode(GL_MODELVIEW);
+
+    // Celestial sprites and stars remain direction-based, but they are drawn over
+    // the screen-space atmosphere rather than on a solid sky sphere.
     glPushMatrix();
     glLoadIdentity();
     multiplyQuaternion(viewRotation);
 
-    std::array<SkyRing, 7> rings = {{
-        {-89.5f, currentState.lower},
-        {-15.0f, currentState.lower},
-        {-2.5f, currentState.horizon},
-        {10.0f, currentState.horizon},
-        {30.0f, currentState.upper},
-        {62.0f, currentState.zenith},
-        {89.5f, currentState.zenith}
-    }};
-    glDisable(GL_BLEND);
-    drawSkyRings(rings, radius);
-
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     drawStars(radius * 0.96f, currentState.starIntensity);
+
+    // Moon glow and core are separate.  The glow gives the Stories sky the soft
+    // horizon "blob" around the moon without bringing back any sky-sphere geometry.
+    StorylandSkyColor moonGlow = currentState.moon;
+    moonGlow.a = clampValue(currentState.moon.a * 0.34f, 0.0f, 1.0f);
+    drawFeatheredDisc(currentState.moonDirectionX, currentState.moonDirectionY,
+                      currentState.moonDirectionZ, radius * 0.92f,
+                      currentState.moonSize * 2.35f, moonGlow,
+                      0.58f, 0.18f);
     drawFeatheredDisc(currentState.moonDirectionX, currentState.moonDirectionY,
                       currentState.moonDirectionZ, radius * 0.92f,
                       currentState.moonSize, currentState.moon,
                       0.82f, 0.75f);
-    drawCloudBands(radius * 0.90f, currentState);
+
+    if (currentGame == StorylandSkyGame::Lcs) {
+        drawCloudBands(radius * 0.90f, currentState);
+    }
+
     glBlendFunc(GL_SRC_ALPHA, GL_ONE);
-
     StorylandSkyColor sunCorona = currentState.sunCorona;
-    sunCorona.a = clampValue(currentState.sunCorona.a, 0.0f, 1.0f);
-
+    sunCorona.a = clampValue(currentState.sunCorona.a, 0.0f, 1.0f) * 0.62f;
     StorylandSkyColor sunCore = currentState.sunCore;
     sunCore.a = clampValue(currentState.sunCore.a, 0.0f, 1.0f);
 
-    drawFeatheredDisc(currentState.sunDirectionX, currentState.sunDirectionY,
-                      currentState.sunDirectionZ, radius * 0.88f,
-                      currentState.sunSize * 1.65f, sunCorona,
-                      0.50f, 0.18f);
+    if (currentGame == StorylandSkyGame::Vcs && currentHour >= 4.5f && currentHour <= 7.0f) {
+        // Retail VCS' dawn rows intentionally carry dark orange core/corona RGB.
+        // With additive blending those values need useful alpha in the preview;
+        // do not replace the RGB with a fabricated white/yellow sun.
+        sunCorona.a = std::max(sunCorona.a, 0.44f);
+        sunCore.a = std::max(sunCore.a, 0.82f);
+    }
 
     drawFeatheredDisc(currentState.sunDirectionX, currentState.sunDirectionY,
                       currentState.sunDirectionZ, radius * 0.88f,
-                      currentState.sunSize * 0.90f, sunCore,
-                      0.72f, 0.30f);
+                      currentState.sunSize * 2.40f, sunCorona,
+                      0.58f, 0.16f);
+    drawFeatheredDisc(currentState.sunDirectionX, currentState.sunDirectionY,
+                      currentState.sunDirectionZ, radius * 0.88f,
+                      currentState.sunSize, sunCore,
+                      0.82f, 0.42f);
 
     glPopMatrix();
     glDepthMask(GL_TRUE);
