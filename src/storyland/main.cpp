@@ -6,6 +6,7 @@
 #include <windowsx.h>
 #include <dwmapi.h>
 #include <mmsystem.h>
+#include <wincodec.h>
 #include <GL/gl.h>
 
 #include <algorithm>
@@ -62,77 +63,38 @@
 
 #pragma comment(lib, "Winmm.lib")
 
-static std::wstring gReignsThemeTempPath;
-static bool gReignsThemeExtractAttempted = false;
-
-static std::wstring storylandMciQuote(const std::wstring& value) {
-    return L"\"" + value + L"\"";
+static void stopStorylandTheme() {
+    // PlaySound uses the process-wide waveform channel. Passing nullptr stops
+    // the currently playing asynchronous resource immediately.
+    PlaySoundW(nullptr, nullptr, 0);
 }
 
-static bool ensureReignsThemeTempFile() {
-    if (gReignsThemeExtractAttempted) {
-        return !gReignsThemeTempPath.empty() && GetFileAttributesW(gReignsThemeTempPath.c_str()) != INVALID_FILE_ATTRIBUTES;
-    }
-    gReignsThemeExtractAttempted = true;
-
+static bool playStorylandTheme(bool /*introSting*/) {
     HMODULE module = GetModuleHandleW(nullptr);
-    HRSRC resource = FindResourceW(module, MAKEINTRESOURCEW(IDR_REIGNS_ERROR_THEME), reinterpret_cast<LPCWSTR>(static_cast<ULONG_PTR>(10)));
-    if (!resource) return false;
-    HGLOBAL loaded = LoadResource(module, resource);
-    const DWORD size = SizeofResource(module, resource);
-    const void* bytes = loaded ? LockResource(loaded) : nullptr;
-    if (!bytes || size == 0) return false;
+    if (!module) return false;
 
-    wchar_t tempDir[MAX_PATH + 1]{};
-    const DWORD tempLen = GetTempPathW(MAX_PATH, tempDir);
-    if (tempLen == 0 || tempLen > MAX_PATH) return false;
-
-    wchar_t tempName[MAX_PATH + 1]{};
-    if (!GetTempFileNameW(tempDir, L"SLR", 0, tempName)) return false;
-    std::filesystem::path path(tempName);
-    path.replace_extension(L".mp3");
-    DeleteFileW(tempName);
-
-    std::ofstream file(path, std::ios::binary | std::ios::trunc);
-    if (!file) return false;
-    file.write(static_cast<const char*>(bytes), static_cast<std::streamsize>(size));
-    if (!file) return false;
-    file.close();
-
-    gReignsThemeTempPath = path.wstring();
-    return true;
-}
-
-static void stopStorylandThemeAlias(const wchar_t* alias) {
-    std::wstring stop = std::wstring(L"stop ") + alias;
-    mciSendStringW(stop.c_str(), nullptr, 0, nullptr);
-    std::wstring close = std::wstring(L"close ") + alias;
-    mciSendStringW(close.c_str(), nullptr, 0, nullptr);
-}
-
-static void playStorylandTheme(bool introSting) {
-    if (!ensureReignsThemeTempFile()) return;
-    const wchar_t* alias = introSting ? L"storyland_intro_sting" : L"storyland_error_theme";
-    stopStorylandThemeAlias(alias);
-
-    const std::wstring open = L"open " + storylandMciQuote(gReignsThemeTempPath) + L" type mpegvideo alias " + alias;
-    if (mciSendStringW(open.c_str(), nullptr, 0, nullptr) != 0) return;
-    mciSendStringW((std::wstring(L"set ") + alias + L" time format milliseconds").c_str(), nullptr, 0, nullptr);
-    const std::wstring play = introSting
-        ? (std::wstring(L"play ") + alias + L" from 0 to 4000")
-        : (std::wstring(L"play ") + alias + L" from 0");
-    mciSendStringW(play.c_str(), nullptr, 0, nullptr);
+    // The theme is embedded as a real WAVE resource.  This deliberately avoids
+    // MCI/Media Player codec registration: PlaySound sends the PCM WAVE resource
+    // directly through winmm, so the intro/error music works on a clean Windows
+    // install without extracting a temporary MP3 or depending on an MPEG MCI
+    // driver.
+    return PlaySoundW(
+        MAKEINTRESOURCEW(IDR_REIGNS_ERROR_THEME),
+        module,
+        SND_RESOURCE | SND_ASYNC | SND_NODEFAULT
+    ) != FALSE;
 }
 
 static int storylandMessageBoxW(HWND owner, LPCWSTR text, LPCWSTR caption, UINT type) {
     if ((type & MB_ICONERROR) == MB_ICONERROR) {
+        // Restart the full theme from the beginning for every error. PlaySound
+        // automatically replaces any currently playing intro/error instance.
         playStorylandTheme(false);
     }
     return ::MessageBoxW(owner, text, caption, type);
 }
 
 #define MessageBoxW storylandMessageBoxW
-
 
 #ifndef GL_VERTEX_SHADER
 #define GL_VERTEX_SHADER 0x8B31
@@ -17676,6 +17638,220 @@ static int gSplashTick = 0;
 static int gSplashCell = 16;
 static bool gSplashSkipRequested = false;
 static uint32_t gSplashQuoteSeed = 0u;
+static ULONGLONG gSplashVisibleStartedAt = 0;
+
+struct StorylandSplashMemeFrame {
+    HBITMAP bitmap = nullptr;
+    int width = 0;
+    int height = 0;
+    UINT durationMs = 100;
+};
+
+static std::vector<StorylandSplashMemeFrame> gSplashMemeFrames;
+
+static void clearSplashMemeFrames() {
+    for (StorylandSplashMemeFrame& frame : gSplashMemeFrames) {
+        if (frame.bitmap) {
+            DeleteObject(frame.bitmap);
+            frame.bitmap = nullptr;
+        }
+    }
+    gSplashMemeFrames.clear();
+}
+
+static UINT splashGifFrameDelayMs(IWICBitmapFrameDecode* frame) {
+    if (!frame) return 100u;
+    IWICMetadataQueryReader* metadata = nullptr;
+    if (FAILED(frame->GetMetadataQueryReader(&metadata)) || !metadata) return 100u;
+
+    PROPVARIANT value{};
+    PropVariantInit(&value);
+    UINT delayMs = 100u;
+    if (SUCCEEDED(metadata->GetMetadataByName(L"/grctlext/Delay", &value))) {
+        unsigned long delayCentiseconds = 0;
+        if (value.vt == VT_UI2) delayCentiseconds = value.uiVal;
+        else if (value.vt == VT_UI4) delayCentiseconds = value.ulVal;
+        if (delayCentiseconds > 0) delayMs = UINT(delayCentiseconds * 10u);
+    }
+    PropVariantClear(&value);
+    metadata->Release();
+    return std::clamp(delayMs, 40u, 250u);
+}
+
+static bool loadSplashMemeGif() {
+    clearSplashMemeFrames();
+
+    HMODULE module = GetModuleHandleW(nullptr);
+    HRSRC resource = module ? FindResourceW(
+        module,
+        MAKEINTRESOURCEW(IDR_REIGNS_SPLASH_MEME_GIF),
+        reinterpret_cast<LPCWSTR>(static_cast<ULONG_PTR>(10))) : nullptr;
+    if (!resource) return false;
+
+    HGLOBAL loaded = LoadResource(module, resource);
+    const BYTE* bytes = loaded ? static_cast<const BYTE*>(LockResource(loaded)) : nullptr;
+    const DWORD byteCount = loaded ? SizeofResource(module, resource) : 0u;
+    if (!bytes || byteCount == 0u) return false;
+
+    IWICImagingFactory* factory = nullptr;
+    IWICStream* stream = nullptr;
+    IWICBitmapDecoder* decoder = nullptr;
+    HRESULT hr = CoCreateInstance(
+        CLSID_WICImagingFactory,
+        nullptr,
+        CLSCTX_INPROC_SERVER,
+        IID_PPV_ARGS(&factory));
+    if (SUCCEEDED(hr)) hr = factory->CreateStream(&stream);
+    if (SUCCEEDED(hr)) {
+        hr = stream->InitializeFromMemory(
+            const_cast<BYTE*>(bytes),
+            byteCount);
+    }
+    if (SUCCEEDED(hr)) {
+        hr = factory->CreateDecoderFromStream(
+            stream,
+            nullptr,
+            WICDecodeMetadataCacheOnLoad,
+            &decoder);
+    }
+
+    UINT frameCount = 0u;
+    if (SUCCEEDED(hr)) hr = decoder->GetFrameCount(&frameCount);
+    if (SUCCEEDED(hr)) {
+        gSplashMemeFrames.reserve(frameCount);
+        for (UINT frameIndex = 0u; frameIndex < frameCount; ++frameIndex) {
+            IWICBitmapFrameDecode* frame = nullptr;
+            IWICFormatConverter* converter = nullptr;
+            UINT width = 0u;
+            UINT height = 0u;
+
+            hr = decoder->GetFrame(frameIndex, &frame);
+            if (SUCCEEDED(hr)) hr = frame->GetSize(&width, &height);
+            if (SUCCEEDED(hr)) hr = factory->CreateFormatConverter(&converter);
+            if (SUCCEEDED(hr)) {
+                hr = converter->Initialize(
+                    frame,
+                    GUID_WICPixelFormat32bppBGRA,
+                    WICBitmapDitherTypeNone,
+                    nullptr,
+                    0.0,
+                    WICBitmapPaletteTypeCustom);
+            }
+
+            HBITMAP bitmap = nullptr;
+            void* pixels = nullptr;
+            if (SUCCEEDED(hr) && width > 0u && height > 0u) {
+                BITMAPINFO info{};
+                info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                info.bmiHeader.biWidth = LONG(width);
+                info.bmiHeader.biHeight = -LONG(height);
+                info.bmiHeader.biPlanes = 1;
+                info.bmiHeader.biBitCount = 32;
+                info.bmiHeader.biCompression = BI_RGB;
+                bitmap = CreateDIBSection(
+                    nullptr,
+                    &info,
+                    DIB_RGB_COLORS,
+                    &pixels,
+                    nullptr,
+                    0);
+                if (bitmap && pixels) {
+                    const UINT stride = width * 4u;
+                    const UINT imageBytes = stride * height;
+                    hr = converter->CopyPixels(
+                        nullptr,
+                        stride,
+                        imageBytes,
+                        static_cast<BYTE*>(pixels));
+                } else {
+                    hr = E_OUTOFMEMORY;
+                }
+            }
+
+            if (SUCCEEDED(hr) && bitmap) {
+                StorylandSplashMemeFrame out{};
+                out.bitmap = bitmap;
+                out.width = int(width);
+                out.height = int(height);
+                out.durationMs = splashGifFrameDelayMs(frame);
+                gSplashMemeFrames.push_back(out);
+            } else if (bitmap) {
+                DeleteObject(bitmap);
+            }
+
+            if (converter) converter->Release();
+            if (frame) frame->Release();
+            if (FAILED(hr)) break;
+        }
+    }
+
+    if (decoder) decoder->Release();
+    if (stream) stream->Release();
+    if (factory) factory->Release();
+
+    if (FAILED(hr) || gSplashMemeFrames.empty()) {
+        clearSplashMemeFrames();
+        return false;
+    }
+    return true;
+}
+
+static void drawSplashMeme(HDC dc, const RECT& client) {
+    if (!dc || gSplashMemeFrames.empty() || gSplashVisibleStartedAt == 0u) return;
+
+    const ULONGLONG elapsed = GetTickCount64() - gSplashVisibleStartedAt;
+    // Easter egg: flash the licking portion of the supplied GIF during the
+    // final second of the 5.5-second Reigns Studios intro.
+    constexpr ULONGLONG showFromMs = 4350u;
+    constexpr ULONGLONG showUntilMs = 5350u;
+    if (elapsed < showFromMs || elapsed >= showUntilMs) return;
+
+    const size_t firstFrame = std::min<size_t>(13u, gSplashMemeFrames.size() - 1u);
+    const size_t available = gSplashMemeFrames.size() - firstFrame;
+    if (available == 0u) return;
+
+    ULONGLONG localMs = elapsed - showFromMs;
+    size_t frameIndex = firstFrame;
+    for (size_t i = 0u; i < available; ++i) {
+        const UINT duration = std::max(40u, gSplashMemeFrames[firstFrame + i].durationMs);
+        if (localMs < duration) {
+            frameIndex = firstFrame + i;
+            break;
+        }
+        localMs -= duration;
+        frameIndex = firstFrame + ((i + 1u) % available);
+    }
+
+    const StorylandSplashMemeFrame& frame = gSplashMemeFrames[frameIndex];
+    if (!frame.bitmap || frame.width <= 0 || frame.height <= 0) return;
+
+    const int targetWidth = std::max(1, frame.width * 3 / 2);
+    const int targetHeight = std::max(1, frame.height * 3 / 2);
+    const int x = client.left + (client.right - client.left - targetWidth) / 2;
+    const int y = client.top + (client.bottom - client.top - targetHeight) / 2 + 34;
+
+    HDC source = CreateCompatibleDC(dc);
+    if (!source) return;
+    HGDIOBJ old = SelectObject(source, frame.bitmap);
+    const int oldMode = SetStretchBltMode(dc, HALFTONE);
+    SetBrushOrgEx(dc, 0, 0, nullptr);
+    StretchBlt(
+        dc,
+        x,
+        y,
+        targetWidth,
+        targetHeight,
+        source,
+        0,
+        0,
+        frame.width,
+        frame.height,
+        SRCCOPY);
+    SetStretchBltMode(dc, oldMode);
+    SelectObject(source, old);
+    DeleteDC(source);
+}
+
 
 static const wchar_t* gSplashRainQuotes[] = {
     // Vice City Stories — deliberately the largest share.
@@ -18048,6 +18224,8 @@ static LRESULT CALLBACK storylandSplashProc(HWND hwnd, UINT message, WPARAM wPar
     if (message == WM_CREATE) {
         gSplashTick = 0;
         gSplashSkipRequested = false;
+        gSplashVisibleStartedAt = 0u;
+        loadSplashMemeGif();
 
         LARGE_INTEGER performanceCounter{};
         QueryPerformanceCounter(&performanceCounter);
@@ -18117,6 +18295,7 @@ static LRESULT CALLBACK storylandSplashProc(HWND hwnd, UINT message, WPARAM wPar
         DeleteObject(background);
 
         drawSplashMatrixRain(memoryDc, client);
+        drawSplashMeme(memoryDc, client);
         drawReignsStudiosLogo(memoryDc, client);
 
         HPEN border = CreatePen(PS_SOLID, 2,
@@ -18137,6 +18316,8 @@ static LRESULT CALLBACK storylandSplashProc(HWND hwnd, UINT message, WPARAM wPar
     }
     if (message == WM_DESTROY) {
         KillTimer(hwnd, 1);
+        clearSplashMemeFrames();
+        gSplashVisibleStartedAt = 0u;
         return 0;
     }
     return DefWindowProcW(hwnd, message, wParam, lParam);
@@ -18192,16 +18373,17 @@ static HWND createStorylandSplash(HINSTANCE instance, ULONGLONG& startedAt) {
     }
     SetLayeredWindowAttributes(splash, 0, 255, LWA_ALPHA);
     startedAt = GetTickCount64();
+    gSplashVisibleStartedAt = startedAt;
     return splash;
 }
 
 static void finishStorylandSplash(HWND splash, ULONGLONG startedAt) {
     if (!splash) return;
-    while (!gSplashSkipRequested && GetTickCount64() - startedAt < 4000u) {
+    while (!gSplashSkipRequested && GetTickCount64() - startedAt < 5500u) {
         pumpSplashMessages(splash);
         Sleep(10);
     }
-    stopStorylandThemeAlias(L"storyland_intro_sting");
+    stopStorylandTheme();
     for (int alpha = 255; alpha >= 0; alpha -= 17) {
         SetLayeredWindowAttributes(splash, 0, BYTE(alpha), LWA_ALPHA);
         pumpSplashMessages(splash);
@@ -18309,9 +18491,8 @@ static int runStorylandApplication(HINSTANCE hInstance, HINSTANCE, LPWSTR comman
         DispatchMessageW(&msg);
     }
 
-    stopStorylandThemeAlias(L"storyland_intro_sting");
-    stopStorylandThemeAlias(L"storyland_error_theme");
-    if (!gReignsThemeTempPath.empty()) DeleteFileW(gReignsThemeTempPath.c_str());
+    stopStorylandTheme();
+    stopStorylandTheme();
     CoUninitialize();
     return int(msg.wParam);
 }
