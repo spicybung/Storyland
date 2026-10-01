@@ -1,8 +1,17 @@
 {
   "name": "storyland",
-  "version-string": "1.0.3",
+  "version-string": "1.1.5.2",
   "description": "Portable LCS/VCS Leeds-engine resource workbench",
   "dependencies": [
-    "zlib"
+    "zlib",
+    {
+      "name": "ffmpeg",
+      "default-features": false,
+      "features": [
+        "avcodec",
+        "avformat",
+        "swscale"
+      ]
+    }
   ]
 }

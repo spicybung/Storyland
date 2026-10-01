@@ -76,7 +76,7 @@ static bool ensureReignsThemeTempFile() {
     gReignsThemeExtractAttempted = true;
 
     HMODULE module = GetModuleHandleW(nullptr);
-    HRSRC resource = FindResourceW(module, MAKEINTRESOURCEW(IDR_REIGNS_ERROR_THEME), MAKEINTRESOURCEW(10));
+    HRSRC resource = FindResourceW(module, MAKEINTRESOURCEW(IDR_REIGNS_ERROR_THEME), reinterpret_cast<LPCWSTR>(static_cast<ULONG_PTR>(10)));
     if (!resource) return false;
     HGLOBAL loaded = LoadResource(module, resource);
     const DWORD size = SizeofResource(module, resource);
@@ -18214,7 +18214,7 @@ static void loadEmbeddedVcsTimecycle() {
     HRSRC resource = FindResourceW(
         gInstance,
         MAKEINTRESOURCEW(IDR_VCS_TIMECYC),
-        MAKEINTRESOURCEW(10) // RT_RCDATA, explicitly wide for FindResourceW
+        reinterpret_cast<LPCWSTR>(static_cast<ULONG_PTR>(10)) // RT_RCDATA = integer resource type 10
     );
     if (!resource) {
         gStoriesSkyDataStatus = "Embedded VCS timecycle resource was not found; using fallback colours.";

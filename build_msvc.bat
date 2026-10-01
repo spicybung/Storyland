@@ -54,7 +54,7 @@ echo.
 echo ============================================================
 echo Building Storyland
 echo ============================================================
-cmake --build "%BUILD_DIR%" --config Release --clean-first
+cmake --build "%BUILD_DIR%" --config Release
 if errorlevel 1 goto build_failed
 
 if not exist "%STORYLAND_EXE%" goto missing_exe
