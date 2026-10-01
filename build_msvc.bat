@@ -42,20 +42,12 @@ if not defined VCPKG_EXE goto vcpkg_missing
 
 echo.
 echo ============================================================
-echo Installing/verifying Storyland dependencies
+echo Configuring Storyland and verifying dependencies
 echo ============================================================
-echo The first build now includes FFmpeg for native PMF/PSS decoding.
-echo vcpkg may need several minutes the first time it builds FFmpeg.
-echo Its output is intentionally shown live so the build never appears frozen.
+echo vcpkg manifest installation runs once through CMake.
+echo FFmpeg and zlib output is shown live during configure.
 echo.
-"%VCPKG_EXE%" install --triplet x64-windows-static
-if errorlevel 1 goto dependencies_failed
-
-echo.
-echo ============================================================
-echo Configuring Storyland
-echo ============================================================
-cmake --fresh -S . -B "%BUILD_DIR%" -A x64 "-DCMAKE_TOOLCHAIN_FILE=%VCPKG_TOOLCHAIN%" -DVCPKG_TARGET_TRIPLET=x64-windows-static
+cmake --fresh -S . -B "%BUILD_DIR%" -A x64 "-DCMAKE_TOOLCHAIN_FILE=%VCPKG_TOOLCHAIN%" -DVCPKG_TARGET_TRIPLET=x64-windows-static -DVCPKG_MANIFEST_INSTALL=ON
 if errorlevel 1 goto configure_failed
 
 echo.

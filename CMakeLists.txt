@@ -2,26 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 if(POLICY CMP0091)
     cmake_policy(SET CMP0091 NEW)
 endif()
-if(WIN32)
-    project(Storyland VERSION 1.1.5.2 LANGUAGES CXX RC)
-else()
-    project(Storyland VERSION 1.1.5.2 LANGUAGES CXX)
-endif()
-
-if(UNIX AND NOT APPLE)
-    set(CMAKE_CXX_STANDARD 17)
-    set(CMAKE_CXX_STANDARD_REQUIRED ON)
-    find_package(ZLIB REQUIRED)
-    add_executable(StorylandLinux
-        src/storyland_linux.cpp
-        src/storyland_dtz.cpp
-        src/storyland_archive.cpp
-        src/storyland_dma_validator.cpp
-    )
-    target_include_directories(StorylandLinux PRIVATE src)
-    target_link_libraries(StorylandLinux PRIVATE ZLIB::ZLIB)
-    return()
-endif()
+project(Storyland VERSION 1.1.5.2 LANGUAGES CXX RC)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -54,16 +35,43 @@ find_path(STORYLAND_FFMPEG_INCLUDE_DIR
     NAMES libavcodec/avcodec.h
     REQUIRED
 )
-find_library(STORYLAND_AVCODEC_LIBRARY NAMES avcodec REQUIRED)
-find_library(STORYLAND_AVFORMAT_LIBRARY NAMES avformat REQUIRED)
-find_library(STORYLAND_AVUTIL_LIBRARY NAMES avutil REQUIRED)
-find_library(STORYLAND_SWSCALE_LIBRARY NAMES swscale REQUIRED)
+# Visual Studio is a multi-config generator.  A plain find_library() can pick a
+# debug vcpkg FFmpeg archive during configure and then feed it into a Release
+# link, which pulls LIBCMTD into an otherwise Release executable.  Resolve the
+# release/debug libraries from the same vcpkg triplet root as the headers and
+# select them per configuration.
+get_filename_component(STORYLAND_VCPKG_TRIPLET_ROOT "${STORYLAND_FFMPEG_INCLUDE_DIR}" DIRECTORY)
+
+function(storyland_find_ffmpeg_library out_release out_debug basename)
+    find_library(${out_release}
+        NAMES ${basename}
+        PATHS "${STORYLAND_VCPKG_TRIPLET_ROOT}/lib"
+        NO_DEFAULT_PATH
+        REQUIRED
+    )
+    find_library(${out_debug}
+        NAMES ${basename}
+        PATHS "${STORYLAND_VCPKG_TRIPLET_ROOT}/debug/lib"
+        NO_DEFAULT_PATH
+    )
+    if(NOT ${out_debug})
+        set(${out_debug} "${${out_release}}" PARENT_SCOPE)
+    else()
+        set(${out_debug} "${${out_debug}}" PARENT_SCOPE)
+    endif()
+    set(${out_release} "${${out_release}}" PARENT_SCOPE)
+endfunction()
+
+storyland_find_ffmpeg_library(STORYLAND_AVCODEC_RELEASE STORYLAND_AVCODEC_DEBUG avcodec)
+storyland_find_ffmpeg_library(STORYLAND_AVFORMAT_RELEASE STORYLAND_AVFORMAT_DEBUG avformat)
+storyland_find_ffmpeg_library(STORYLAND_AVUTIL_RELEASE STORYLAND_AVUTIL_DEBUG avutil)
+storyland_find_ffmpeg_library(STORYLAND_SWSCALE_RELEASE STORYLAND_SWSCALE_DEBUG swscale)
 
 set(STORYLAND_FFMPEG_LIBRARIES
-    ${STORYLAND_AVFORMAT_LIBRARY}
-    ${STORYLAND_AVCODEC_LIBRARY}
-    ${STORYLAND_SWSCALE_LIBRARY}
-    ${STORYLAND_AVUTIL_LIBRARY}
+    optimized ${STORYLAND_AVFORMAT_RELEASE} debug ${STORYLAND_AVFORMAT_DEBUG}
+    optimized ${STORYLAND_AVCODEC_RELEASE} debug ${STORYLAND_AVCODEC_DEBUG}
+    optimized ${STORYLAND_SWSCALE_RELEASE} debug ${STORYLAND_SWSCALE_DEBUG}
+    optimized ${STORYLAND_AVUTIL_RELEASE} debug ${STORYLAND_AVUTIL_DEBUG}
 )
 
 if(WIN32 AND DEFINED ZLIB_LIBRARY_RELEASE)
@@ -76,7 +84,7 @@ if(WIN32 AND DEFINED ZLIB_LIBRARY_RELEASE)
     endif()
 endif()
 
-set(STORYLAND_RESOURCE_FILE "${CMAKE_CURRENT_SOURCE_DIR}/src/Storyland.rc")
+set(STORYLAND_RESOURCE_FILE "${CMAKE_CURRENT_SOURCE_DIR}/src/platform/windows/Storyland.rc")
 set_source_files_properties(
     "${STORYLAND_RESOURCE_FILE}"
     PROPERTIES
@@ -85,38 +93,55 @@ set_source_files_properties(
 )
 
 add_executable(Storyland WIN32
-    src/main.cpp
-    src/leeds_texture.cpp
-    src/wic_image.cpp
-    src/storyland_dtz.cpp
-    src/storyland_model.cpp
-    src/storyland_analysis_graph.cpp
-    src/storyland_analysis_graph.h
-    src/storyland_opengl_renderer.cpp
-    src/storyland_opengl_renderer.h
-    src/storyland_shaders.cpp
-    src/storyland_shaders.h
-    src/storyland_archive.cpp
-    src/storyland_anim.cpp
-    src/storyland_wbl.cpp
-    src/storyland_sky.cpp
-    src/storyland_scm.cpp
-    src/storyland_scm.h
-    src/storyland_atomic_io.h
-    src/storyland_dma_validator.cpp
-    src/storyland_dma_validator.h
-    src/storyland_psp_validator.cpp
-    src/storyland_psp_validator.h
-    src/storyland_model_validator.cpp
-    src/storyland_model_validator.h
-    src/storyland_media.cpp
-    src/storyland_media.h
-    src/storyland_scripting.cpp
-    src/storyland_scripting.h
+    src/storyland/main.cpp
+    src/storyland/storyland_analysis_graph.cpp
+    src/storyland/storyland_analysis_graph.h
+    src/storyland/storyland_opengl_renderer.cpp
+    src/storyland/storyland_opengl_renderer.h
+    src/shaders/storyland_shaders.cpp
+    src/shaders/storyland_shaders.h
+    src/storyland/storyland_sky.cpp
+    src/storyland/storyland_sky.h
+    src/storyland/storyland_scm.cpp
+    src/storyland/storyland_scm.h
+    src/storyland/storyland_media.cpp
+    src/storyland/storyland_media.h
+    src/storyland/storyland_atomic_io.h
+
+    src/leeds/leeds_texture.cpp
+    src/leeds/leeds_texture.h
+    src/leeds/storyland_archive.cpp
+    src/leeds/storyland_archive.h
+    src/leeds/storyland_dtz.cpp
+    src/leeds/storyland_dtz.h
+    src/leeds/storyland_model.cpp
+    src/leeds/storyland_model.h
+    src/leeds/storyland_anim.cpp
+    src/leeds/storyland_anim.h
+    src/leeds/storyland_wbl.cpp
+    src/leeds/storyland_wbl.h
+
+    src/validation/storyland_dma_validator.cpp
+    src/validation/storyland_dma_validator.h
+    src/validation/storyland_psp_validator.cpp
+    src/validation/storyland_psp_validator.h
+    src/validation/storyland_model_validator.cpp
+    src/validation/storyland_model_validator.h
+
+    src/platform/windows/wic_image.cpp
+    src/platform/windows/wic_image.h
+    src/platform/windows/resource.h
     "${STORYLAND_RESOURCE_FILE}"
 )
 
-target_include_directories(Storyland PRIVATE src ${STORYLAND_FFMPEG_INCLUDE_DIR})
+target_include_directories(Storyland PRIVATE
+    src/storyland
+    src/shaders
+    src/leeds
+    src/validation
+    src/platform/windows
+    ${STORYLAND_FFMPEG_INCLUDE_DIR}
+)
 target_link_libraries(Storyland PRIVATE
     ZLIB::ZLIB
     ${STORYLAND_FFMPEG_LIBRARIES}
@@ -145,7 +170,7 @@ target_link_libraries(Storyland PRIVATE
 
 
 add_custom_command(TARGET Storyland POST_BUILD
-    # Storyland GLSL is compiled directly from src/storyland_shaders.cpp.
+    # Storyland GLSL is compiled directly from src/shaders/storyland_shaders.cpp.
     COMMAND ${CMAKE_COMMAND} -E rm -f
         "$<TARGET_FILE_DIR:Storyland>/timecyc.dat"
         "$<TARGET_FILE_DIR:Storyland>/zlib1.dll"

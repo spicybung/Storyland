@@ -1,0 +1,3469 @@
+#include "storyland_dtz.h"
+#include "storyland_atomic_io.h"
+
+#include <algorithm>
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
+#include <cmath>
+#include <cstddef>
+#include <cwctype>
+#include <cwchar>
+#include <fstream>
+#include <filesystem>
+#include <iomanip>
+#include <initializer_list>
+#include <utility>
+#include <limits>
+#include <map>
+#include <set>
+#include <sstream>
+
+#include <zlib.h>
+
+static uint32_t readU32(const std::vector<uint8_t>& data, size_t offset) {
+    if (offset + 4 > data.size()) return 0;
+    return uint32_t(data[offset]) | (uint32_t(data[offset + 1]) << 8) | (uint32_t(data[offset + 2]) << 16) | (uint32_t(data[offset + 3]) << 24);
+}
+
+static void writeU32(std::vector<uint8_t>& data, size_t offset, uint32_t value) {
+    if (offset + 4 > data.size()) return;
+    data[offset + 0] = uint8_t(value & 0xFF);
+    data[offset + 1] = uint8_t((value >> 8) & 0xFF);
+    data[offset + 2] = uint8_t((value >> 16) & 0xFF);
+    data[offset + 3] = uint8_t((value >> 24) & 0xFF);
+}
+
+static uint16_t readU16(const std::vector<uint8_t>& data, size_t offset) {
+    if (offset + 2 > data.size()) return 0;
+    return uint16_t(data[offset]) | (uint16_t(data[offset + 1]) << 8);
+}
+
+static int16_t readI16(const std::vector<uint8_t>& data, size_t offset) {
+    return static_cast<int16_t>(readU16(data, offset));
+}
+
+static int32_t readI32(const std::vector<uint8_t>& data, size_t offset) {
+    return static_cast<int32_t>(readU32(data, offset));
+}
+
+static float readFloat32(const std::vector<uint8_t>& data, size_t offset) {
+    if (offset + 4 > data.size()) return 0.0f;
+    uint32_t raw = readU32(data, offset);
+    float value = 0.0f;
+    std::memcpy(&value, &raw, sizeof(value));
+    return value;
+}
+
+static void writeU16(std::vector<uint8_t>& data, size_t offset, uint16_t value) {
+    if (offset + 2 > data.size()) return;
+    data[offset + 0] = uint8_t(value & 0xFF);
+    data[offset + 1] = uint8_t((value >> 8) & 0xFF);
+}
+
+static void writeFloat32(std::vector<uint8_t>& data, size_t offset, float value) {
+    uint32_t raw = 0;
+    std::memcpy(&raw, &value, sizeof(raw));
+    writeU32(data, offset, raw);
+}
+
+static std::string formatFloat32(float value) {
+    std::ostringstream ss;
+    ss << std::setprecision(9) << value;
+    return ss.str();
+}
+
+static std::string readFixedAscii(const std::vector<uint8_t>& data, size_t offset, size_t length) {
+    std::string text;
+    for (size_t i = 0; i < length && offset + i < data.size(); ++i) {
+        char c = char(data[offset + i]);
+        if (c == '\0') break;
+        if (static_cast<unsigned char>(c) < 0x20 || static_cast<unsigned char>(c) > 0x7E) {
+            text.push_back('.');
+        } else {
+            text.push_back(c);
+        }
+    }
+    return text;
+}
+
+static std::string hex32(uint32_t value) {
+    std::ostringstream ss;
+    ss << "0x" << std::uppercase << std::hex << std::setw(8) << std::setfill('0') << value;
+    return ss.str();
+}
+
+static std::string hexOffset(uint32_t value) {
+    std::ostringstream ss;
+    ss << "0x" << std::uppercase << std::hex << std::setw(6) << std::setfill('0') << value;
+    return ss.str();
+}
+
+static bool validStreamingPair(uint32_t start, uint32_t count) {
+    if (start == 0xFFFFFFFFu || count == 0xFFFFFFFFu) return false;
+    if (count == 0 || count > 0x20000u) return false;
+    if (start > 0x400000u) return false;
+    return true;
+}
+
+static constexpr uint64_t StorylandMaxLoadedFileBytes = 2ull * 1024ull * 1024ull * 1024ull;
+static constexpr size_t StorylandMaxInflatedDtzBytes = 512ull * 1024ull * 1024ull;
+
+static bool readWholeFile(const std::wstring& filePath, std::vector<uint8_t>& bytes, std::string& errorMessage) {
+    std::ifstream file(std::filesystem::path(filePath), std::ios::binary);
+    if (!file) {
+        errorMessage = "Could not open file.";
+        return false;
+    }
+
+    file.seekg(0, std::ios::end);
+    const std::streamoff fileSize = file.tellg();
+    if (fileSize < 0) {
+        errorMessage = "Could not determine file size.";
+        return false;
+    }
+
+    const uint64_t size64 = static_cast<uint64_t>(fileSize);
+    if (size64 > StorylandMaxLoadedFileBytes ||
+        size64 > static_cast<uint64_t>(std::numeric_limits<size_t>::max()) ||
+        size64 > static_cast<uint64_t>(std::numeric_limits<std::streamsize>::max())) {
+        errorMessage = "File is too large to load safely.";
+        return false;
+    }
+
+    file.seekg(0, std::ios::beg);
+    bytes.assign(static_cast<size_t>(size64), uint8_t(0));
+    if (!bytes.empty()) {
+        const std::streamsize readSize = static_cast<std::streamsize>(bytes.size());
+        file.read(reinterpret_cast<char*>(bytes.data()), readSize);
+        if (file.gcount() != readSize) {
+            bytes.clear();
+            errorMessage = "Could not read full file.";
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool writeWholeFile(const std::wstring& filePath, const std::vector<uint8_t>& bytes, std::string& errorMessage) {
+    return storylandWriteFilesTransaction({{std::filesystem::path(filePath), &bytes}}, errorMessage);
+}
+
+static std::wstring asciiWide(const std::string& text) {
+    return std::wstring(text.begin(), text.end());
+}
+
+static std::wstring lowercaseWide(const std::wstring& text) {
+    std::wstring result = text;
+    std::transform(result.begin(), result.end(), result.begin(), [](wchar_t c) { return wchar_t(std::towlower(c)); });
+    return result;
+}
+
+static std::wstring canonicalDtzDirEntryWideName(const std::wstring& displayName) {
+    std::wstring lower = lowercaseWide(displayName);
+    const wchar_t* knownExtensions[] = {
+        L".mdl", L".dff", L".xtx", L".chk", L".tex", L".anim", L".col", L".col2", L".dat", L".ipl", L".ide", L".cut", L".dir", L".bin", L".dtz"
+    };
+
+    size_t bestPos = std::wstring::npos;
+    size_t bestEnd = std::wstring::npos;
+    for (const wchar_t* extension : knownExtensions) {
+        size_t pos = lower.find(extension);
+        if (pos == std::wstring::npos) continue;
+        size_t end = pos + wcslen(extension);
+        if (bestPos == std::wstring::npos || pos < bestPos) {
+            bestPos = pos;
+            bestEnd = end;
+        }
+    }
+    if (bestEnd != std::wstring::npos) return displayName.substr(0, bestEnd);
+
+    size_t noteStart = displayName.find(L" (");
+    if (noteStart != std::wstring::npos) return displayName.substr(0, noteStart);
+    return displayName;
+}
+
+static std::wstring widePathStemLower(const std::wstring& path) {
+    size_t slash = path.find_last_of(L"\\/");
+    size_t start = slash == std::wstring::npos ? 0 : slash + 1;
+    size_t dot = path.find_last_of(L'.');
+    if (dot == std::wstring::npos || dot < start) dot = path.size();
+    return lowercaseWide(path.substr(start, dot - start));
+}
+
+static std::wstring widePathExtensionLower(const std::wstring& path) {
+    size_t dot = path.find_last_of(L'.');
+    if (dot == std::wstring::npos) return L"";
+    return lowercaseWide(path.substr(dot));
+}
+
+
+static std::string readDirName(const std::vector<uint8_t>& bytes, size_t offset, size_t length) {
+    std::string name;
+    for (size_t i = 0; i < length && offset + i < bytes.size(); ++i) {
+        char c = char(bytes[offset + i]);
+        if (c == '\0') break;
+        if (static_cast<unsigned char>(c) < 0x20 || static_cast<unsigned char>(c) > 0x7E) break;
+        name.push_back(c);
+    }
+    return name;
+}
+
+static bool looksLikeDirName(const std::string& name) {
+    if (name.empty() || name.size() > 24) return false;
+    bool hasDot = false;
+    for (char c : name) {
+        if (c == '.') hasDot = true;
+        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.';
+        if (!ok) return false;
+    }
+    return hasDot;
+}
+
+static bool looksLikeRawDtz(const std::vector<uint8_t>& bytes) {
+    if (bytes.size() < 4) return false;
+    uint32_t magic = readU32(bytes, 0);
+    return magic == 0x47544147 || magic == 0x47415447;
+}
+
+static bool inflateZlibBytes(const std::vector<uint8_t>& source, std::vector<uint8_t>& unpacked, std::string& errorMessage) {
+    if (source.empty()) {
+        errorMessage = "Compressed DTZ input is empty.";
+        return false;
+    }
+
+    z_stream stream = {};
+    const int initResult = inflateInit(&stream);
+    if (initResult != Z_OK) {
+        errorMessage = "zlib inflateInit failed.";
+        return false;
+    }
+
+    unpacked.clear();
+    std::vector<uint8_t> chunk(1024u * 1024u);
+    size_t inputOffset = 0;
+    int result = Z_OK;
+    bool madeProgress = true;
+
+    while (result != Z_STREAM_END) {
+        if (stream.avail_in == 0 && inputOffset < source.size()) {
+            const size_t remaining = source.size() - inputOffset;
+            const size_t feedBytes = std::min<size_t>(remaining, std::numeric_limits<uInt>::max());
+            stream.next_in = const_cast<Bytef*>(reinterpret_cast<const Bytef*>(source.data() + inputOffset));
+            stream.avail_in = static_cast<uInt>(feedBytes);
+            inputOffset += feedBytes;
+        }
+
+        stream.next_out = reinterpret_cast<Bytef*>(chunk.data());
+        stream.avail_out = static_cast<uInt>(chunk.size());
+        const uLong previousTotalIn = stream.total_in;
+        const uLong previousTotalOut = stream.total_out;
+        result = inflate(&stream, Z_NO_FLUSH);
+
+        if (result != Z_OK && result != Z_STREAM_END) {
+            inflateEnd(&stream);
+            unpacked.clear();
+            errorMessage = "zlib inflate failed before stream end.";
+            return false;
+        }
+
+        const size_t produced = chunk.size() - static_cast<size_t>(stream.avail_out);
+        if (produced != 0) {
+            if (unpacked.size() > StorylandMaxInflatedDtzBytes - std::min(StorylandMaxInflatedDtzBytes, produced)) {
+                inflateEnd(&stream);
+                unpacked.clear();
+                errorMessage = "Inflated GAME.DTZ exceeds the safe 512 MiB limit.";
+                return false;
+            }
+            unpacked.insert(unpacked.end(), chunk.data(), chunk.data() + produced);
+        }
+
+        madeProgress = stream.total_in != previousTotalIn || stream.total_out != previousTotalOut;
+        if (result != Z_STREAM_END && !madeProgress && stream.avail_in == 0 && inputOffset >= source.size()) {
+            inflateEnd(&stream);
+            unpacked.clear();
+            errorMessage = "Compressed DTZ ended before the zlib stream completed.";
+            return false;
+        }
+    }
+
+    inflateEnd(&stream);
+    if (!looksLikeRawDtz(unpacked)) {
+        unpacked.clear();
+        errorMessage = "Inflated file does not look like a raw GAME.DTZ/GATG block.";
+        return false;
+    }
+    return true;
+}
+
+static bool deflateZlibBytes(const std::vector<uint8_t>& unpacked, std::vector<uint8_t>& packed, std::string& errorMessage) {
+    if (unpacked.size() > StorylandMaxInflatedDtzBytes ||
+        unpacked.size() > static_cast<size_t>(std::numeric_limits<uLong>::max())) {
+        errorMessage = "GAME.DTZ is too large to compress safely.";
+        return false;
+    }
+
+    const uLong sourceLength = static_cast<uLong>(unpacked.size());
+    uLongf bound = compressBound(sourceLength);
+    if (bound > static_cast<uLongf>(std::numeric_limits<size_t>::max())) {
+        errorMessage = "Compressed GAME.DTZ buffer is too large for this build.";
+        return false;
+    }
+
+    packed.resize(static_cast<size_t>(bound));
+    const int result = compress2(
+        reinterpret_cast<Bytef*>(packed.data()),
+        &bound,
+        reinterpret_cast<const Bytef*>(unpacked.data()),
+        sourceLength,
+        Z_BEST_COMPRESSION);
+    if (result != Z_OK) {
+        packed.clear();
+        errorMessage = "zlib compress2 failed.";
+        return false;
+    }
+    packed.resize(static_cast<size_t>(bound));
+    return true;
+}
+
+static bool validateDeflatedDtzRoundTrip(const std::vector<uint8_t>& expectedUnpacked, const std::vector<uint8_t>& packed, std::string& errorMessage) {
+    std::vector<uint8_t> inflated;
+    std::string inflateError;
+    if (!inflateZlibBytes(packed, inflated, inflateError)) {
+        errorMessage = "Compressed DTZ check failed: " + inflateError;
+        return false;
+    }
+    if (inflated.size() != expectedUnpacked.size()) {
+        std::ostringstream ss;
+        ss << "Compressed DTZ check failed: inflated size "
+           << inflated.size()
+           << " differs from expected size "
+           << expectedUnpacked.size()
+           << ".";
+        errorMessage = ss.str();
+        return false;
+    }
+    if (!expectedUnpacked.empty() && std::memcmp(inflated.data(), expectedUnpacked.data(), expectedUnpacked.size()) != 0) {
+        errorMessage = "Compressed DTZ check failed: inflated bytes differ from the edited raw DTZ bytes.";
+        return false;
+    }
+    return true;
+}
+
+static void addHeaderField(std::vector<StorylandDtzHeaderField>& headers, const char* name, uint32_t offset, const std::vector<uint8_t>& data, const char* note) {
+    headers.push_back({name, offset, readU32(data, offset), note ? note : ""});
+}
+
+static void addHint(std::vector<StorylandDtzResourceHint>& hints, const std::vector<uint8_t>& data, const char* name, uint32_t offsetField, const char* note) {
+    uint32_t value = readU32(data, offsetField);
+    if (value != 0 && value < data.size()) hints.push_back({name, value, 0, note});
+}
+
+static std::string classifyKnownStreamingRecord(uint32_t, uint32_t) {
+    // Do not assign VCS-specific resource names from sector numbers. LCS and VCS,
+    // and even different regional/platform builds, can legitimately reuse the same
+    // sector positions for unrelated resources. Names are recovered from GAME.DTZ
+    // metadata, companion DIR data, hashes, or the payload itself instead.
+    return "";
+}
+
+static std::string describeKnownStreamingRecord(uint32_t start, uint32_t count) {
+    std::ostringstream ss;
+    ss << "Streaming allocation: sectors [" << start << ", " << (uint64_t(start) + uint64_t(count))
+       << "), " << (uint64_t(count) * 2048ull) << " bytes at 2048 bytes/sector.";
+    return ss.str();
+}
+
+bool StorylandDtzArchive::loadFromFile(const std::wstring& filePath, std::string& errorMessage) {
+    path = filePath;
+    dirPath.clear();
+    imgPath.clear();
+    dirMap.clear();
+    externalDirMap.clear();
+    dirRawData.clear();
+    imgRawData.clear();
+
+    std::vector<uint8_t> fileBytes;
+    if (!readWholeFile(filePath, fileBytes, errorMessage)) return false;
+
+    compressedInput = false;
+    if (looksLikeRawDtz(fileBytes)) {
+        unpackedData = std::move(fileBytes);
+    } else {
+        compressedInput = true;
+        if (!inflateZlibBytes(fileBytes, unpackedData, errorMessage)) return false;
+    }
+
+    if (!parse(errorMessage)) return false;
+
+    // Retail LCS/VCS GAME.DTZ contains the authoritative gta3PS*.img stream map.
+    // A nearby .dir may belong to a beta build or an old backup, so never load it implicitly.
+    // Beta DIR files remain available through the explicit Load .dir command.
+    tryAutoLoadCompanionImg();
+    rebuildDirMatches();
+    return true;
+}
+
+bool StorylandDtzArchive::loadCompanionDir(const std::wstring& filePath, std::string& errorMessage) {
+    std::vector<uint8_t> bytes;
+    if (!readWholeFile(filePath, bytes, errorMessage)) return false;
+    if (bytes.size() < 32 || (bytes.size() % 32) != 0) {
+        errorMessage = "DIR file size is not a multiple of 32 bytes.";
+        return false;
+    }
+
+    std::vector<StorylandDtzDirEntry> parsed;
+    parsed.reserve(bytes.size() / 32);
+    for (size_t offset = 0, index = 0; offset + 32 <= bytes.size(); offset += 32, ++index) {
+        uint32_t start = readU32(bytes, offset + 0);
+        uint32_t count = readU32(bytes, offset + 4);
+        std::string name = readDirName(bytes, offset + 8, 24);
+        if (!looksLikeDirName(name)) continue;
+        if (count == 0 || count > 0x20000 || start > 0x400000) continue;
+        StorylandDtzDirEntry entry;
+        entry.dirIndex = uint32_t(index);
+        entry.startSector = start;
+        entry.sectorCount = count;
+        entry.name = name;
+        parsed.push_back(entry);
+    }
+
+    if (parsed.empty()) {
+        errorMessage = "No valid IMG/DIR entries were found.";
+        return false;
+    }
+
+    dirPath = filePath;
+    dirRawData = bytes;
+    externalDirMap = std::move(parsed);
+    rebuildDirMatches();
+    return true;
+}
+
+bool StorylandDtzArchive::loadCompanionImg(const std::wstring& filePath, std::string& errorMessage) {
+    std::vector<uint8_t> bytes;
+    if (!readWholeFile(filePath, bytes, errorMessage)) return false;
+    if (bytes.empty()) {
+        errorMessage = "IMG file is empty.";
+        return false;
+    }
+
+    imgPath = filePath;
+    imgRawData = std::move(bytes);
+    rebuildDirMatches();
+    return true;
+}
+
+
+void StorylandDtzArchive::tryAutoLoadCompanionImg() {
+    if (path.empty()) return;
+
+    std::error_code ec;
+    std::filesystem::path dtzPath(path);
+    std::filesystem::path folder = dtzPath.parent_path();
+    if (folder.empty()) folder = std::filesystem::current_path(ec);
+    if (ec || !std::filesystem::exists(folder, ec) || !std::filesystem::is_directory(folder, ec)) return;
+
+    std::vector<std::filesystem::path> candidates;
+    auto addCandidate = [&](const std::filesystem::path& candidate) {
+        if (candidate.empty()) return;
+        std::error_code candidateEc;
+        if (!std::filesystem::exists(candidate, candidateEc) ||
+            !std::filesystem::is_regular_file(candidate, candidateEc)) return;
+        const std::filesystem::path normalized = candidate.lexically_normal();
+        for (const auto& existing : candidates) {
+            std::error_code compareEc;
+            if (std::filesystem::equivalent(existing, normalized, compareEc) && !compareEc) return;
+            if (existing.lexically_normal() == normalized) return;
+        }
+        candidates.push_back(normalized);
+    };
+
+    // Retail PS2, retail/prototype PSP, and classic/beta LCS naming all occur in
+    // real Leeds asset sets. Do not prefer PS2 merely because its filename appears
+    // first: the actual DTZ sector map decides which IMG is the best companion.
+    const wchar_t* preferredNames[] = {
+        L"gta3PS2.img", L"GTA3PS2.IMG", L"gta3ps2.img",
+        L"gta3PSP.img", L"GTA3PSP.IMG", L"gta3psp.img",
+        L"GTA3PSPHR.IMG", L"gta3psphr.img",
+        L"GTA3.IMG", L"gta3.img"
+    };
+    for (const wchar_t* name : preferredNames) addCandidate(folder / name);
+    std::wstring folderName = folder.filename().wstring();
+    std::transform(folderName.begin(), folderName.end(), folderName.begin(),
+        [](wchar_t c) { return wchar_t(std::towlower(c)); });
+    const bool searchParent = (folderName == L"ps2" || folderName == L"models" || folderName == L"data") &&
+        folder.has_parent_path();
+    if (searchParent) {
+        for (const wchar_t* name : preferredNames) addCandidate(folder.parent_path() / name);
+    }
+
+    std::filesystem::path sameStemImg = dtzPath;
+    sameStemImg.replace_extension(L".img");
+    addCandidate(sameStemImg);
+    sameStemImg = dtzPath;
+    sameStemImg.replace_extension(L".IMG");
+    addCandidate(sameStemImg);
+
+    for (const auto& searchFolder : {folder, searchParent ? folder.parent_path() : folder}) {
+        ec.clear();
+        for (const auto& item : std::filesystem::directory_iterator(searchFolder, ec)) {
+            if (ec) break;
+            if (!item.is_regular_file(ec)) continue;
+            std::filesystem::path candidate = item.path();
+            std::wstring ext = candidate.extension().wstring();
+            std::transform(ext.begin(), ext.end(), ext.begin(), [](wchar_t c) { return wchar_t(std::towlower(c)); });
+            std::wstring stem = candidate.stem().wstring();
+            std::transform(stem.begin(), stem.end(), stem.begin(), [](wchar_t c) { return wchar_t(std::towlower(c)); });
+            if (ext == L".img" && stem.find(L"gta3") != std::wstring::npos) addCandidate(candidate);
+        }
+        if (!searchParent) break;
+    }
+
+    if (candidates.empty()) return;
+
+    struct ScoredImg {
+        std::filesystem::path path;
+        std::vector<uint8_t> bytes;
+        size_t validRanges = 0u;
+        size_t backedRanges = 0u;
+        size_t recognizablePayloads = 0u;
+        uint64_t highestReferencedEnd = 0u;
+    };
+
+    auto payloadLooksRecognizable = [](const std::vector<uint8_t>& bytes, uint64_t offset) -> bool {
+        if (offset > bytes.size() || bytes.size() - size_t(offset) < 4u) return false;
+        const size_t at = size_t(offset);
+        const uint8_t a = bytes[at + 0u], b = bytes[at + 1u], c = bytes[at + 2u], d = bytes[at + 3u];
+        if ((a == 'l' && b == 'd' && c == 'm' && d == 0) ||
+            (a == 'P' && b == 'M' && c == 'L' && d == 'C') ||
+            (a == 'x' && b == 'e' && c == 't' && d == 0) ||
+            (a == 'm' && b == 'i' && c == 'n' && d == 'a') ||
+            (a == 'C' && b == 'O' && c == 'L') ||
+            (a == 'I' && b == 'D' && c == 'E') ||
+            (a == 'I' && b == 'P' && c == 'L')) return true;
+        const uint32_t word = uint32_t(a) | (uint32_t(b) << 8u) | (uint32_t(c) << 16u) | (uint32_t(d) << 24u);
+        return word == 0x10u || word == 0x16u;
+    };
+
+    std::vector<ScoredImg> scored;
+    scored.reserve(candidates.size());
+    for (const auto& candidate : candidates) {
+        ScoredImg item;
+        item.path = candidate;
+        std::string ignored;
+        if (!readWholeFile(candidate.wstring(), item.bytes, ignored) || item.bytes.empty()) continue;
+
+        for (const StorylandDtzSectorRecord& record : records) {
+            if (!validStreamingPair(record.startSector, record.sectorCount)) continue;
+            ++item.validRanges;
+            const uint64_t begin = uint64_t(record.startSector) * 2048ull;
+            const uint64_t length = uint64_t(record.sectorCount) * 2048ull;
+            if (begin > std::numeric_limits<uint64_t>::max() - length) continue;
+            const uint64_t end = begin + length;
+            item.highestReferencedEnd = std::max(item.highestReferencedEnd, end);
+            if (begin <= item.bytes.size() && length <= uint64_t(item.bytes.size()) - begin) {
+                ++item.backedRanges;
+                if (payloadLooksRecognizable(item.bytes, begin)) ++item.recognizablePayloads;
+            }
+        }
+        scored.push_back(std::move(item));
+    }
+
+    if (scored.empty()) return;
+
+    auto better = [](const ScoredImg& left, const ScoredImg& right) {
+        // Primary criterion: how much of the DTZ's own sector map the image actually backs.
+        // Payload signatures break ties and prevent a similarly-sized unrelated IMG from
+        // winning just because all ranges happen to fit.
+        if (left.backedRanges != right.backedRanges) return left.backedRanges > right.backedRanges;
+        if (left.recognizablePayloads != right.recognizablePayloads) return left.recognizablePayloads > right.recognizablePayloads;
+
+        const uint64_t leftSlack = left.bytes.size() >= left.highestReferencedEnd
+            ? uint64_t(left.bytes.size()) - left.highestReferencedEnd
+            : std::numeric_limits<uint64_t>::max();
+        const uint64_t rightSlack = right.bytes.size() >= right.highestReferencedEnd
+            ? uint64_t(right.bytes.size()) - right.highestReferencedEnd
+            : std::numeric_limits<uint64_t>::max();
+        if (leftSlack != rightSlack) return leftSlack < rightSlack;
+        return left.path.native() < right.path.native();
+    };
+    std::sort(scored.begin(), scored.end(), better);
+
+    // If the DTZ contained no recoverable sector records, retaining deterministic filename
+    // fallback is still more useful than refusing to pair the files. Otherwise require the
+    // winning IMG to back at least one real DTZ allocation.
+    const ScoredImg& best = scored.front();
+    if (!records.empty() && best.backedRanges == 0u) return;
+
+    imgPath = best.path.wstring();
+    imgRawData = best.bytes;
+}
+
+void StorylandDtzArchive::rebuildDirMatches() {
+    dirMap.clear();
+
+    auto lowerAscii = [](std::string text) -> std::string {
+        std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+        return text;
+    };
+
+    auto recordIsUsable = [](const StorylandDtzSectorRecord& record) -> bool {
+        return validStreamingPair(record.startSector, record.sectorCount);
+    };
+
+    auto classifySliceExtension = [&](uint32_t startSector, uint32_t sectorCount) -> std::string {
+        if (imgRawData.empty()) return "";
+        const uint64_t byteOffset = uint64_t(startSector) * 2048ull;
+        const uint64_t byteLength = uint64_t(sectorCount) * 2048ull;
+        if (byteOffset > imgRawData.size() || byteLength < 4ull || byteOffset + 4ull > imgRawData.size()) return "";
+        const size_t offset = static_cast<size_t>(byteOffset);
+        const uint8_t b0 = imgRawData[offset + 0u], b1 = imgRawData[offset + 1u], b2 = imgRawData[offset + 2u], b3 = imgRawData[offset + 3u];
+        if (b0 == 'l' && b1 == 'd' && b2 == 'm' && b3 == 0) return ".mdl";
+        if (b0 == 'P' && b1 == 'M' && b2 == 'L' && b3 == 'C') return ".mdl";
+        if (b0 == 'x' && b1 == 'e' && b2 == 't' && b3 == 0) return ".xtx";
+        if (b0 == 'm' && b1 == 'i' && b2 == 'n' && b3 == 'a') return ".anim";
+        if (b0 == 'G' && b1 == 'T' && b2 == 'A' && b3 == 'G') return ".dtz";
+        if (b0 == 'G' && b1 == 'A' && b2 == 'T' && b3 == 'G') return ".dtz";
+        if (b0 == 'C' && b1 == 'O' && b2 == 'L') return ".col";
+        if (b0 == '2' && b1 == 'l' && b2 == 'o' && b3 == 'c') return ".col2";
+        if (b0 == 'I' && b1 == 'D' && b2 == 'E') return ".ide";
+        if (b0 == 'I' && b1 == 'P' && b2 == 'L') return ".ipl";
+        const uint32_t chunkType = readU32(imgRawData, offset);
+        if (chunkType == 0x10u && byteLength >= 12ull && byteOffset + 12ull <= imgRawData.size()) {
+            const uint32_t chunkSize = readU32(imgRawData, offset + 4u);
+            const uint64_t totalChunkBytes = 12ull + uint64_t(chunkSize);
+            if (chunkSize >= 12u && totalChunkBytes <= byteLength && byteOffset + totalChunkBytes <= imgRawData.size()) return ".dff";
+        }
+        return ".bin";
+    };
+
+    auto populateImageRangeInfo = [&](StorylandDtzDirEntry& entry) {
+        entry.byteOffset = uint64_t(entry.startSector) * 2048ull;
+        entry.byteLength = uint64_t(entry.sectorCount) * 2048ull;
+        entry.detectedExtension = classifySliceExtension(entry.startSector, entry.sectorCount);
+        entry.availableBytes = 0;
+        entry.fullyBackedByImg = false;
+        if (imgRawData.empty() || entry.byteOffset > imgRawData.size()) return;
+        const uint64_t remaining = uint64_t(imgRawData.size()) - entry.byteOffset;
+        entry.availableBytes = std::min(entry.byteLength, remaining);
+        entry.fullyBackedByImg = entry.availableBytes == entry.byteLength;
+    };
+
+    auto knownNameExtension = [&](const std::string& name) -> std::string {
+        const std::string lower = lowerAscii(name);
+        static const char* extensions[] = {".mdl", ".dff", ".xtx", ".chk", ".tex", ".txd", ".anim", ".col", ".col2", ".dat", ".ipl", ".ide", ".cut", ".cam", ".bin", ".dtz"};
+        for (const char* extension : extensions) {
+            const size_t length = std::strlen(extension);
+            if (lower.size() >= length && lower.rfind(extension) == lower.size() - length) return extension;
+        }
+        return "";
+    };
+
+    auto forceNameExtension = [&](const std::string& name, const std::string& extension) -> std::string {
+        if (extension.empty() || extension == ".bin") return name;
+        const std::string oldExtension = knownNameExtension(name);
+        if (oldExtension.empty()) return name + extension;
+        return name.substr(0, name.size() - oldExtension.size()) + extension;
+    };
+
+    auto makeRecoveredName = [&](size_t recoveredIndex, uint32_t startSector, uint32_t sectorCount, const std::string& extension) -> std::string {
+        std::string prefix = "resource_";
+        if (extension == ".anim") prefix = "anim_clip_";
+        else if (extension == ".xtx" || extension == ".chk" || extension == ".tex" || extension == ".txd") prefix = "texture_";
+        else if (extension == ".mdl" || extension == ".dff") prefix = "model_";
+        std::ostringstream name;
+        name << prefix << std::setw(4) << std::setfill('0') << recoveredIndex
+             << "_s" << std::setw(6) << std::setfill('0') << startSector
+             << "_c" << std::setw(4) << std::setfill('0') << sectorCount
+             << (extension.empty() ? ".bin" : extension);
+        return name.str();
+    };
+
+    auto parseTwentyEightByteNameRow = [&](size_t offset, std::string& nameOut) -> bool {
+        nameOut.clear();
+        if (offset > unpackedData.size() || 28u > unpackedData.size() - offset) return false;
+        size_t cursor = offset;
+        while (cursor < offset + 20u) {
+            const uint8_t value = unpackedData[cursor];
+            if (value == 0u) break;
+            const bool allowed = (value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z') ||
+                                 (value >= '0' && value <= '9') || value == '_';
+            if (!allowed) return false;
+            nameOut.push_back(char(value));
+            ++cursor;
+        }
+        if (nameOut.size() < 2u || nameOut.size() >= 20u || unpackedData[offset + nameOut.size()] != 0u) return false;
+        for (size_t pad = offset + nameOut.size() + 1u; pad < offset + 20u; ++pad) {
+            const uint8_t value = unpackedData[pad];
+            if (value != 0xAAu && value != 0x00u) return false;
+        }
+        return true;
+    };
+
+    struct InternalNameTable { size_t offset = 0u; std::vector<std::string> names; };
+    InternalNameTable nameTable;
+    for (size_t offset = 0; offset + 28u * 8u <= unpackedData.size(); offset += 4u) {
+        std::vector<std::string> candidate;
+        std::set<std::string> uniqueNames;
+        for (size_t row = 0; row < 4096u && offset + row * 28u + 28u <= unpackedData.size(); ++row) {
+            std::string name;
+            if (!parseTwentyEightByteNameRow(offset + row * 28u, name)) break;
+            if (!uniqueNames.insert(lowerAscii(name)).second) break;
+            candidate.push_back(name);
+        }
+        if (candidate.size() >= 8u && candidate.size() > nameTable.names.size()) {
+            nameTable.offset = offset;
+            nameTable.names = std::move(candidate);
+        }
+    }
+
+    auto nameHash = [](const std::string& name) -> uint32_t {
+        std::string upper = name;
+        std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char c) { return char(std::toupper(c)); });
+        uLong crc = crc32(0L, Z_NULL, 0);
+        crc = crc32(crc, reinterpret_cast<const Bytef*>(upper.data()), static_cast<uInt>(upper.size()));
+        return uint32_t(crc) ^ 0xFFFFFFFFu;
+    };
+    std::map<uint32_t, std::string> nameByHash;
+    for (const std::string& name : nameTable.names) nameByHash.emplace(nameHash(name), name);
+
+    auto sentinelPrefix = [&](size_t offset) -> bool {
+        return offset <= unpackedData.size() && unpackedData.size() - offset >= 24u &&
+               readU32(unpackedData, offset + 0x00u) == 0xAAAAAAAAu &&
+               readU32(unpackedData, offset + 0x04u) == 0u &&
+               readU32(unpackedData, offset + 0x08u) == 0u &&
+               readU32(unpackedData, offset + 0x0Cu) == 0xAAAA0000u;
+    };
+    struct SentinelRun { size_t base = 0u; size_t rows = 0u; };
+    std::vector<SentinelRun> sentinelRuns;
+    for (size_t offset = 0; offset + 24u <= unpackedData.size();) {
+        if (!sentinelPrefix(offset)) { offset += 4u; continue; }
+        SentinelRun run; run.base = offset;
+        while (offset + 24u <= unpackedData.size() && sentinelPrefix(offset)) { ++run.rows; offset += 24u; }
+        sentinelRuns.push_back(run);
+    }
+
+    uint32_t ideCount = unpackedData.size() >= 0x40u ? readU32(unpackedData, 0x38u) : 0u;
+    uint32_t modelInfoTable = unpackedData.size() >= 0x40u ? readU32(unpackedData, 0x3Cu) : 0u;
+    uint32_t streamingObject = unpackedData.size() >= 0x80u ? readU32(unpackedData, 0x7Cu) : 0u;
+    uint32_t texOffset = 0u, colOffset = 0u, anmOffset = 0u, numStreamInfos = 0u;
+    bool semanticStreaming = false;
+    if (streamingObject != 0u && uint64_t(streamingObject) + 24ull <= unpackedData.size()) {
+        texOffset = readU32(unpackedData, streamingObject + 8u);
+        colOffset = readU32(unpackedData, streamingObject + 12u);
+        anmOffset = readU32(unpackedData, streamingObject + 16u);
+        numStreamInfos = readU32(unpackedData, streamingObject + 20u);
+        semanticStreaming = texOffset > 0u && texOffset <= colOffset && colOffset <= anmOffset &&
+                            anmOffset <= numStreamInfos && numStreamInfos > 0u && numStreamInfos < 1000000u;
+    }
+
+    const SentinelRun* streamRun = nullptr;
+    if (semanticStreaming) {
+        for (const SentinelRun& run : sentinelRuns) {
+            if (run.rows >= numStreamInfos && (!streamRun || run.rows < streamRun->rows)) streamRun = &run;
+        }
+        if (!streamRun) semanticStreaming = false;
+    }
+
+    auto readCcPaddedAnimName = [&](size_t offset, size_t length, std::string& nameOut) -> bool {
+        nameOut.clear();
+        if (offset > unpackedData.size() || length > unpackedData.size() - offset) return false;
+        for (size_t index = 0; index < length; ++index) {
+            const uint8_t value = unpackedData[offset + index];
+            if (value == 0u || value == 0xCCu) break;
+            const bool allowed = (value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z') ||
+                                 (value >= '0' && value <= '9') || value == '_';
+            if (!allowed) return false;
+            nameOut.push_back(char(value));
+        }
+        return nameOut.size() >= 2u && nameOut.size() < length;
+    };
+    auto canonicalAnimName = [](std::string name) -> std::string {
+        if (name.find('_') != std::string::npos && !name.empty() && std::isupper(static_cast<unsigned char>(name[0])) && name.size() <= 7u)
+            name.erase(std::remove(name.begin(), name.end(), '_'), name.end());
+        return name;
+    };
+    struct AnimName { std::string name; uint32_t offset = 0xFFFFFFFFu; };
+    std::vector<AnimName> animNames;
+    if (unpackedData.size() > 0x84u) {
+        const uint32_t blockOffset = readU32(unpackedData, 0x80u);
+        if (blockOffset != 0u && blockOffset < unpackedData.size()) {
+            for (size_t row = 0; row < 512u; ++row) {
+                const uint64_t rowOffset64 = uint64_t(blockOffset) + uint64_t(row) * 52ull;
+                if (rowOffset64 + 52ull > unpackedData.size()) break;
+                std::string archiveName, hierarchyName;
+                const size_t rowOffset = static_cast<size_t>(rowOffset64);
+                if (!readCcPaddedAnimName(rowOffset, 24u, archiveName) || !readCcPaddedAnimName(rowOffset + 24u, 24u, hierarchyName)) break;
+                animNames.push_back({canonicalAnimName(archiveName), uint32_t(rowOffset)});
+            }
+        }
+    }
+
+    // Detect the LCS retail CStreamingInfo serialization independently of the
+    // VCS descriptor/sentinel layout.  LCS uses a 0x20-byte prefix followed by
+    // 0x14-byte rows with start/count at +0x04/+0x08.
+    bool lcsStreaming = false;
+    size_t lcsStreamBase = 0u;
+    size_t lcsStreamRowCount = 0u;
+    if (streamingObject >= 0xE0u && uint64_t(streamingObject) + 0x20ull + 0x14ull * 64ull <= unpackedData.size()) {
+        const size_t candidateBase = size_t(streamingObject) + 0x20u;
+        size_t validRows = 0u;
+        size_t usefulRows = 0u;
+        for (size_t row = 0u; row < 8192u; ++row) {
+            const uint64_t rowOffset64 = uint64_t(candidateBase) + uint64_t(row) * 0x14ull;
+            if (rowOffset64 + 0x14ull > unpackedData.size()) break;
+            const size_t rowOffset = size_t(rowOffset64);
+            const uint32_t start = readU32(unpackedData, rowOffset + 0x04u);
+            const uint32_t count = readU32(unpackedData, rowOffset + 0x08u);
+            const uint32_t tail0 = readU32(unpackedData, rowOffset + 0x0Cu);
+            const uint32_t tail1 = readU32(unpackedData, rowOffset + 0x10u);
+            const bool empty = start == 0u && count == 0u;
+            const bool pairValid = validStreamingPair(start, count);
+            if (tail0 != 0u || tail1 != 0u || (!empty && !pairValid)) break;
+            ++validRows;
+            if (pairValid) ++usefulRows;
+            lcsStreamRowCount = row + 1u;
+        }
+        if (validRows >= 256u && usefulRows >= 32u) {
+            lcsStreaming = true;
+            lcsStreamBase = candidateBase;
+            semanticStreaming = false;
+            streamRun = nullptr;
+        }
+    }
+
+    std::map<std::pair<uint32_t, uint32_t>, size_t> entryIndexByPair;
+    auto attachMatchingRecords = [&](StorylandDtzDirEntry& entry) {
+        for (size_t recordIndex = 0; recordIndex < records.size(); ++recordIndex) {
+            const StorylandDtzSectorRecord& record = records[recordIndex];
+            if (recordIsUsable(record) && record.startSector == entry.startSector && record.sectorCount == entry.sectorCount)
+                entry.matchingRecordIndices.push_back(recordIndex);
+        }
+    };
+
+    if (lcsStreaming) {
+        uint32_t firstTextureIndex = 0xFFFFFFFFu;
+        uint32_t firstCollisionIndex = 0xFFFFFFFFu;
+        uint32_t firstAnimIndex = 0xFFFFFFFFu;
+
+        // Once the IMG is loaded, payload signatures give reliable category
+        // boundaries without borrowing VCS-specific tex/col/anim offsets.
+        if (!imgRawData.empty()) {
+            for (size_t streamIndex = 0u; streamIndex < lcsStreamRowCount; ++streamIndex) {
+                const size_t rowOffset = lcsStreamBase + streamIndex * 0x14u;
+                const uint32_t start = readU32(unpackedData, rowOffset + 0x04u);
+                const uint32_t count = readU32(unpackedData, rowOffset + 0x08u);
+                if (!validStreamingPair(start, count)) continue;
+                const std::string extension = classifySliceExtension(start, count);
+                if ((extension == ".xtx" || extension == ".chk" || extension == ".tex" || extension == ".txd") && firstTextureIndex == 0xFFFFFFFFu)
+                    firstTextureIndex = uint32_t(streamIndex);
+                else if ((extension == ".col" || extension == ".col2") && firstCollisionIndex == 0xFFFFFFFFu)
+                    firstCollisionIndex = uint32_t(streamIndex);
+                else if (extension == ".anim" && firstAnimIndex == 0xFFFFFFFFu)
+                    firstAnimIndex = uint32_t(streamIndex);
+            }
+        }
+
+        for (size_t streamIndex = 0u; streamIndex < lcsStreamRowCount; ++streamIndex) {
+            const size_t rowOffset = lcsStreamBase + streamIndex * 0x14u;
+            const uint32_t start = readU32(unpackedData, rowOffset + 0x04u);
+            const uint32_t count = readU32(unpackedData, rowOffset + 0x08u);
+            if (!validStreamingPair(start, count)) continue;
+
+            const std::pair<uint32_t, uint32_t> key{start, count};
+            if (entryIndexByPair.count(key)) continue;
+
+            StorylandDtzDirEntry entry;
+            entry.streamingIndex = uint32_t(streamIndex);
+            entry.startSector = start;
+            entry.sectorCount = count;
+            entry.matchedDtzSectorCount = count;
+            entry.startStorageOffset = uint32_t(rowOffset + 0x04u);
+            entry.countStorageOffset = uint32_t(rowOffset + 0x08u);
+            populateImageRangeInfo(entry);
+            attachMatchingRecords(entry);
+
+            std::string baseName;
+            if (entry.detectedExtension == ".mdl" || entry.detectedExtension == ".dff") {
+                if (streamIndex < ideCount && modelInfoTable != 0u &&
+                    uint64_t(modelInfoTable) + uint64_t(streamIndex + 1u) * 4ull <= unpackedData.size()) {
+                    const uint32_t modelInfo = readU32(unpackedData, modelInfoTable + streamIndex * 4u);
+                    if (modelInfo != 0u && uint64_t(modelInfo) + 12ull <= unpackedData.size()) {
+                        const uint32_t hash = readU32(unpackedData, modelInfo + 8u);
+                        auto known = nameByHash.find(hash);
+                        if (known != nameByHash.end()) baseName = known->second;
+                        else {
+                            std::ostringstream unknown;
+                            unknown << "model_" << std::setw(4) << std::setfill('0') << streamIndex
+                                    << "_hash_" << std::uppercase << std::hex << std::setw(8)
+                                    << std::setfill('0') << hash;
+                            baseName = unknown.str();
+                        }
+                        entry.nameStorageOffset = modelInfo + 8u;
+                        entry.nameStorageLength = 4u;
+                        entry.nameStoredAsHash = true;
+                    }
+                }
+            } else if ((entry.detectedExtension == ".xtx" || entry.detectedExtension == ".chk" ||
+                        entry.detectedExtension == ".tex" || entry.detectedExtension == ".txd") &&
+                       firstTextureIndex != 0xFFFFFFFFu && streamIndex >= firstTextureIndex) {
+                const uint32_t slot = uint32_t(streamIndex) - firstTextureIndex;
+                if (slot < nameTable.names.size()) {
+                    baseName = nameTable.names[slot];
+                    const uint64_t nameOffset64 = uint64_t(nameTable.offset) + uint64_t(slot) * 28ull;
+                    if (nameOffset64 + 20ull <= unpackedData.size()) {
+                        entry.nameStorageOffset = uint32_t(nameOffset64);
+                        entry.nameStorageLength = 20u;
+                    }
+                }
+            } else if (entry.detectedExtension == ".anim" && firstAnimIndex != 0xFFFFFFFFu && streamIndex >= firstAnimIndex) {
+                const uint32_t slot = uint32_t(streamIndex) - firstAnimIndex;
+                if (slot < animNames.size()) {
+                    baseName = animNames[slot].name;
+                    entry.nameStorageOffset = animNames[slot].offset;
+                    entry.nameStorageLength = 24u;
+                }
+            }
+
+            if (baseName.empty()) entry.name = makeRecoveredName(dirMap.size(), start, count, entry.detectedExtension);
+            else entry.name = forceNameExtension(baseName, entry.detectedExtension);
+            entryIndexByPair[key] = dirMap.size();
+            dirMap.push_back(std::move(entry));
+        }
+    }
+
+    if (!lcsStreaming && semanticStreaming && streamRun) {
+        for (uint32_t streamIndex = 0; streamIndex < numStreamInfos; ++streamIndex) {
+            const size_t rowOffset = streamRun->base + size_t(streamIndex) * 24u;
+            if (rowOffset + 24u > unpackedData.size()) break;
+            const uint32_t start = readU32(unpackedData, rowOffset + 0x10u);
+            const uint32_t count = readU32(unpackedData, rowOffset + 0x14u);
+            if (!validStreamingPair(start, count)) continue;
+            const std::pair<uint32_t, uint32_t> key{start, count};
+            if (entryIndexByPair.count(key)) continue;
+
+            StorylandDtzDirEntry entry;
+            entry.streamingIndex = streamIndex;
+            entry.startSector = start;
+            entry.sectorCount = count;
+            entry.matchedDtzSectorCount = count;
+            entry.startStorageOffset = uint32_t(rowOffset + 0x10u);
+            entry.countStorageOffset = uint32_t(rowOffset + 0x14u);
+            populateImageRangeInfo(entry);
+            attachMatchingRecords(entry);
+
+            std::string baseName;
+            auto explicitName = explicitStreamNames.find(streamIndex);
+            if (explicitName != explicitStreamNames.end()) {
+                baseName = explicitName->second;
+            } else if (streamIndex < texOffset && (entry.detectedExtension == ".mdl" || entry.detectedExtension == ".dff")) {
+                if (streamIndex < ideCount && modelInfoTable != 0u && uint64_t(modelInfoTable) + uint64_t(streamIndex + 1u) * 4ull <= unpackedData.size()) {
+                    const uint32_t modelInfo = readU32(unpackedData, modelInfoTable + streamIndex * 4u);
+                    if (modelInfo != 0u && uint64_t(modelInfo) + 12ull <= unpackedData.size()) {
+                        const uint32_t hash = readU32(unpackedData, modelInfo + 8u);
+                        auto known = nameByHash.find(hash);
+                        if (known != nameByHash.end()) baseName = known->second;
+                        else {
+                            std::ostringstream unknown; unknown << "hash_" << std::uppercase << std::hex << std::setw(8) << std::setfill('0') << hash;
+                            baseName = unknown.str();
+                        }
+                        entry.nameStorageOffset = modelInfo + 8u;
+                        entry.nameStorageLength = 4u;
+                        entry.nameStoredAsHash = true;
+                    }
+                }
+            } else if (streamIndex >= texOffset && streamIndex < colOffset) {
+                const uint32_t slot = streamIndex - texOffset;
+                if (slot < nameTable.names.size()) {
+                    baseName = nameTable.names[slot];
+                    const uint64_t nameOffset64 = uint64_t(nameTable.offset) + uint64_t(slot) * 28ull;
+                    if (nameOffset64 + 20ull <= unpackedData.size()) {
+                        entry.nameStorageOffset = uint32_t(nameOffset64);
+                        entry.nameStorageLength = 20u;
+                    }
+                }
+            } else if (streamIndex >= anmOffset) {
+                const uint32_t slot = streamIndex - anmOffset;
+                if (slot < animNames.size()) {
+                    baseName = animNames[slot].name;
+                    entry.nameStorageOffset = animNames[slot].offset;
+                    entry.nameStorageLength = 24u;
+                }
+            }
+
+            // When the real CStreaming table is present, its indices and GAME.DTZ name tables
+            // are authoritative.  Do not let a separately loaded beta/backup DIR relabel or
+            // duplicate retail entries.
+            if (baseName.empty()) entry.name = makeRecoveredName(dirMap.size(), start, count, entry.detectedExtension);
+            else entry.name = forceNameExtension(baseName, entry.detectedExtension);
+            entryIndexByPair[key] = dirMap.size();
+            dirMap.push_back(std::move(entry));
+        }
+    }
+
+    // Retail GAME.DTZ also stores a compact internal name directory immediately after
+    // CStreamingInfo_ms_aInfoForModel[].  These rows are 32 bytes:
+    //   u32 startSector, u32 sectorCount, char baseName[], '\0', char extension[], '\0'.
+    // They cover resources such as special/cutscene MDLs that are not live CStreaming rows.
+    // They are part of GAME.DTZ itself and must move whenever IMG sectors are inserted/removed.
+    if (!lcsStreaming && semanticStreaming && streamRun) {
+        const uint64_t namedDirectoryBase64 = uint64_t(streamRun->base) + uint64_t(numStreamInfos) * 24ull;
+        if (namedDirectoryBase64 <= unpackedData.size()) {
+            const size_t namedDirectoryBase = size_t(namedDirectoryBase64);
+            auto readSplitToken = [&](size_t begin, size_t end, std::string& token, size_t& next) -> bool {
+                token.clear();
+                next = begin;
+                if (begin >= end || end > unpackedData.size()) return false;
+                while (next < end) {
+                    const uint8_t value = unpackedData[next++];
+                    if (value == 0u) return !token.empty();
+                    const bool allowed = (value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z') ||
+                                         (value >= '0' && value <= '9') || value == '_';
+                    if (!allowed) return false;
+                    token.push_back(char(value));
+                }
+                return false;
+            };
+
+            for (size_t row = 0; row < 4096u; ++row) {
+                const uint64_t rowOffset64 = uint64_t(namedDirectoryBase) + uint64_t(row) * 32ull;
+                if (rowOffset64 + 32ull > unpackedData.size()) break;
+                const size_t rowOffset = size_t(rowOffset64);
+                const uint32_t start = readU32(unpackedData, rowOffset + 0u);
+                const uint32_t count = readU32(unpackedData, rowOffset + 4u);
+                if (!validStreamingPair(start, count)) break;
+
+                std::string baseName, extensionToken;
+                size_t next = rowOffset + 8u;
+                if (!readSplitToken(rowOffset + 8u, rowOffset + 32u, baseName, next)) break;
+                if (!readSplitToken(next, rowOffset + 32u, extensionToken, next)) break;
+                if (baseName.size() > 19u || extensionToken.size() > 7u) break;
+
+                std::string extension = "." + lowerAscii(extensionToken);
+                const std::pair<uint32_t, uint32_t> key{start, count};
+                auto existing = entryIndexByPair.find(key);
+                if (existing != entryIndexByPair.end()) {
+                    StorylandDtzDirEntry& entry = dirMap[existing->second];
+                    if (entry.nameStorageOffset == 0xFFFFFFFFu) {
+                        entry.nameStorageOffset = uint32_t(rowOffset + 8u);
+                        entry.nameStorageLength = 24u;
+                        entry.nameStoredAsSplitExtension = true;
+                    }
+                    continue;
+                }
+
+                StorylandDtzDirEntry entry;
+                entry.startSector = start;
+                entry.sectorCount = count;
+                entry.matchedDtzSectorCount = count;
+                entry.startStorageOffset = uint32_t(rowOffset + 0u);
+                entry.countStorageOffset = uint32_t(rowOffset + 4u);
+                entry.nameStorageOffset = uint32_t(rowOffset + 8u);
+                entry.nameStorageLength = 24u;
+                entry.nameStoredAsSplitExtension = true;
+                populateImageRangeInfo(entry);
+                if (entry.detectedExtension.empty() || entry.detectedExtension == ".bin") entry.detectedExtension = extension;
+                entry.name = baseName + extension;
+                entryIndexByPair[key] = dirMap.size();
+                dirMap.push_back(std::move(entry));
+            }
+        }
+    }
+
+    // Only synthesize a browser map from scanned sector records when the authoritative
+    // CStreaming table could not be located.  Mixing both sources creates duplicate rows
+    // after a retail rebuild (for example old plr.xtx/plr.mdl ranges beside the new ones).
+    if (!semanticStreaming && !lcsStreaming) {
+    // Preserve any valid ranges that are not part of a recognized CStreaming array.
+    for (size_t recordIndex = 0; recordIndex < records.size(); ++recordIndex) {
+        StorylandDtzSectorRecord& record = records[recordIndex];
+        if (!recordIsUsable(record)) continue;
+        const std::pair<uint32_t, uint32_t> key{record.startSector, record.sectorCount};
+        auto existing = entryIndexByPair.find(key);
+        if (existing != entryIndexByPair.end()) {
+            StorylandDtzDirEntry& entry = dirMap[existing->second];
+            if (std::find(entry.matchingRecordIndices.begin(), entry.matchingRecordIndices.end(), recordIndex) == entry.matchingRecordIndices.end())
+                entry.matchingRecordIndices.push_back(recordIndex);
+            record.resourceName = entry.name;
+            continue;
+        }
+        StorylandDtzDirEntry entry;
+        entry.startSector = record.startSector;
+        entry.sectorCount = record.sectorCount;
+        entry.matchedDtzSectorCount = record.sectorCount;
+        entry.startStorageOffset = record.startOffset;
+        entry.countStorageOffset = record.countOffset;
+        entry.matchingRecordIndices.push_back(recordIndex);
+        populateImageRangeInfo(entry);
+        std::string externalName;
+        for (const StorylandDtzDirEntry& external : externalDirMap)
+            if (external.startSector == entry.startSector && external.sectorCount == entry.sectorCount) { externalName = external.name; break; }
+        const bool usefulRecordName = !record.resourceName.empty() && record.resourceName.find("first entry after original") == std::string::npos;
+        if (!externalName.empty()) entry.name = forceNameExtension(externalName, entry.detectedExtension);
+        else if (usefulRecordName) entry.name = forceNameExtension(record.resourceName, entry.detectedExtension);
+        else entry.name = makeRecoveredName(dirMap.size(), entry.startSector, entry.sectorCount, entry.detectedExtension);
+        record.resourceName = entry.name;
+        entryIndexByPair[key] = dirMap.size();
+        dirMap.push_back(std::move(entry));
+    }
+
+    for (const StorylandDtzDirEntry& external : externalDirMap) {
+        const std::pair<uint32_t, uint32_t> key{external.startSector, external.sectorCount};
+        auto exact = entryIndexByPair.find(key);
+        if (exact != entryIndexByPair.end()) {
+            StorylandDtzDirEntry& entry = dirMap[exact->second];
+            entry.name = forceNameExtension(external.name, entry.detectedExtension);
+            continue;
+        }
+        StorylandDtzDirEntry entry;
+        entry.startSector = external.startSector;
+        entry.sectorCount = external.sectorCount;
+        entry.name = external.name;
+        populateImageRangeInfo(entry);
+        for (size_t recordIndex = 0; recordIndex < records.size(); ++recordIndex) {
+            const StorylandDtzSectorRecord& record = records[recordIndex];
+            if (!recordIsUsable(record) || record.startSector != entry.startSector) continue;
+            entry.matchingRecordIndices.push_back(recordIndex);
+            if (entry.matchedDtzSectorCount == 0u) entry.matchedDtzSectorCount = record.sectorCount;
+        }
+        entry.countDiffersFromCompanionDir = entry.matchedDtzSectorCount != 0u && entry.matchedDtzSectorCount != entry.sectorCount;
+        entry.name = forceNameExtension(entry.name, entry.detectedExtension);
+        entryIndexByPair[key] = dirMap.size();
+        dirMap.push_back(std::move(entry));
+    }
+    } // !semanticStreaming fallback
+
+    std::sort(dirMap.begin(), dirMap.end(), [](const StorylandDtzDirEntry& left, const StorylandDtzDirEntry& right) {
+        if (left.startSector != right.startSector) return left.startSector < right.startSector;
+        if (left.sectorCount != right.sectorCount) return left.sectorCount < right.sectorCount;
+        return left.name < right.name;
+    });
+    for (size_t index = 0; index < dirMap.size(); ++index) {
+        dirMap[index].dirIndex = static_cast<uint32_t>(index);
+        for (size_t recordIndex : dirMap[index].matchingRecordIndices) if (recordIndex < records.size()) records[recordIndex].resourceName = dirMap[index].name;
+    }
+}
+
+bool StorylandDtzArchive::writePatchedCompanionDir(const std::wstring& savedDtzPath, std::string& errorMessage) const {
+    if (externalDirMap.empty() || dirRawData.empty()) return true;
+
+    std::vector<uint8_t> patchedDir = dirRawData;
+    for (const StorylandDtzDirEntry& entry : externalDirMap) {
+        size_t offset = size_t(entry.dirIndex) * 32u;
+        if (offset + 8 > patchedDir.size()) continue;
+        writeU32(patchedDir, offset + 0, entry.startSector);
+        writeU32(patchedDir, offset + 4, entry.sectorCount);
+    }
+
+    if (!dirPath.empty()) {
+        if (!writeWholeFile(dirPath, patchedDir, errorMessage)) return false;
+    }
+
+    if (!savedDtzPath.empty() && !dirPath.empty()) {
+        std::filesystem::path saved(savedDtzPath);
+        std::filesystem::path originalDir(dirPath);
+        std::filesystem::path sibling = saved.parent_path() / originalDir.filename();
+        if (!sibling.empty() && sibling.wstring() != dirPath) {
+            if (!writeWholeFile(sibling.wstring(), patchedDir, errorMessage)) return false;
+        }
+    }
+
+    return true;
+}
+
+bool StorylandDtzArchive::saveCompanionImgToFile(const std::wstring& filePath, std::string& errorMessage) const {
+    if (imgRawData.empty()) {
+        errorMessage = "No companion IMG is loaded.";
+        return false;
+    }
+    return writeWholeFile(filePath, imgRawData, errorMessage);
+}
+
+bool StorylandDtzArchive::writePatchedCompanionImg(const std::wstring& savedDtzPath, std::string& errorMessage) const {
+    if (imgRawData.empty() || imgPath.empty()) return true;
+    if (savedDtzPath.empty()) return true;
+
+    std::filesystem::path saved(savedDtzPath);
+    std::filesystem::path originalImg(imgPath);
+    std::filesystem::path outputDirectory = saved.parent_path();
+    std::filesystem::path sibling = outputDirectory / originalImg.filename();
+
+    if (sibling.empty()) {
+        errorMessage = "Could not derive companion IMG output path beside rebuilt GAME.DTZ.";
+        return false;
+    }
+
+    return writeWholeFile(sibling.wstring(), imgRawData, errorMessage);
+}
+
+void StorylandDtzArchive::patchCompanionDirMap(
+    uint32_t selectedStartSector,
+    uint32_t selectedOldSectorCount,
+    uint32_t selectedNewSectorCount,
+    bool shiftLaterStarts
+) {
+    if (externalDirMap.empty()) return;
+
+    int64_t delta = int64_t(selectedNewSectorCount) - int64_t(selectedOldSectorCount);
+    uint32_t oldEnd = selectedStartSector + selectedOldSectorCount;
+
+    for (StorylandDtzDirEntry& entry : externalDirMap) {
+        if (entry.startSector == selectedStartSector) {
+            entry.sectorCount = selectedNewSectorCount;
+            continue;
+        }
+
+        if (!shiftLaterStarts || delta == 0) continue;
+        if (entry.startSector < oldEnd) continue;
+
+        int64_t shifted = int64_t(entry.startSector) + delta;
+        if (shifted >= 0 && shifted <= 0xFFFFFFFFLL) {
+            entry.startSector = uint32_t(shifted);
+        }
+    }
+}
+
+bool StorylandDtzArchive::resizeCompanionImgForSectorPatch(
+    uint32_t selectedStartSector,
+    uint32_t selectedOldSectorCount,
+    uint32_t selectedNewSectorCount,
+    bool shiftLaterStarts,
+    std::string& report,
+    std::string& errorMessage
+) {
+    report.clear();
+
+    if (imgRawData.empty()) {
+        report = "Companion IMG not loaded; only GAME.DTZ sector metadata was patched.";
+        return true;
+    }
+
+    int64_t deltaSectors = int64_t(selectedNewSectorCount) - int64_t(selectedOldSectorCount);
+    if (deltaSectors == 0) {
+        report = "Companion IMG loaded; sector count did not change, so IMG bytes were not moved.";
+        return true;
+    }
+
+    if (!shiftLaterStarts) {
+        report = "Companion IMG loaded. IMG resize skipped because start-sector shifting was off.";
+        return true;
+    }
+
+    uint64_t startByte = uint64_t(selectedStartSector) * 2048ull;
+    uint64_t oldEndSector64 = uint64_t(selectedStartSector) + uint64_t(selectedOldSectorCount);
+    uint64_t newEndSector64 = uint64_t(selectedStartSector) + uint64_t(selectedNewSectorCount);
+    uint64_t oldEndByte = oldEndSector64 * 2048ull;
+    uint64_t newEndByte = newEndSector64 * 2048ull;
+    if (startByte > imgRawData.size()) {
+        errorMessage = "Selected sector start is past the loaded companion IMG size.";
+        return false;
+    }
+
+    if (oldEndByte > imgRawData.size()) {
+        uint64_t paddingNeeded = oldEndByte - uint64_t(imgRawData.size());
+        if (paddingNeeded > 64ull * 1024ull * 1024ull) {
+            errorMessage = "Selected sector range ends too far past the loaded IMG.";
+            return false;
+        }
+        if (oldEndByte > StorylandMaxLoadedFileBytes || oldEndByte > uint64_t(std::numeric_limits<size_t>::max())) {
+            errorMessage = "Selected sector range would make the companion IMG exceed the safe 2 GiB limit.";
+            return false;
+        }
+        imgRawData.resize(size_t(oldEndByte), 0);
+    }
+
+    const size_t oldSize = imgRawData.size();
+    if (deltaSectors > 0) {
+        const uint64_t insertBytes64 = uint64_t(deltaSectors) * 2048ull;
+        if (insertBytes64 > uint64_t(std::numeric_limits<size_t>::max()) ||
+            insertBytes64 > StorylandMaxLoadedFileBytes ||
+            uint64_t(imgRawData.size()) > StorylandMaxLoadedFileBytes - insertBytes64) {
+            errorMessage = "Sector expansion would make the companion IMG exceed the safe 2 GiB limit.";
+            return false;
+        }
+        imgRawData.insert(imgRawData.begin() + std::ptrdiff_t(oldEndByte), size_t(insertBytes64), uint8_t(0));
+    } else {
+        uint64_t eraseBytes64 = uint64_t(-deltaSectors) * 2048ull;
+        if (newEndByte > oldEndByte || eraseBytes64 > oldEndByte - newEndByte) {
+            errorMessage = "Invalid IMG shrink range.";
+            return false;
+        }
+        imgRawData.erase(imgRawData.begin() + std::ptrdiff_t(newEndByte), imgRawData.begin() + std::ptrdiff_t(oldEndByte));
+    }
+
+    std::ostringstream ss;
+    ss << "Companion IMG resized in memory: "
+       << "start_sector=" << selectedStartSector
+       << " old_count=" << selectedOldSectorCount
+       << " new_count=" << selectedNewSectorCount
+       << " delta_sectors=" << deltaSectors
+       << " old_size=" << oldSize
+       << " new_size=" << imgRawData.size()
+       << ". Later file bytes physically moved by " << (deltaSectors * 2048ll) << " bytes.";
+    report = ss.str();
+    return true;
+}
+
+bool StorylandDtzArchive::saveToFile(const std::wstring& filePath, bool compressOutput, std::string& errorMessage) const {
+    if (unpackedData.empty()) {
+        errorMessage = "No DTZ data loaded.";
+        return false;
+    }
+    if (!looksLikeRawDtz(unpackedData)) {
+        errorMessage = "Not saving: edited raw DTZ buffer no longer begins with GTAG/GATG.";
+        return false;
+    }
+
+    uint32_t declaredSize = readU32(unpackedData, 0x08);
+    if (declaredSize != 0 && declaredSize != unpackedData.size()) {
+        std::ostringstream ss;
+        ss << "Not saving: DTZ header size "
+           << declaredSize
+           << " differs from edited raw size "
+           << unpackedData.size()
+           << ".";
+        errorMessage = ss.str();
+        return false;
+    }
+
+    // A retail GAME.DTZ stream map is expected to describe non-overlapping IMG allocations.
+    // Refuse to write a pair if an older edit left a secondary/internal locator stale.
+    // This specifically prevents a shifted special/cutscene MDL from silently retaining its
+    // old start sector while the CStreaming table and IMG have already moved forward.
+    if (!imgRawData.empty()) {
+        const StorylandDtzDirEntry* previous = nullptr;
+        uint64_t previousEndSector = 0;
+        for (const StorylandDtzDirEntry& entry : dirMap) {
+            if (entry.sectorCount == 0u) continue;
+            const uint64_t startSector = uint64_t(entry.startSector);
+            const uint64_t endSector = startSector + uint64_t(entry.sectorCount);
+            if (endSector < startSector) {
+                errorMessage = "Not saving: an internal DTZ stream range overflows its sector arithmetic.";
+                return false;
+            }
+            if (previous && startSector < previousEndSector) {
+                std::ostringstream ss;
+                ss << "Not saving: GAME.DTZ contains overlapping internal IMG ranges. '"
+                   << previous->name << "' ends at sector " << previousEndSector
+                   << " but '" << entry.name << "' starts at sector " << startSector
+                   << ". Reopen an unmodified GAME.DTZ/IMG pair or repair the stale stream map before rebuilding.";
+                errorMessage = ss.str();
+                return false;
+            }
+            previous = &entry;
+            previousEndSector = endSector;
+        }
+    }
+
+    std::vector<uint8_t> outputBytes;
+    if (!compressOutput) {
+        outputBytes = unpackedData;
+    } else {
+        if (!deflateZlibBytes(unpackedData, outputBytes, errorMessage)) return false;
+        if (!validateDeflatedDtzRoundTrip(unpackedData, outputBytes, errorMessage)) return false;
+    }
+
+    std::vector<StorylandOutputFile> outputs;
+    outputs.push_back({std::filesystem::path(filePath), &outputBytes});
+
+    std::filesystem::path savedDtz(filePath);
+    std::filesystem::path outputDirectory = savedDtz.parent_path();
+    if (!imgRawData.empty() && !imgPath.empty()) {
+        for (const StorylandDtzDirEntry& entry : dirMap) {
+            const uint64_t endByte = (uint64_t(entry.startSector) + uint64_t(entry.sectorCount)) * 2048ull;
+            if (endByte > uint64_t(imgRawData.size())) {
+                errorMessage = "Not saving: an internal DTZ stream range extends past the rebuilt companion IMG.";
+                return false;
+            }
+        }
+        std::filesystem::path imgOutput = outputDirectory / std::filesystem::path(imgPath).filename();
+        outputs.push_back({imgOutput, &imgRawData});
+    }
+
+    // Retail LCS/VCS do not use a .dir.  Only preserve/write this optional
+    // companion when a beta-build DIR was explicitly loaded with the archive.
+    std::vector<uint8_t> patchedBetaDir;
+    if (!externalDirMap.empty() && !dirRawData.empty() && !dirPath.empty()) {
+        patchedBetaDir = dirRawData;
+        for (const StorylandDtzDirEntry& entry : externalDirMap) {
+            const size_t offset = size_t(entry.dirIndex) * 32u;
+            if (offset + 8 > patchedBetaDir.size()) continue;
+            writeU32(patchedBetaDir, offset + 0, entry.startSector);
+            writeU32(patchedBetaDir, offset + 4, entry.sectorCount);
+        }
+        std::filesystem::path dirOutput = outputDirectory / std::filesystem::path(dirPath).filename();
+        outputs.push_back({dirOutput, &patchedBetaDir});
+    }
+
+    if (!storylandWriteFilesTransaction(outputs, errorMessage)) {
+        errorMessage = "DTZ rebuild transaction failed; existing outputs were restored.\r\n" + errorMessage;
+        return false;
+    }
+    return true;
+}
+
+bool StorylandDtzArchive::parse(std::string& errorMessage) {
+    headers.clear();
+    records.clear();
+    hints.clear();
+
+    if (!looksLikeRawDtz(unpackedData)) {
+        errorMessage = "Raw data does not begin with GTAG/GATG.";
+        return false;
+    }
+    if (unpackedData.size() < 0xE0) {
+        errorMessage = "DTZ header is too small.";
+        return false;
+    }
+
+    addHeaderField(headers, "FourCC", 0x00, unpackedData, "GTAG/GATG raw DTZ signature after zlib inflate.");
+    addHeaderField(headers, "VersionOrUnknown", 0x04, unpackedData, "Usually 1 for LCS/VCS DTZ.");
+    addHeaderField(headers, "UnpackedDtzSize", 0x08, unpackedData, "Full raw DTZ size.");
+    addHeaderField(headers, "DataSizeBeforeRelocationTables", 0x0C, unpackedData, "Data size before relocation/global tables.");
+    addHeaderField(headers, "RelocationTable", 0x10, unpackedData, "Pointer relocation table offset.");
+    addHeaderField(headers, "RelocationOffsetCount", 0x14, unpackedData, "Count of relocation offsets.");
+    addHeaderField(headers, "VmtHashOffsetTable", 0x18, unpackedData, "Jenkins hash/VMT replacement table pointer.");
+    addHeaderField(headers, "VmtHashCounts", 0x1C, unpackedData, "Two u16 counts packed in one dword.");
+    addHeaderField(headers, "gpThePaths", 0x20, unpackedData, "Path data pointer.");
+    addHeaderField(headers, "BuildingPoolIPL", 0x24, unpackedData, "Static building IPL-like data.");
+    addHeaderField(headers, "TreadableIPL", 0x28, unpackedData, "Road/treadable IPL-like data.");
+    addHeaderField(headers, "DummyIPL", 0x2C, unpackedData, "Dynamic dummy IPL-like data.");
+    addHeaderField(headers, "EntryInfoNodes", 0x30, unpackedData, "Streaming dynamic object entry-info nodes.");
+    addHeaderField(headers, "PtrNodes", 0x34, unpackedData, "Streaming map PtrNodes.");
+    addHeaderField(headers, "IdeCount", 0x38, unpackedData, "Number of binary IDE pointers/records.");
+    addHeaderField(headers, "IdePointerTable", 0x3C, unpackedData, "Table of offsets to binary IDE strings.");
+    addHeaderField(headers, "VehicleClassTable", 0x40, unpackedData, "Vehicle class/model id table.");
+    addHeaderField(headers, "VehicleClassItemCount", 0x44, unpackedData, "Count per vehicle class table row.");
+    addHeaderField(headers, "ZoneData", 0x48, unpackedData, "info.zon/navig.zon-like data.");
+    addHeaderField(headers, "CWorld_ms_aSectors", 0x4C, unpackedData, "Game world sector data.");
+    addHeaderField(headers, "CWorld_ms_bigBuildingsList", 0x50, unpackedData, "Big building PtrNode list.");
+    addHeaderField(headers, "TwoDfxCount", 0x54, unpackedData, "2dfx record count.");
+    addHeaderField(headers, "TwoDfxTable", 0x58, unpackedData, "2dfx table, 64-byte rows.");
+    addHeaderField(headers, "HardcodedModelIndexArray", 0x5C, unpackedData, "Hardcoded model indices.");
+    addHeaderField(headers, "TexList", 0x60, unpackedData, "Texture archive loader block / TexList.");
+    addHeaderField(headers, "UnknownZero_0x64", 0x64, unpackedData, "Usually zero.");
+    addHeaderField(headers, "Col2LoaderBlock", 0x68, unpackedData, "COL2 loader block.");
+    addHeaderField(headers, "UnknownZero_0x6C", 0x6C, unpackedData, "Usually zero.");
+    addHeaderField(headers, "DummyCollision", 0x70, unpackedData, "Dummy collision.");
+    addHeaderField(headers, "ObjectDat", 0x74, unpackedData, "object.dat analogue, documented as 32-byte rows.");
+    addHeaderField(headers, "CarcolsPalette", 0x78, unpackedData, "RGBA palette used by carcols.dat.");
+    addHeaderField(headers, "CStreamingInfo_ms_aInfoForModel", 0x7C, unpackedData, "GTA3PS*.DIR analogue; important for gta3PS2.img sector metadata.");
+    addHeaderField(headers, "AnimLoaderBlock", 0x80, unpackedData, "ANIM/IFP loader block.");
+    addHeaderField(headers, "fistfite.dat", 0x84, unpackedData, "fistfite.dat analogue.");
+    addHeaderField(headers, "PedAnimInfo", 0x88, unpackedData, "PedAnimInfo table.");
+    addHeaderField(headers, "ped.dat", 0x8C, unpackedData, "ped.dat analogue.");
+    addHeaderField(headers, "pedstats.dat", 0x90, unpackedData, "pedstats.dat analogue.");
+    addHeaderField(headers, "CullIplCountOrOffset", 0x94, unpackedData, "Documented cull.ipl count/related field; layout differs between supported builds.");
+    addHeaderField(headers, "CullIpl", 0x98, unpackedData, "cull.ipl analogue, documented as 16-byte rows.");
+    addHeaderField(headers, "OcclusionUnused_0x9C", 0x9C, unpackedData, "Unused occlusion field, often zero.");
+    addHeaderField(headers, "OcclusionUnused_0xA0", 0xA0, unpackedData, "Unused occlusion field, often zero.");
+    addHeaderField(headers, "waterpro.dat", 0xA4, unpackedData, "waterpro.dat analogue.");
+    addHeaderField(headers, "HANDLING.CFG", 0xA8, unpackedData, "handling data analogue.");
+    addHeaderField(headers, "surface.dat", 0xAC, unpackedData, "surface.dat analogue.");
+    addHeaderField(headers, "timecyc.dat", 0xB0, unpackedData, "timecyc.dat analogue.");
+    addHeaderField(headers, "pedgrp.dat", 0xB4, unpackedData, "pedgrp.dat analogue.");
+    addHeaderField(headers, "particle.cfg", 0xB8, unpackedData, "particle.cfg analogue.");
+    addHeaderField(headers, "weapon.dat", 0xBC, unpackedData, "weapon.dat analogue.");
+    addHeaderField(headers, "EmbeddedMdlClumpPointerTable", 0xC0, unpackedData, "Table of offsets to DTZ-embedded MDL clumps.");
+    addHeaderField(headers, "CUTS.DIR", 0xC4, unpackedData, "CUTS.DIR analogue.");
+    addHeaderField(headers, "ferry.dat", 0xC8, unpackedData, "ferry.dat analogue.");
+    addHeaderField(headers, "tracks.dat/tracks2.dat", 0xCC, unpackedData, "tracks.dat and tracks2.dat analogue.");
+    addHeaderField(headers, "flight.dat", 0xD0, unpackedData, "flight.dat analogue.");
+    addHeaderField(headers, "menu.chk", 0xD4, unpackedData, "menu.chk compressed offset on documented LCS/VCS builds; zero is valid in variants that omit this resource.");
+    addHeaderField(headers, "fonts.chk real size", 0xD8, unpackedData, "fonts.chk real/unpacked size or variant field.");
+    addHeaderField(headers, "fonts.chk", 0xDC, unpackedData, "fonts.chk compressed offset on documented LCS/VCS builds; zero is valid in variants that omit this resource.");
+
+    addHint(hints, unpackedData, "TexList / CHK loader block", 0x60, "DTZ header field 0x60");
+    addHint(hints, unpackedData, "COL2 loader block", 0x68, "DTZ header field 0x68");
+    addHint(hints, unpackedData, "CStreamingInfo ms_aInfoForModel[]", 0x7C, "Main GTA3PS2.IMG mapping analogue");
+    addHint(hints, unpackedData, "ANIM loader block", 0x80, "DTZ header field 0x80");
+    addHint(hints, unpackedData, "Embedded MDL clump pointer table", 0xC0, "DTZ-embedded MDL table");
+    addHint(hints, unpackedData, "CUTS.DIR analogue", 0xC4, "DTZ header field 0xC4");
+    addHint(hints, unpackedData, "menu.chk compressed", 0xD4, "Compressed CHK texture archive where present");
+    addHint(hints, unpackedData, "fonts.chk compressed/size field", 0xD8, "Font CHK info field on documented builds");
+    addHint(hints, unpackedData, "fonts.chk compressed", 0xDC, "Compressed CHK texture archive where present");
+
+    rebuildSectorRecords();
+    rebuildLeeds2dfxEffects();
+    rebuildDataBlocksAndFields();
+    rebuildDirMatches();
+    return true;
+}
+
+
+static bool dtzFiniteReasonableFloat(float value, float limit) {
+    return std::isfinite(value) && std::fabs(value) <= limit;
+}
+
+static const char* dtzLeeds2dfxEffectTypeName(uint8_t effectType) {
+    switch (effectType) {
+    case 0: return "LIGHT";
+    case 1: return "PARTICLE";
+    case 2: return "ATTRACTOR";
+    case 3: return "PED_BEHAVIOUR";
+    default: return "UNKNOWN";
+    }
+}
+
+void StorylandDtzArchive::rebuildLeeds2dfxEffects() {
+    leeds2dfxEffectsCache.clear();
+    leeds2dfxWorldInstancesCache.clear();
+    if (unpackedData.size() < 0x5Cu) return;
+
+    const uint32_t declaredCount = readU32(unpackedData, 0x54u);
+    const uint32_t tableOffset = readU32(unpackedData, 0x58u);
+    constexpr uint32_t rowStride = 0x40u;
+    if (declaredCount == 0u || declaredCount > 100000u) return;
+    if (tableOffset == 0u || uint64_t(tableOffset) + uint64_t(declaredCount) * rowStride > unpackedData.size()) return;
+
+    struct ModelEffectRange {
+        int32_t modelIndex = -1;
+        uint32_t modelHash = 0;
+        uint32_t modelInfoOffset = 0;
+        uint8_t modelType = 0;
+        uint32_t firstEffect = 0;
+        uint32_t effectCount = 0;
+    };
+
+    std::vector<int32_t> effectOwner(declaredCount, -1);
+    std::vector<uint32_t> effectOwnerHash(declaredCount, 0u);
+    std::vector<uint32_t> effectOwnerInfo(declaredCount, 0u);
+    std::vector<uint8_t> effectOwnerType(declaredCount, 0u);
+    std::vector<uint32_t> effectOwnerLocalIndex(declaredCount, 0u);
+
+    const uint32_t ideCount = readU32(unpackedData, 0x38u);
+    const uint32_t idePointerTable = readU32(unpackedData, 0x3Cu);
+    if (ideCount > 0u && ideCount <= 200000u &&
+        idePointerTable != 0u &&
+        uint64_t(idePointerTable) + uint64_t(ideCount) * 4ull <= unpackedData.size()) {
+        for (uint32_t modelIndex = 0u; modelIndex < ideCount; ++modelIndex) {
+            const uint32_t modelInfoOffset = readU32(unpackedData, size_t(idePointerTable) + size_t(modelIndex) * 4u);
+            if (modelInfoOffset == 0u || uint64_t(modelInfoOffset) + 0x20ull > unpackedData.size()) continue;
+
+            const uint32_t modelHash = readU32(unpackedData, size_t(modelInfoOffset) + 0x08u);
+            const uint8_t modelType = unpackedData[size_t(modelInfoOffset) + 0x10u];
+            const uint8_t effectCount = unpackedData[size_t(modelInfoOffset) + 0x11u];
+            const int16_t firstEffect = readI16(unpackedData, size_t(modelInfoOffset) + 0x18u);
+            if (effectCount == 0u || firstEffect < 0) continue;
+            if (uint32_t(firstEffect) >= declaredCount ||
+                uint32_t(firstEffect) + uint32_t(effectCount) > declaredCount) continue;
+
+            ModelEffectRange range;
+            range.modelIndex = int32_t(modelIndex);
+            range.modelHash = modelHash;
+            range.modelInfoOffset = modelInfoOffset;
+            range.modelType = modelType;
+            range.firstEffect = uint32_t(firstEffect);
+            range.effectCount = uint32_t(effectCount);
+
+            for (uint32_t localIndex = 0u; localIndex < range.effectCount; ++localIndex) {
+                const uint32_t globalIndex = range.firstEffect + localIndex;
+                effectOwner[globalIndex] = range.modelIndex;
+                effectOwnerHash[globalIndex] = range.modelHash;
+                effectOwnerInfo[globalIndex] = range.modelInfoOffset;
+                effectOwnerType[globalIndex] = range.modelType;
+                effectOwnerLocalIndex[globalIndex] = localIndex;
+            }
+        }
+    }
+
+    leeds2dfxEffectsCache.reserve(declaredCount);
+    for (uint32_t index = 0u; index < declaredCount; ++index) {
+        const size_t row = size_t(tableOffset) + size_t(index) * rowStride;
+
+        StorylandDtz2dfxEffect effect;
+        effect.index = index;
+        effect.rowOffset = uint32_t(row);
+        effect.localX = readFloat32(unpackedData, row + 0x00u);
+        effect.localY = readFloat32(unpackedData, row + 0x04u);
+        effect.localZ = readFloat32(unpackedData, row + 0x08u);
+        effect.positionW = readFloat32(unpackedData, row + 0x0Cu);
+        effect.red = unpackedData[row + 0x10u];
+        effect.green = unpackedData[row + 0x11u];
+        effect.blue = unpackedData[row + 0x12u];
+        effect.alpha = unpackedData[row + 0x13u];
+        effect.effectType = unpackedData[row + 0x14u];
+        effect.isLight = effect.effectType == 0u;
+
+        effect.valid =
+            effect.effectType <= 3u &&
+            dtzFiniteReasonableFloat(effect.localX, 1000000.0f) &&
+            dtzFiniteReasonableFloat(effect.localY, 1000000.0f) &&
+            dtzFiniteReasonableFloat(effect.localZ, 1000000.0f) &&
+            dtzFiniteReasonableFloat(effect.positionW, 1000000.0f);
+
+        if (effect.effectType == 0u) {
+            effect.coronaFarClip = readFloat32(unpackedData, row + 0x18u);
+            effect.pointLightRange = readFloat32(unpackedData, row + 0x1Cu);
+            effect.coronaSize = readFloat32(unpackedData, row + 0x20u);
+            effect.shadowSize = readFloat32(unpackedData, row + 0x24u);
+            effect.lightType = unpackedData[row + 0x28u];
+            effect.roadReflection = unpackedData[row + 0x29u];
+            effect.flareType = unpackedData[row + 0x2Au];
+            effect.shadowIntensity = unpackedData[row + 0x2Bu];
+            effect.flags = unpackedData[row + 0x2Cu];
+            effect.coronaTexturePointer = readU32(unpackedData, row + 0x30u);
+            effect.shadowTexturePointer = readU32(unpackedData, row + 0x34u);
+            effect.valid = effect.valid &&
+                dtzFiniteReasonableFloat(effect.coronaFarClip, 1000000.0f) &&
+                dtzFiniteReasonableFloat(effect.pointLightRange, 1000000.0f) &&
+                dtzFiniteReasonableFloat(effect.coronaSize, 100000.0f) &&
+                dtzFiniteReasonableFloat(effect.shadowSize, 100000.0f);
+        } else if (effect.effectType == 1u) {
+            effect.particleSubtype = readI32(unpackedData, row + 0x18u);
+            effect.directionX = readFloat32(unpackedData, row + 0x1Cu);
+            effect.directionY = readFloat32(unpackedData, row + 0x20u);
+            effect.directionZ = readFloat32(unpackedData, row + 0x24u);
+            effect.particleScale = readFloat32(unpackedData, row + 0x28u);
+            effect.valid = effect.valid &&
+                dtzFiniteReasonableFloat(effect.directionX, 1000000.0f) &&
+                dtzFiniteReasonableFloat(effect.directionY, 1000000.0f) &&
+                dtzFiniteReasonableFloat(effect.directionZ, 1000000.0f) &&
+                dtzFiniteReasonableFloat(effect.particleScale, 1000000.0f);
+        } else if (effect.effectType == 2u) {
+            effect.directionX = readFloat32(unpackedData, row + 0x18u);
+            effect.directionY = readFloat32(unpackedData, row + 0x1Cu);
+            effect.directionZ = readFloat32(unpackedData, row + 0x20u);
+            effect.attractorSubtype = unpackedData[row + 0x24u];
+            effect.attractorProbability = unpackedData[row + 0x25u];
+            effect.valid = effect.valid &&
+                dtzFiniteReasonableFloat(effect.directionX, 1000000.0f) &&
+                dtzFiniteReasonableFloat(effect.directionY, 1000000.0f) &&
+                dtzFiniteReasonableFloat(effect.directionZ, 1000000.0f);
+        } else if (effect.effectType == 3u) {
+            effect.directionX = readFloat32(unpackedData, row + 0x18u);
+            effect.directionY = readFloat32(unpackedData, row + 0x1Cu);
+            effect.directionZ = readFloat32(unpackedData, row + 0x20u);
+            effect.pedRotationX = readFloat32(unpackedData, row + 0x24u);
+            effect.pedRotationY = readFloat32(unpackedData, row + 0x28u);
+            effect.pedRotationZ = readFloat32(unpackedData, row + 0x2Cu);
+            effect.pedSubtype = unpackedData[row + 0x30u];
+            effect.valid = effect.valid &&
+                dtzFiniteReasonableFloat(effect.directionX, 1000000.0f) &&
+                dtzFiniteReasonableFloat(effect.directionY, 1000000.0f) &&
+                dtzFiniteReasonableFloat(effect.directionZ, 1000000.0f) &&
+                dtzFiniteReasonableFloat(effect.pedRotationX, 1000000.0f) &&
+                dtzFiniteReasonableFloat(effect.pedRotationY, 1000000.0f) &&
+                dtzFiniteReasonableFloat(effect.pedRotationZ, 1000000.0f);
+        }
+
+        if (effectOwner[index] >= 0) {
+            effect.modelIndex = effectOwner[index];
+            effect.modelHash = effectOwnerHash[index];
+            effect.modelInfoOffset = effectOwnerInfo[index];
+            effect.modelType = effectOwnerType[index];
+            effect.modelEffectIndex = effectOwnerLocalIndex[index];
+            effect.hasModelAssociation = true;
+        }
+
+        leeds2dfxEffectsCache.push_back(effect);
+    }
+
+    std::map<int32_t, std::vector<uint32_t>> effectIndicesByModel;
+    for (const StorylandDtz2dfxEffect& effect : leeds2dfxEffectsCache) {
+        if (effect.valid && effect.hasModelAssociation) {
+            effectIndicesByModel[effect.modelIndex].push_back(effect.index);
+        }
+    }
+
+    struct PoolDescriptor {
+        const char* name;
+        uint32_t headerOffset;
+    };
+    const PoolDescriptor pools[] = {
+        {"BUILDING", 0x24u},
+        {"TREADABLE", 0x28u},
+        {"DUMMY", 0x2Cu}
+    };
+
+    for (const PoolDescriptor& pool : pools) {
+        const uint32_t poolOffset = readU32(unpackedData, pool.headerOffset);
+        if (poolOffset == 0u || uint64_t(poolOffset) + 0x20ull > unpackedData.size()) continue;
+
+        const uint32_t itemsOffset = readU32(unpackedData, size_t(poolOffset) + 0x00u);
+        const uint32_t flagsOffset = readU32(unpackedData, size_t(poolOffset) + 0x04u);
+        const int32_t poolSize = readI32(unpackedData, size_t(poolOffset) + 0x08u);
+        if (poolSize < 0 || poolSize > 200000) continue;
+        if (uint64_t(itemsOffset) + uint64_t(poolSize) * 0x60ull > unpackedData.size()) continue;
+        if (uint64_t(flagsOffset) + uint64_t(poolSize) > unpackedData.size()) continue;
+
+        for (int32_t poolIndex = 0; poolIndex < poolSize; ++poolIndex) {
+            const uint8_t poolFlag = unpackedData[size_t(flagsOffset) + size_t(poolIndex)];
+            if ((poolFlag & 0x80u) != 0u) continue;
+
+            const size_t entityOffset = size_t(itemsOffset) + size_t(poolIndex) * 0x60u;
+            const int32_t modelIndex = int32_t(readI16(unpackedData, entityOffset + 0x56u));
+            const auto modelEffects = effectIndicesByModel.find(modelIndex);
+            if (modelEffects == effectIndicesByModel.end() || modelEffects->second.empty()) continue;
+
+            float matrix[16] = {};
+            bool matrixValid = true;
+            for (size_t component = 0u; component < 16u; ++component) {
+                matrix[component] = readFloat32(unpackedData, entityOffset + component * 4u);
+                if (!dtzFiniteReasonableFloat(matrix[component], 10000000.0f)) matrixValid = false;
+            }
+            if (!matrixValid) continue;
+
+            const float rightX = matrix[0], rightY = matrix[1], rightZ = matrix[2];
+            const float upX = matrix[4], upY = matrix[5], upZ = matrix[6];
+            const float atX = matrix[8], atY = matrix[9], atZ = matrix[10];
+            const float entityX = matrix[12], entityY = matrix[13], entityZ = matrix[14];
+            const int32_t secondaryModelIndex = int32_t(readI16(unpackedData, entityOffset + 0x58u));
+            const uint8_t level = unpackedData[entityOffset + 0x5Au];
+            const uint8_t area = unpackedData[entityOffset + 0x5Bu];
+
+            for (uint32_t effectIndex : modelEffects->second) {
+                if (effectIndex >= leeds2dfxEffectsCache.size()) continue;
+                const StorylandDtz2dfxEffect& effect = leeds2dfxEffectsCache[effectIndex];
+
+                StorylandDtz2dfxWorldInstance instance;
+                instance.index = uint32_t(leeds2dfxWorldInstancesCache.size());
+                instance.effectIndex = effectIndex;
+                instance.entityOffset = uint32_t(entityOffset);
+                instance.poolIndex = uint32_t(poolIndex);
+                instance.poolName = pool.name;
+                instance.poolFlag = poolFlag;
+                instance.modelIndex = modelIndex;
+                instance.secondaryModelIndex = secondaryModelIndex;
+                instance.level = level;
+                instance.area = area;
+                instance.rightX = rightX;
+                instance.rightY = rightY;
+                instance.rightZ = rightZ;
+                instance.upX = upX;
+                instance.upY = upY;
+                instance.upZ = upZ;
+                instance.atX = atX;
+                instance.atY = atY;
+                instance.atZ = atZ;
+                instance.entityX = entityX;
+                instance.entityY = entityY;
+                instance.entityZ = entityZ;
+                instance.worldX = rightX * effect.localX + upX * effect.localY + atX * effect.localZ + entityX;
+                instance.worldY = rightY * effect.localX + upY * effect.localY + atY * effect.localZ + entityY;
+                instance.worldZ = rightZ * effect.localX + upZ * effect.localY + atZ * effect.localZ + entityZ;
+                instance.valid =
+                    dtzFiniteReasonableFloat(instance.worldX, 10000000.0f) &&
+                    dtzFiniteReasonableFloat(instance.worldY, 10000000.0f) &&
+                    dtzFiniteReasonableFloat(instance.worldZ, 10000000.0f);
+                if (instance.valid) leeds2dfxWorldInstancesCache.push_back(instance);
+            }
+        }
+    }
+}
+void StorylandDtzArchive::rebuildSectorRecords() {
+    records.clear();
+    std::set<std::pair<uint32_t, uint32_t>> seenOffsets;
+
+    auto addRecord = [&](uint32_t recordOffset, uint32_t startOffset, uint32_t countOffset, uint32_t start, uint32_t count, const std::string& source) {
+        if (count == 0 || count > 0x20000) return;
+        if (start == 0xFFFFFFFFu || count == 0xFFFFFFFFu) return;
+        if (start > 0x400000) return;
+        if (!seenOffsets.insert({startOffset, countOffset}).second) return;
+
+        StorylandDtzSectorRecord record;
+        record.recordOffset = recordOffset;
+        record.startOffset = startOffset;
+        record.countOffset = countOffset;
+        record.startSector = start;
+        record.sectorCount = count;
+        record.source = source;
+        record.resourceName = classifyKnownStreamingRecord(start, count);
+        record.note = describeKnownStreamingRecord(start, count);
+        records.push_back(record);
+    };
+
+    // LCS retail PS2/PSP uses a different CStreamingInfo serialization from VCS.
+    // Header +0x7C points at the LCS streaming block.  After a 0x20-byte block
+    // prefix, entries are 0x14 bytes each and store the gta3PS*.img sector start
+    // and sector count at +0x04/+0x08.  The final two dwords of each entry are 0.
+    // Empty/reserved stream IDs use start/count 0/0 and are intentionally skipped.
+    //
+    // This must be detected before the older VCS 0x18-byte sentinel scan.  The
+    // previous generic scan could find unrelated zero/sentinel structures elsewhere
+    // in an LCS GAME.DTZ and turn them into hundreds of fake s000000 entries.
+    bool foundLcsStreamingTable = false;
+    const uint32_t streamingPointer = unpackedData.size() >= 0x80u ? readU32(unpackedData, 0x7Cu) : 0u;
+    if (streamingPointer >= 0xE0u && uint64_t(streamingPointer) + 0x20ull + 0x14ull * 64ull <= unpackedData.size()) {
+        const size_t tableBase = size_t(streamingPointer) + 0x20u;
+        size_t structurallyValidRows = 0u;
+        size_t usefulRows = 0u;
+        size_t rowCount = 0u;
+
+        // Validate a substantial prefix first.  This deliberately checks the LCS
+        // row shape rather than just plausible sector numbers.
+        for (size_t row = 0u; row < 8192u; ++row) {
+            const uint64_t rowOffset64 = uint64_t(tableBase) + uint64_t(row) * 0x14ull;
+            if (rowOffset64 + 0x14ull > unpackedData.size()) break;
+            const size_t rowOffset = size_t(rowOffset64);
+            const uint32_t start = readU32(unpackedData, rowOffset + 0x04u);
+            const uint32_t count = readU32(unpackedData, rowOffset + 0x08u);
+            const uint32_t tail0 = readU32(unpackedData, rowOffset + 0x0Cu);
+            const uint32_t tail1 = readU32(unpackedData, rowOffset + 0x10u);
+
+            const bool empty = start == 0u && count == 0u;
+            const bool pairValid = validStreamingPair(start, count);
+            if (tail0 != 0u || tail1 != 0u || (!empty && !pairValid)) break;
+
+            ++structurallyValidRows;
+            if (pairValid) ++usefulRows;
+            rowCount = row + 1u;
+        }
+
+        if (structurallyValidRows >= 256u && usefulRows >= 32u) {
+            foundLcsStreamingTable = true;
+            for (size_t row = 0u; row < rowCount; ++row) {
+                const size_t rowOffset = tableBase + row * 0x14u;
+                const uint32_t start = readU32(unpackedData, rowOffset + 0x04u);
+                const uint32_t count = readU32(unpackedData, rowOffset + 0x08u);
+                if (!validStreamingPair(start, count)) continue;
+
+                std::ostringstream source;
+                source << "LCS CStreamingInfo[" << row << "] (0x14-byte retail row)";
+                addRecord(uint32_t(rowOffset), uint32_t(rowOffset + 0x04u),
+                          uint32_t(rowOffset + 0x08u), start, count, source.str());
+            }
+        }
+    }
+
+    auto looksLikeStreamingEntry = [&](size_t offset) -> bool {
+        if (offset + 24 > unpackedData.size()) return false;
+        return readU32(unpackedData, offset + 0x00) == 0xAAAAAAAAu
+            && readU32(unpackedData, offset + 0x04) == 0x00000000u
+            && readU32(unpackedData, offset + 0x08) == 0x00000000u
+            && readU32(unpackedData, offset + 0x0C) == 0xAAAA0000u;
+    };
+
+    uint32_t strictCount = 0;
+    if (!foundLcsStreamingTable) {
+        for (size_t offset = 0; offset + 24 <= unpackedData.size(); offset += 4) {
+            if (!looksLikeStreamingEntry(offset)) continue;
+
+            uint32_t start = readU32(unpackedData, offset + 0x10);
+            uint32_t count = readU32(unpackedData, offset + 0x14);
+            if (!validStreamingPair(start, count)) continue;
+
+            addRecord(uint32_t(offset), uint32_t(offset + 0x10), uint32_t(offset + 0x14),
+                      start, count, "VCS 0x18-byte GAME.DTZ gta3PS*.img streaming entry");
+            strictCount++;
+        }
+    }
+
+    if (!foundLcsStreamingTable && strictCount == 0) {
+        for (size_t offset = 0; offset + 24 <= unpackedData.size(); offset += 4) {
+            uint32_t a = readU32(unpackedData, offset + 0x00);
+            uint32_t b = readU32(unpackedData, offset + 0x04);
+            uint32_t c = readU32(unpackedData, offset + 0x08);
+            uint32_t d = readU32(unpackedData, offset + 0x0C);
+            uint32_t start = readU32(unpackedData, offset + 0x10);
+            uint32_t count = readU32(unpackedData, offset + 0x14);
+            if ((a == 0xAAAAAAAAu || a == 0x00000000u || a == 0xFFFFFFFFu) && b == 0 && c == 0 &&
+                (d == 0x0000AAAAu || d == 0xAAAAAAAAu || d == 0)) {
+                if (validStreamingPair(start, count)) {
+                    addRecord(uint32_t(offset), uint32_t(offset + 0x10), uint32_t(offset + 0x14),
+                              start, count, "loose 24-byte sector pair candidate");
+                }
+            }
+        }
+    }
+
+    auto nameHasUsefulDtzExtension = [](const std::string& name) -> bool {
+        if (name.empty()) return false;
+        bool hasAlnum = false;
+        for (char c : name) {
+            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+                hasAlnum = true;
+                break;
+            }
+        }
+        if (!hasAlnum) return false;
+        std::string lower = name;
+        std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+        static const char* extensions[] = {
+            ".mdl", ".xtx", ".chk", ".tex", ".anim", ".ifp", ".cut", ".dat", ".col", ".col2", ".wdr", ".wrld", ".raw", ".sdt", ".cam", ".gxt"
+        };
+        for (const char* ext : extensions) {
+            if (lower.size() >= std::strlen(ext) && lower.rfind(ext) == lower.size() - std::strlen(ext)) return true;
+        }
+        return false;
+    };
+
+    if (!foundLcsStreamingTable && strictCount == 0) {
+        for (size_t offset = 0; offset + 32u <= unpackedData.size(); offset += 4u) {
+            std::string name = readDirName(unpackedData, offset, 24u);
+            if (!looksLikeDirName(name) || !nameHasUsefulDtzExtension(name)) continue;
+
+            uint32_t start = readU32(unpackedData, offset + 24u);
+            uint32_t count = readU32(unpackedData, offset + 28u);
+            if (!validStreamingPair(start, count)) continue;
+            if (!seenOffsets.insert({uint32_t(offset + 24u), uint32_t(offset + 28u)}).second) continue;
+
+            StorylandDtzSectorRecord record;
+            record.recordOffset = uint32_t(offset);
+            record.startOffset = uint32_t(offset + 24u);
+            record.countOffset = uint32_t(offset + 28u);
+            record.startSector = start;
+            record.sectorCount = count;
+            record.source = "generic internal 32-byte ASCII DIR entry";
+            record.resourceName = name;
+            record.note = "Name + sector pair scanned from DTZ contents; no strict gta3PS*.img table was found.";
+            records.push_back(record);
+        }
+    }
+
+    std::sort(records.begin(), records.end(), [](const StorylandDtzSectorRecord& left, const StorylandDtzSectorRecord& right) {
+        if (left.startSector != right.startSector) return left.startSector < right.startSector;
+        if (left.sectorCount != right.sectorCount) return left.sectorCount < right.sectorCount;
+        return left.recordOffset < right.recordOffset;
+    });
+}
+
+static bool dtzValidOffset(const std::vector<uint8_t>& data, uint32_t offset) {
+    return offset >= 0xE0 && offset < data.size();
+}
+
+static uint32_t dtzDataLimit(const std::vector<uint8_t>& data) {
+    uint32_t declaredDataEnd = readU32(data, 0x0C);
+    uint32_t relocationTable = readU32(data, 0x10);
+    uint32_t limit = uint32_t(data.size());
+    if (declaredDataEnd >= 0xE0 && declaredDataEnd < limit) limit = declaredDataEnd;
+    if (relocationTable >= 0xE0 && relocationTable < limit) limit = relocationTable;
+    return limit;
+}
+
+static std::string hexForValue(uint32_t value) {
+    std::ostringstream ss;
+    ss << "0x" << std::uppercase << std::hex << std::setw(8) << std::setfill('0') << value;
+    return ss.str();
+}
+
+static std::string formatSignedInt(int32_t value) {
+    std::ostringstream ss;
+    ss << value;
+    return ss.str();
+}
+
+static bool parseUnsignedText(const std::string& text, uint64_t& valueOut) {
+    errno = 0;
+    char* end = nullptr;
+    valueOut = std::strtoull(text.c_str(), &end, 0);
+    if (errno != 0 || end == text.c_str()) return false;
+    while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') ++end;
+    return *end == '\0';
+}
+
+static bool parseSignedText(const std::string& text, int64_t& valueOut) {
+    errno = 0;
+    char* end = nullptr;
+    valueOut = std::strtoll(text.c_str(), &end, 0);
+    if (errno != 0 || end == text.c_str()) return false;
+    while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') ++end;
+    return *end == '\0';
+}
+
+static bool parseFloatText(const std::string& text, float& valueOut) {
+    errno = 0;
+    char* end = nullptr;
+    double value = std::strtod(text.c_str(), &end);
+    if (errno != 0 || end == text.c_str()) return false;
+    while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') ++end;
+    if (*end != '\0') return false;
+    if (!std::isfinite(value)) return false;
+    valueOut = static_cast<float>(value);
+    return std::isfinite(valueOut);
+}
+
+static bool isPrintableAsciiByte(uint8_t value) {
+    return value >= 0x20 && value <= 0x7E;
+}
+
+static bool hasAsciiNameAt(const std::vector<uint8_t>& data, uint32_t offset, size_t length, const char* prefix) {
+    if (offset + length > data.size()) return false;
+    std::string name = readFixedAscii(data, offset, length);
+    if (name.empty()) return false;
+    for (char c : name) {
+        if (c != '.' && (static_cast<unsigned char>(c) < 0x20 || static_cast<unsigned char>(c) > 0x7E)) return false;
+    }
+    if (prefix == nullptr || prefix[0] == '\0') return true;
+    return name.rfind(prefix, 0) == 0;
+}
+
+static void addDtzDataField(
+    std::vector<StorylandDtzDataField>& fields,
+    size_t blockIndex,
+    const StorylandDtzDataBlock& block,
+    uint32_t rowIndex,
+    uint32_t absoluteOffset,
+    uint32_t relativeOffset,
+    uint32_t size,
+    const std::string& rowLabel,
+    const std::string& name,
+    const std::string& type,
+    const std::string& valueText,
+    bool editable,
+    const std::string& note
+) {
+    StorylandDtzDataField field;
+    field.blockIndex = blockIndex;
+    field.rowIndex = rowIndex;
+    field.absoluteOffset = absoluteOffset;
+    field.relativeOffset = relativeOffset;
+    field.size = size;
+    field.blockName = block.name;
+    field.rowLabel = rowLabel;
+    field.name = name;
+    field.type = type;
+    field.valueText = valueText;
+    field.editable = editable;
+    field.note = note;
+    fields.push_back(field);
+}
+
+static std::string byteValueText(uint8_t value) {
+    std::ostringstream ss;
+    ss << unsigned(value) << " / 0x" << std::uppercase << std::hex << std::setw(2) << std::setfill('0') << unsigned(value);
+    return ss.str();
+}
+
+static std::string u16ValueText(uint16_t value) {
+    std::ostringstream ss;
+    ss << value << " / 0x" << std::uppercase << std::hex << std::setw(4) << std::setfill('0') << value;
+    return ss.str();
+}
+
+static std::string i16ValueText(int16_t value) {
+    std::ostringstream ss;
+    ss << value << " / 0x" << std::uppercase << std::hex << std::setw(4) << std::setfill('0') << uint16_t(value);
+    return ss.str();
+}
+
+static std::string u32ValueText(uint32_t value) {
+    std::ostringstream ss;
+    ss << value << " / " << hexForValue(value);
+    return ss.str();
+}
+
+static std::string i32ValueText(int32_t value) {
+    std::ostringstream ss;
+    ss << value << " / " << hexForValue(uint32_t(value));
+    return ss.str();
+}
+
+static std::string f32ValueText(const std::vector<uint8_t>& data, uint32_t offset) {
+    std::ostringstream ss;
+    float value = readFloat32(data, offset);
+    uint32_t raw = readU32(data, offset);
+    ss << formatFloat32(value) << " / raw=" << hexForValue(raw);
+    return ss.str();
+}
+
+static uint32_t clampRecordCountBySize(uint32_t offset, uint32_t recordSize, uint32_t wantedCount, uint32_t limit) {
+    if (recordSize == 0 || offset >= limit) return 0;
+    uint64_t maxCount = (uint64_t(limit) - uint64_t(offset)) / uint64_t(recordSize);
+    if (maxCount > 0xFFFFFFFFull) maxCount = 0xFFFFFFFFull;
+    if (wantedCount == 0 || wantedCount > maxCount) return uint32_t(maxCount);
+    return wantedCount;
+}
+
+static uint32_t inferNextHeaderPointerEnd(const std::vector<uint8_t>& data, uint32_t start) {
+    uint32_t limit = dtzDataLimit(data);
+    uint32_t end = limit;
+    for (uint32_t headerOffset = 0x20; headerOffset <= 0xDC; headerOffset += 4) {
+        uint32_t candidate = readU32(data, headerOffset);
+        if (candidate > start && candidate < end && candidate >= 0xE0 && candidate < limit) {
+            end = candidate;
+        }
+    }
+    return end;
+}
+
+static size_t appendDtzDataBlock(
+    std::vector<StorylandDtzDataBlock>& blocks,
+    const std::string& name,
+    const std::string& parser,
+    uint32_t headerOffset,
+    uint32_t offset,
+    uint32_t inferredEnd,
+    uint32_t rowSize,
+    uint32_t rowCount,
+    bool editable,
+    const std::string& note
+) {
+    StorylandDtzDataBlock block;
+    block.name = name;
+    block.parser = parser;
+    block.headerOffset = headerOffset;
+    block.offset = offset;
+    block.inferredEnd = inferredEnd;
+    block.rowSize = rowSize;
+    block.rowCount = rowCount;
+    if (rowSize != 0 && rowCount != 0) {
+        uint64_t sized = uint64_t(rowSize) * uint64_t(rowCount);
+        uint64_t maxSize = offset < inferredEnd ? uint64_t(inferredEnd - offset) : 0;
+        block.size = uint32_t(std::min(sized, maxSize));
+    } else {
+        block.size = offset < inferredEnd ? inferredEnd - offset : 0;
+    }
+    block.editable = editable;
+    block.note = note;
+    blocks.push_back(block);
+    return blocks.size() - 1;
+}
+
+static void appendGenericPreviewFields(
+    const std::vector<uint8_t>& data,
+    std::vector<StorylandDtzDataField>& fields,
+    size_t blockIndex,
+    const StorylandDtzDataBlock& block,
+    uint32_t maxRows
+) {
+    if (block.offset >= data.size() || block.rowSize == 0 || block.rowCount == 0) return;
+    uint32_t rows = std::min(block.rowCount, maxRows);
+    for (uint32_t row = 0; row < rows; ++row) {
+        uint32_t rowOffset = block.offset + row * block.rowSize;
+        if (rowOffset + block.rowSize > data.size()) break;
+        std::ostringstream rowLabel;
+        rowLabel << "record " << row;
+        for (uint32_t rel = 0; rel + 4 <= block.rowSize; rel += 4) {
+            uint32_t off = rowOffset + rel;
+            std::ostringstream name;
+            name << "+0x" << std::uppercase << std::hex << std::setw(2) << std::setfill('0') << rel;
+            addDtzDataField(fields, blockIndex, block, row, off, rel, 4, rowLabel.str(), name.str() + " u32", "u32", u32ValueText(readU32(data, off)), block.editable, "generic u32 view/edit of this row slot");
+            addDtzDataField(fields, blockIndex, block, row, off, rel, 4, rowLabel.str(), name.str() + " f32", "float", f32ValueText(data, off), block.editable, "same four bytes viewed as float");
+        }
+    }
+}
+
+static void appendCarcolsPaletteFields(
+    const std::vector<uint8_t>& data,
+    std::vector<StorylandDtzDataField>& fields,
+    size_t blockIndex,
+    const StorylandDtzDataBlock& block
+) {
+    for (uint32_t row = 0; row < block.rowCount; ++row) {
+        uint32_t base = block.offset + row * 4;
+        if (base + 4 > data.size()) break;
+        std::ostringstream rowLabel;
+        rowLabel << "color " << row;
+        addDtzDataField(fields, blockIndex, block, row, base + 0, 0, 1, rowLabel.str(), "red", "u8", byteValueText(data[base + 0]), true, "RGBA palette byte used by carcols-style data");
+        addDtzDataField(fields, blockIndex, block, row, base + 1, 1, 1, rowLabel.str(), "green", "u8", byteValueText(data[base + 1]), true, "RGBA palette byte used by carcols-style data");
+        addDtzDataField(fields, blockIndex, block, row, base + 2, 2, 1, rowLabel.str(), "blue", "u8", byteValueText(data[base + 2]), true, "RGBA palette byte used by carcols-style data");
+        addDtzDataField(fields, blockIndex, block, row, base + 3, 3, 1, rowLabel.str(), "alpha", "u8", byteValueText(data[base + 3]), true, "RGBA palette byte used by carcols-style data");
+    }
+}
+
+static void appendCullFields(
+    const std::vector<uint8_t>& data,
+    std::vector<StorylandDtzDataField>& fields,
+    size_t blockIndex,
+    const StorylandDtzDataBlock& block
+) {
+    const uint32_t safeRows = std::min<uint32_t>(block.rowCount, 16384u);
+    for (uint32_t row = 0; row < safeRows; ++row) {
+        uint32_t base = block.offset + row * 16;
+        if (base + 16 > data.size()) break;
+        std::ostringstream rowLabel;
+        rowLabel << "cull " << row;
+        const char* names[8] = {"boxLowerX", "boxUpperX", "boxLowerY", "boxUpperY", "boxLowerZ", "boxUpperZ", "flag1", "flag2"};
+        for (uint32_t i = 0; i < 8; ++i) {
+            uint32_t off = base + i * 2;
+            std::string type = i < 6 ? "i16" : "u16";
+            std::string value = i < 6 ? i16ValueText(readI16(data, off)) : u16ValueText(readU16(data, off));
+            addDtzDataField(fields, blockIndex, block, row, off, i * 2, 2, rowLabel.str(), names[i], type, value, true, "cull.ipl 16-byte record field");
+        }
+    }
+}
+
+static uint32_t countPedstatPointers(const std::vector<uint8_t>& data, uint32_t pointerTable) {
+    if (!dtzValidOffset(data, pointerTable)) return 0;
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < 128; ++i) {
+        uint32_t ptr = readU32(data, pointerTable + i * 4);
+        if (!dtzValidOffset(data, ptr) || ptr + 0x34 > data.size()) break;
+        if (!hasAsciiNameAt(data, ptr + 0x1A, 26, "STAT_")) break;
+        count++;
+    }
+    return count;
+}
+
+static void appendPedstatFields(
+    const std::vector<uint8_t>& data,
+    std::vector<StorylandDtzDataField>& fields,
+    size_t blockIndex,
+    const StorylandDtzDataBlock& block
+) {
+    for (uint32_t row = 0; row < block.rowCount; ++row) {
+        uint32_t recordPtrOffset = block.offset + row * 4;
+        uint32_t base = readU32(data, recordPtrOffset);
+        if (!dtzValidOffset(data, base) || base + 0x34 > data.size()) break;
+        std::string name = readFixedAscii(data, base + 0x1A, 26);
+        std::ostringstream rowLabel;
+        rowLabel << row << " " << name;
+        addDtzDataField(fields, blockIndex, block, row, recordPtrOffset, row * 4, 4, rowLabel.str(), "record pointer", "u32", u32ValueText(base), false, "pointer table entry; not edited here until relocation handling is safer");
+        addDtzDataField(fields, blockIndex, block, row, base + 0x00, 0x00, 4, rowLabel.str(), "iNumber", "i32", i32ValueText(readI32(data, base + 0x00)), true, "VCS pedstats record");
+        addDtzDataField(fields, blockIndex, block, row, base + 0x04, 0x04, 4, rowLabel.str(), "fFleeDistance", "float", f32ValueText(data, base + 0x04), true, "VCS pedstats record");
+        addDtzDataField(fields, blockIndex, block, row, base + 0x08, 0x08, 4, rowLabel.str(), "fHeadingChangeRate", "float", f32ValueText(data, base + 0x08), true, "VCS pedstats record");
+        addDtzDataField(fields, blockIndex, block, row, base + 0x0C, 0x0C, 4, rowLabel.str(), "fAttackStrength", "float", f32ValueText(data, base + 0x0C), true, "VCS pedstats record");
+        addDtzDataField(fields, blockIndex, block, row, base + 0x10, 0x10, 4, rowLabel.str(), "fDefendWeakness", "float", f32ValueText(data, base + 0x10), true, "VCS pedstats record");
+        addDtzDataField(fields, blockIndex, block, row, base + 0x14, 0x14, 1, rowLabel.str(), "btStatFlags", "u8", byteValueText(data[base + 0x14]), true, "VCS pedstats record byte");
+        addDtzDataField(fields, blockIndex, block, row, base + 0x15, 0x15, 1, rowLabel.str(), "btZero", "u8", byteValueText(data[base + 0x15]), true, "VCS pedstats record byte");
+        addDtzDataField(fields, blockIndex, block, row, base + 0x16, 0x16, 1, rowLabel.str(), "btFear", "u8", byteValueText(data[base + 0x16]), true, "VCS pedstats record byte");
+        addDtzDataField(fields, blockIndex, block, row, base + 0x17, 0x17, 1, rowLabel.str(), "btTemper", "u8", byteValueText(data[base + 0x17]), true, "VCS pedstats record byte");
+        addDtzDataField(fields, blockIndex, block, row, base + 0x18, 0x18, 1, rowLabel.str(), "btLawfulness", "u8", byteValueText(data[base + 0x18]), true, "VCS pedstats record byte");
+        addDtzDataField(fields, blockIndex, block, row, base + 0x19, 0x19, 1, rowLabel.str(), "btView", "u8", byteValueText(data[base + 0x19]), true, "VCS pedstats record byte");
+        addDtzDataField(fields, blockIndex, block, row, base + 0x1A, 0x1A, 26, rowLabel.str(), "name", "ascii", name, false, "fixed 26-byte name; view-only in this patch");
+    }
+}
+
+static bool looksLikeParticleRow(const std::vector<uint8_t>& data, uint32_t offset) {
+    if (offset + 24 > data.size()) return false;
+    std::string name = readFixedAscii(data, offset + 4, 20);
+    if (name.size() < 2) return false;
+    int letters = 0;
+    for (char c : name) {
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_' || c == '-' || (c >= '0' && c <= '9')) letters++;
+    }
+    return letters >= 2;
+}
+
+static void appendParticlePreviewFields(
+    const std::vector<uint8_t>& data,
+    std::vector<StorylandDtzDataField>& fields,
+    size_t blockIndex,
+    const StorylandDtzDataBlock& block
+) {
+    uint32_t rows = std::min(block.rowCount, 128u);
+    for (uint32_t row = 0; row < rows; ++row) {
+        uint32_t base = block.offset + row * block.rowSize;
+        if (base + block.rowSize > data.size()) break;
+        if (!looksLikeParticleRow(data, base)) continue;
+        std::string rowName = readFixedAscii(data, base + 4, 20);
+        std::ostringstream rowLabel;
+        rowLabel << row << " " << rowName;
+        addDtzDataField(fields, blockIndex, block, row, base + 0x00, 0x00, 4, rowLabel.str(), "dwID", "u32", u32ValueText(readU32(data, base + 0x00)), true, "particle row ID");
+        addDtzDataField(fields, blockIndex, block, row, base + 0x04, 0x04, 20, rowLabel.str(), "Name", "ascii", rowName, false, "particle name");
+        for (uint32_t rel = 0x18; rel + 4 <= std::min(block.rowSize, 0x54u); rel += 4) {
+            uint32_t off = base + rel;
+            std::ostringstream name;
+            name << "+0x" << std::uppercase << std::hex << std::setw(2) << std::setfill('0') << rel;
+            addDtzDataField(fields, blockIndex, block, row, off, rel, 4, rowLabel.str(), name.str() + " f32/u32", "float", f32ValueText(data, off), true, "particle numeric field; shown by offset and storage type");
+        }
+    }
+}
+
+static void appendTimecycFields(
+    const std::vector<uint8_t>& data,
+    std::vector<StorylandDtzDataField>& fields,
+    size_t blockIndex,
+    const StorylandDtzDataBlock& block
+) {
+    if (block.rowSize == 36 && block.rowCount > 0) {
+        static const char* channelNames[9] = {
+            "ambient.r",
+            "ambient.g",
+            "ambient.b",
+            "directional.r",
+            "directional.g",
+            "directional.b",
+            "sky/top.r",
+            "sky/top.g",
+            "sky/top.b"
+        };
+
+        for (uint32_t row = 0; row < block.rowCount; ++row) {
+            uint32_t base = block.offset + row * block.rowSize;
+            if (base + block.rowSize > data.size()) break;
+
+            uint32_t weather = row / 24u;
+            uint32_t hour = row % 24u;
+            std::ostringstream rowLabel;
+            if (block.rowCount >= 24 && (block.rowCount % 24u) == 0) {
+                rowLabel << "weather " << weather << " hour " << std::setw(2) << std::setfill('0') << hour;
+            } else {
+                rowLabel << "hour row " << row;
+            }
+
+            for (uint32_t channel = 0; channel < 9; ++channel) {
+                uint32_t rel = channel * 4;
+                std::ostringstream note;
+                note << "Compact hourly timecycle row: 36 bytes containing 9 float channels grouped as three RGB triplets. Offsets and values are shown directly so each channel can be edited without changing the row layout.";
+                addDtzDataField(fields, blockIndex, block, row, base + rel, rel, 4, rowLabel.str(), channelNames[channel], "float", f32ValueText(data, base + rel), true, note.str());
+            }
+        }
+        return;
+    }
+
+    uint32_t dwordCount = block.size / 4;
+    uint32_t shown = std::min(dwordCount, 512u);
+    for (uint32_t i = 0; i < shown; ++i) {
+        uint32_t off = block.offset + i * 4;
+        if (off + 4 > data.size()) break;
+        std::ostringstream rowLabel;
+        rowLabel << "dword " << i << " +0x" << std::uppercase << std::hex << std::setw(4) << std::setfill('0') << (i * 4);
+        addDtzDataField(fields, blockIndex, block, i, off, i * 4, 4, rowLabel.str(), "float value", "float", f32ValueText(data, off), true, "timecyc.dat raw dword viewed as float");
+        addDtzDataField(fields, blockIndex, block, i, off, i * 4, 4, rowLabel.str(), "raw u32", "u32", u32ValueText(readU32(data, off)), true, "same timecyc.dat dword viewed as raw u32");
+    }
+}
+
+static bool finiteFloatInRange(const std::vector<uint8_t>& data, uint32_t offset, float minValue, float maxValue) {
+    if (offset + 4 > data.size()) return false;
+    float value = readFloat32(data, offset);
+    return std::isfinite(value) && value >= minValue && value <= maxValue;
+}
+
+static uint32_t scoreVcsWeaponRecord(const std::vector<uint8_t>& data, uint32_t offset) {
+    if (offset + 0x70 > data.size()) return 0;
+    uint32_t score = 0;
+    int32_t fireType = readI32(data, offset + 0x04);
+    int32_t firingRate = readI32(data, offset + 0x0C);
+    int32_t reload = readI32(data, offset + 0x10);
+    int32_t ammo = readI32(data, offset + 0x14);
+    int32_t damage = readI32(data, offset + 0x18);
+    uint32_t paddingA = readU32(data, offset + 0x2C);
+    uint32_t paddingB = readU32(data, offset + 0x6C);
+    uint32_t zero3C = readU32(data, offset + 0x3C);
+
+    if (fireType >= 0 && fireType <= 8) score += 4;
+    if (finiteFloatInRange(data, offset + 0x08, 0.0f, 1000.0f)) score += 5;
+    if (firingRate >= 0 && firingRate <= 10000) score += 3;
+    if (reload >= 0 && reload <= 10000) score += 3;
+    if (ammo >= 0 && ammo <= 100000) score += 2;
+    if (damage >= 0 && damage <= 5000) score += 3;
+    if (finiteFloatInRange(data, offset + 0x1C, -10.0f, 10000.0f)) score += 2;
+    if (finiteFloatInRange(data, offset + 0x20, -10.0f, 10000.0f)) score += 2;
+    if (finiteFloatInRange(data, offset + 0x24, -10.0f, 10000.0f)) score += 2;
+    if (finiteFloatInRange(data, offset + 0x28, -10.0f, 10000.0f)) score += 2;
+    if (paddingA == 0xAAAAAAAAu) score += 8;
+    if (paddingB == 0xAAAAAAAAu) score += 8;
+    if (zero3C == 0) score += 2;
+    return score;
+}
+
+static uint32_t scoreVcsWeaponBlock(const std::vector<uint8_t>& data, uint32_t offset, uint32_t count) {
+    if (offset + uint64_t(count) * 0x70ull > data.size()) return 0;
+    uint32_t total = 0;
+    for (uint32_t row = 0; row < count; ++row) {
+        uint32_t score = scoreVcsWeaponRecord(data, offset + row * 0x70);
+        if (score < 20) return 0;
+        total += score;
+    }
+    return total;
+}
+
+static bool findVcsWeaponBlock(const std::vector<uint8_t>& data, uint32_t& offsetOut, uint32_t& countOut, uint32_t& scoreOut) {
+    uint32_t limit = dtzDataLimit(data);
+    uint32_t bestOffset = 0;
+    uint32_t bestCount = 0;
+    uint32_t bestScore = 0;
+
+    auto testCandidate = [&](uint32_t offset, uint32_t count) {
+        if (!dtzValidOffset(data, offset) || offset + uint64_t(count) * 0x70ull > limit) return;
+        uint32_t score = scoreVcsWeaponBlock(data, offset, count);
+        if (score > bestScore) {
+            bestScore = score;
+            bestOffset = offset;
+            bestCount = count;
+        }
+    };
+
+    testCandidate(0x003D7530u, 40);
+    testCandidate(0x0040A980u, 38);
+    testCandidate(0x0044FAE0u, 38);
+    testCandidate(readU32(data, 0xBC), 40);
+    testCandidate(readU32(data, 0xBC), 38);
+
+    for (uint32_t offset = 0xE0; offset + 0x70u * 38u <= limit; offset += 0x10) {
+        if (readU32(data, offset + 0x2C) != 0xAAAAAAAAu) continue;
+        if (!finiteFloatInRange(data, offset + 0x08, 0.0f, 1000.0f)) continue;
+        testCandidate(offset, 40);
+        testCandidate(offset, 38);
+    }
+
+    if (bestScore == 0) return false;
+    offsetOut = bestOffset;
+    countOut = bestCount;
+    scoreOut = bestScore;
+    return true;
+}
+
+static void appendVcsWeaponFields(
+    const std::vector<uint8_t>& data,
+    std::vector<StorylandDtzDataField>& fields,
+    size_t blockIndex,
+    const StorylandDtzDataBlock& block
+) {
+    for (uint32_t row = 0; row < block.rowCount; ++row) {
+        uint32_t base = block.offset + row * 0x70;
+        if (base + 0x70 > data.size()) break;
+
+        int32_t weaponSlot = readI32(data, base + 0x68);
+        int32_t modelId = readI32(data, base + 0x60);
+        int32_t model2Id = readI32(data, base + 0x64);
+
+        std::ostringstream rowLabel;
+        rowLabel << "weapon " << std::setw(2) << std::setfill('0') << row
+                 << "  slot=" << weaponSlot
+                 << "  model=" << modelId;
+        if (model2Id != -1) rowLabel << "/" << model2Id;
+
+        auto addU32 = [&](uint32_t rel, const std::string& name, bool editable, const std::string& note) {
+            addDtzDataField(fields, blockIndex, block, row, base + rel, rel, 4, rowLabel.str(), name, "u32", u32ValueText(readU32(data, base + rel)), editable, note);
+        };
+        auto addI32 = [&](uint32_t rel, const std::string& name, bool editable, const std::string& note) {
+            addDtzDataField(fields, blockIndex, block, row, base + rel, rel, 4, rowLabel.str(), name, "i32", i32ValueText(readI32(data, base + rel)), editable, note);
+        };
+        auto addF32 = [&](uint32_t rel, const std::string& name, bool editable, const std::string& note) {
+            addDtzDataField(fields, blockIndex, block, row, base + rel, rel, 4, rowLabel.str(), name, "float", f32ValueText(data, base + rel), editable, note);
+        };
+
+        addU32(0x00, "dwType / weapon type flags", true, "VCS weapon.dat leading DWORD; documented VCS-only field before iFireType");
+        addI32(0x04, "iFireType", true, "weapon.dat fire type");
+        addF32(0x08, "fRange", true, "weapon.dat range");
+        addI32(0x0C, "iFiringRate", true, "weapon.dat firing rate");
+        addI32(0x10, "iReload", true, "weapon.dat reload time");
+        addI32(0x14, "iAmountOfAmmunition", true, "weapon.dat ammo amount");
+        addI32(0x18, "iDamage", true, "weapon.dat damage");
+        addF32(0x1C, "fSpeed", true, "weapon.dat projectile/speed value");
+        addF32(0x20, "fRadius", true, "weapon.dat radius");
+        addF32(0x24, "fLifeSpan", true, "weapon.dat lifespan");
+        addF32(0x28, "fSpread", true, "weapon.dat spread");
+        addU32(0x2C, "padding_0x2C", false, "padding/sentinel, normally 0xAAAAAAAA in the VCS PS2 block");
+        addF32(0x30, "m_vFireOffset.x", true, "weapon.dat muzzle/fire offset vector x");
+        addF32(0x34, "m_vFireOffset.y", true, "weapon.dat muzzle/fire offset vector y");
+        addF32(0x38, "m_vFireOffset.z", true, "weapon.dat muzzle/fire offset vector z");
+        addU32(0x3C, "_f3C / zero", true, "documented VCS unknown DWORD, usually zero");
+        addU32(0x40, "_f40 / anim-or-effect id", true, "documented VCS integer field after fire offset");
+        addU32(0x44, "_f44 / unknown dword", true, "documented VCS unknown DWORD");
+        addF32(0x48, "m_vTimeStrc0.x", true, "weapon.dat timing vector 0 x");
+        addF32(0x4C, "m_vTimeStrc0.y", true, "weapon.dat timing vector 0 y");
+        addF32(0x50, "m_vTimeStrc0.z", true, "weapon.dat timing vector 0 z");
+        addF32(0x54, "m_vTimeStrc1.x", true, "weapon.dat timing vector 1 x");
+        addF32(0x58, "m_vTimeStrc1.y", true, "weapon.dat timing vector 1 y");
+        addF32(0x5C, "m_vTimeStrc1.z", true, "weapon.dat timing vector 1 z");
+        addI32(0x60, "dwModelID / documented unk slot", true, "In the tested VCS PS2 block this behaves like the primary model id; some old docs describe this offset as an unknown/float slot, so Storyland keeps the offset explicit");
+        addI32(0x64, "dwModel2ID", true, "secondary model id; -1 means none/null on many records");
+        addI32(0x68, "dwWeaponSlot", true, "weapon slot/index field visible in the tested VCS PS2 weapon table");
+        addU32(0x6C, "padding_0x6C", false, "padding/sentinel, normally 0xAAAAAAAA in the tested VCS PS2 block");
+    }
+}
+
+
+static void appendLeeds2dfxFields(
+    const std::vector<StorylandDtz2dfxEffect>& effects,
+    std::vector<StorylandDtzDataField>& fields,
+    size_t blockIndex,
+    const StorylandDtzDataBlock& block
+) {
+    for (const StorylandDtz2dfxEffect& effect : effects) {
+        if (effect.rowOffset < block.offset || effect.rowOffset >= block.inferredEnd) continue;
+        std::ostringstream rowLabel;
+        rowLabel << "effect[" << effect.index << "] " << dtzLeeds2dfxEffectTypeName(effect.effectType);
+        if (effect.hasModelAssociation) {
+            rowLabel << " model=" << effect.modelIndex << " hash=" << hex32(effect.modelHash);
+        }
+
+        const uint32_t base = effect.rowOffset;
+        addDtzDataField(fields, blockIndex, block, effect.index, base + 0x00u, 0x00u, 4u, rowLabel.str(), "position.x", "float", formatFloat32(effect.localX), false, "native model-space Leeds C2dEffect position x");
+        addDtzDataField(fields, blockIndex, block, effect.index, base + 0x04u, 0x04u, 4u, rowLabel.str(), "position.y", "float", formatFloat32(effect.localY), false, "native model-space Leeds C2dEffect position y");
+        addDtzDataField(fields, blockIndex, block, effect.index, base + 0x08u, 0x08u, 4u, rowLabel.str(), "position.z", "float", formatFloat32(effect.localZ), false, "native model-space Leeds C2dEffect position z");
+        addDtzDataField(fields, blockIndex, block, effect.index, base + 0x0Cu, 0x0Cu, 4u, rowLabel.str(), "position.w", "float", formatFloat32(effect.positionW), false, "fourth serialized position component");
+        addDtzDataField(fields, blockIndex, block, effect.index, base + 0x10u, 0x10u, 1u, rowLabel.str(), "red", "u8", byteValueText(effect.red), false, "effect color red");
+        addDtzDataField(fields, blockIndex, block, effect.index, base + 0x11u, 0x11u, 1u, rowLabel.str(), "green", "u8", byteValueText(effect.green), false, "effect color green");
+        addDtzDataField(fields, blockIndex, block, effect.index, base + 0x12u, 0x12u, 1u, rowLabel.str(), "blue", "u8", byteValueText(effect.blue), false, "effect color blue");
+        addDtzDataField(fields, blockIndex, block, effect.index, base + 0x13u, 0x13u, 1u, rowLabel.str(), "alpha", "u8", byteValueText(effect.alpha), false, "effect color alpha");
+        addDtzDataField(fields, blockIndex, block, effect.index, base + 0x14u, 0x14u, 1u, rowLabel.str(), "effectType", "u8", byteValueText(effect.effectType), false, "0=LIGHT, 1=PARTICLE, 2=ATTRACTOR, 3=PED_BEHAVIOUR");
+
+        if (effect.effectType == 0u) {
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x18u, 0x18u, 4u, rowLabel.str(), "lightDistance", "float", formatFloat32(effect.coronaFarClip), false, "corona/far distance");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x1Cu, 0x1Cu, 4u, rowLabel.str(), "lightOuterRange", "float", formatFloat32(effect.pointLightRange), false, "point-light outer range");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x20u, 0x20u, 4u, rowLabel.str(), "lightSize", "float", formatFloat32(effect.coronaSize), false, "corona/light sprite size");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x24u, 0x24u, 4u, rowLabel.str(), "lightInnerRange", "float", formatFloat32(effect.shadowSize), false, "point-light inner range");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x28u, 0x28u, 1u, rowLabel.str(), "lightFlash", "u8", byteValueText(effect.lightType), false, "steady/night/flicker/flash behavior");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x29u, 0x29u, 1u, rowLabel.str(), "lightWet", "u8", byteValueText(effect.roadReflection), false, "wet-road reflection mode");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x2Au, 0x2Au, 1u, rowLabel.str(), "lightFlare", "u8", byteValueText(effect.flareType), false, "lens flare mode");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x2Bu, 0x2Bu, 1u, rowLabel.str(), "shadowIntensity", "u8", byteValueText(effect.shadowIntensity), false, "shadow intensity");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x2Cu, 0x2Cu, 1u, rowLabel.str(), "lightFlags", "u8", byteValueText(effect.flags), false, "native Leeds light flags");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x30u, 0x30u, 4u, rowLabel.str(), "coronaTexturePointer", "u32", u32ValueText(effect.coronaTexturePointer), false, "relocated corona texture pointer");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x34u, 0x34u, 4u, rowLabel.str(), "shadowTexturePointer", "u32", u32ValueText(effect.shadowTexturePointer), false, "relocated shadow texture pointer");
+        } else if (effect.effectType == 1u) {
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x18u, 0x18u, 4u, rowLabel.str(), "particleSubtype", "i32", formatSignedInt(effect.particleSubtype), false, "particle effect subtype");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x1Cu, 0x1Cu, 4u, rowLabel.str(), "direction.x", "float", formatFloat32(effect.directionX), false, "particle direction x");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x20u, 0x20u, 4u, rowLabel.str(), "direction.y", "float", formatFloat32(effect.directionY), false, "particle direction y");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x24u, 0x24u, 4u, rowLabel.str(), "direction.z", "float", formatFloat32(effect.directionZ), false, "particle direction z");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x28u, 0x28u, 4u, rowLabel.str(), "particleScale", "float", formatFloat32(effect.particleScale), false, "particle scale");
+        } else if (effect.effectType == 2u) {
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x18u, 0x18u, 4u, rowLabel.str(), "direction.x", "float", formatFloat32(effect.directionX), false, "attractor direction x");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x1Cu, 0x1Cu, 4u, rowLabel.str(), "direction.y", "float", formatFloat32(effect.directionY), false, "attractor direction y");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x20u, 0x20u, 4u, rowLabel.str(), "direction.z", "float", formatFloat32(effect.directionZ), false, "attractor direction z");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x24u, 0x24u, 1u, rowLabel.str(), "attractorSubtype", "u8", byteValueText(effect.attractorSubtype), false, "attractor subtype");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x25u, 0x25u, 1u, rowLabel.str(), "attractorProbability", "u8", byteValueText(effect.attractorProbability), false, "attractor probability");
+        } else if (effect.effectType == 3u) {
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x18u, 0x18u, 4u, rowLabel.str(), "direction.x", "float", formatFloat32(effect.directionX), false, "ped behavior direction x");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x1Cu, 0x1Cu, 4u, rowLabel.str(), "direction.y", "float", formatFloat32(effect.directionY), false, "ped behavior direction y");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x20u, 0x20u, 4u, rowLabel.str(), "direction.z", "float", formatFloat32(effect.directionZ), false, "ped behavior direction z");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x24u, 0x24u, 4u, rowLabel.str(), "rotation.x", "float", formatFloat32(effect.pedRotationX), false, "ped behavior rotation x");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x28u, 0x28u, 4u, rowLabel.str(), "rotation.y", "float", formatFloat32(effect.pedRotationY), false, "ped behavior rotation y");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x2Cu, 0x2Cu, 4u, rowLabel.str(), "rotation.z", "float", formatFloat32(effect.pedRotationZ), false, "ped behavior rotation z");
+            addDtzDataField(fields, blockIndex, block, effect.index, base + 0x30u, 0x30u, 1u, rowLabel.str(), "pedSubtype", "u8", byteValueText(effect.pedSubtype), false, "ped behavior subtype");
+        }
+    }
+}
+void StorylandDtzArchive::rebuildDataBlocksAndFields() {
+    dataBlocksCache.clear();
+    dataFieldsCache.clear();
+    if (unpackedData.size() < 0xE0) return;
+
+    const uint32_t limit = dtzDataLimit(unpackedData);
+    std::set<uint32_t> addedRawOffsets;
+
+    for (const StorylandDtzHeaderField& header : headers) {
+        uint32_t value = header.value;
+        if (!dtzValidOffset(unpackedData, value) || value >= limit) continue;
+        if (!addedRawOffsets.insert(value).second) continue;
+        uint32_t end = inferNextHeaderPointerEnd(unpackedData, value);
+        std::ostringstream note;
+        note << "real range derived from GTAG header field " << hexOffset(header.offset)
+             << "; end is the next higher valid header pointer or relocation/data limit";
+        appendDtzDataBlock(dataBlocksCache, header.name, "raw-scanned-header-pointer", header.offset, value, end, 4, (end > value ? (end - value) / 4 : 0), false, note.str());
+    }
+
+    auto findBlockByName = [&](const std::string& name) -> size_t {
+        for (size_t i = 0; i < dataBlocksCache.size(); ++i) {
+            if (dataBlocksCache[i].name == name) return i;
+        }
+        return size_t(-1);
+    };
+
+    uint32_t objectOffset = readU32(unpackedData, 0x74);
+    if (dtzValidOffset(unpackedData, objectOffset)) {
+        uint32_t count = clampRecordCountBySize(objectOffset, 32, 117, limit);
+        size_t blockIndex = appendDtzDataBlock(dataBlocksCache, "object.dat records", "object.dat-32-byte-records", 0x74, objectOffset, std::min<uint32_t>(limit, objectOffset + count * 32), 32, count, true, "object.dat analogue parsed from real header pointer 0x74; documented 32-byte rows, 117 rows on known builds");
+        appendGenericPreviewFields(unpackedData, dataFieldsCache, blockIndex, dataBlocksCache[blockIndex], count);
+    }
+
+    uint32_t carcolsOffset = readU32(unpackedData, 0x78);
+    if (dtzValidOffset(unpackedData, carcolsOffset)) {
+        uint32_t count = clampRecordCountBySize(carcolsOffset, 4, 256, limit);
+        size_t blockIndex = appendDtzDataBlock(dataBlocksCache, "carcols.dat RGBA palette", "carcols-rgba-palette", 0x78, carcolsOffset, std::min<uint32_t>(limit, carcolsOffset + count * 4), 4, count, true, "256 RGBA color table parsed from real header pointer 0x78 when present");
+        appendCarcolsPaletteFields(unpackedData, dataFieldsCache, blockIndex, dataBlocksCache[blockIndex]);
+    }
+
+    uint32_t cullA = readU32(unpackedData, 0x94);
+    uint32_t cullB = readU32(unpackedData, 0x98);
+    uint32_t cullOffset = 0;
+    uint32_t cullCount = 0;
+    if (dtzValidOffset(unpackedData, cullA) && cullB > 0 && cullB < 100000) {
+        cullOffset = cullA;
+        cullCount = cullB;
+    } else if (dtzValidOffset(unpackedData, cullB) && cullA > 0 && cullA < 100000) {
+        cullOffset = cullB;
+        cullCount = cullA;
+    }
+    if (cullOffset != 0 && cullCount != 0) {
+        cullCount = clampRecordCountBySize(cullOffset, 16, cullCount, limit);
+        uint64_t cullEnd64 = uint64_t(cullOffset) + uint64_t(cullCount) * 16ull;
+        uint32_t cullEnd = uint32_t(std::min<uint64_t>(uint64_t(limit), cullEnd64));
+        size_t blockIndex = appendDtzDataBlock(dataBlocksCache, "cull.ipl records", "cull-ipl-16-byte-records", dtzValidOffset(unpackedData, cullA) ? 0x94 : 0x98, cullOffset, cullEnd, 16, cullCount, true, "real cull.ipl range detected by finding which of header 0x94/0x98 is the pointer and which is the count");
+        appendCullFields(unpackedData, dataFieldsCache, blockIndex, dataBlocksCache[blockIndex]);
+    }
+
+    for (uint32_t headerOffset : {0x8Cu, 0x90u}) {
+        uint32_t pointerTable = readU32(unpackedData, headerOffset);
+        uint32_t count = countPedstatPointers(unpackedData, pointerTable);
+        if (count == 0) continue;
+        std::ostringstream name;
+        name << "pedstats.dat STAT_* pointer table from header " << hexOffset(headerOffset);
+        size_t blockIndex = appendDtzDataBlock(dataBlocksCache, name.str(), "vcs-pedstats-pointer-table", headerOffset, pointerTable, pointerTable + count * 4, 4, count, true, "actual content scan: pointer table entries lead to 0x34-byte records whose names begin with STAT_");
+        appendPedstatFields(unpackedData, dataFieldsCache, blockIndex, dataBlocksCache[blockIndex]);
+    }
+
+    for (uint32_t headerOffset : {0xB8u, 0xBCu}) {
+        uint32_t offset = readU32(unpackedData, headerOffset);
+        if (!dtzValidOffset(unpackedData, offset) || !looksLikeParticleRow(unpackedData, offset)) continue;
+        uint32_t end = inferNextHeaderPointerEnd(unpackedData, offset);
+        uint32_t rowSize = 0x54;
+        uint32_t count = clampRecordCountBySize(offset, rowSize, 128, end);
+        std::ostringstream name;
+        name << "particle-style named rows from header " << hexOffset(headerOffset);
+        size_t blockIndex = appendDtzDataBlock(dataBlocksCache, name.str(), "particle-named-row-scan", headerOffset, offset, end, rowSize, count, true, "actual content scan: rows begin with an id and a printable particle/effect name such as SPARK; some VCS field names are still generic");
+        appendParticlePreviewFields(unpackedData, dataFieldsCache, blockIndex, dataBlocksCache[blockIndex]);
+    }
+
+    uint32_t timecycOffset = readU32(unpackedData, 0xB0);
+    if (dtzValidOffset(unpackedData, timecycOffset)) {
+        uint32_t end = inferNextHeaderPointerEnd(unpackedData, timecycOffset);
+        if (end > timecycOffset + 4) {
+            uint32_t size = end - timecycOffset;
+            if ((size % 36u) == 0 && (size / 36u) >= 24u && (size / 36u) <= 96u) {
+                uint32_t rowCount = size / 36u;
+                size_t blockIndex = appendDtzDataBlock(dataBlocksCache, "timecyc.dat hourly 3D-era compact rows", "timecyc-3d-era-36-byte-hourly-rows", 0xB0, timecycOffset, end, 36, rowCount, true, "real header pointer 0xB0; parsed as 36-byte hourly rows: 9 float channels, shown as three RGB triplets instead of anonymous dwords");
+                appendTimecycFields(unpackedData, dataFieldsCache, blockIndex, dataBlocksCache[blockIndex]);
+            } else {
+                uint32_t dwordCount = size / 4;
+                size_t blockIndex = appendDtzDataBlock(dataBlocksCache, "timecyc.dat real scanned range", "timecyc-real-dword-view", 0xB0, timecycOffset, end, 4, dwordCount, true, "real header pointer 0xB0; fallback raw float/u32 view because this build does not match the 36-byte hourly compact layout");
+                appendTimecycFields(unpackedData, dataFieldsCache, blockIndex, dataBlocksCache[blockIndex]);
+            }
+        }
+    }
+
+    uint32_t weaponOffset = 0;
+    uint32_t weaponCount = 0;
+    uint32_t weaponScore = 0;
+    if (findVcsWeaponBlock(unpackedData, weaponOffset, weaponCount, weaponScore)) {
+        std::ostringstream note;
+        note << "actual content scan for VCS/LCS weapon.dat-style 0x70-byte records; scanner score=" << weaponScore
+             << "; header 0xBC can point at other row types on some VCS DTZs";
+        size_t blockIndex = appendDtzDataBlock(dataBlocksCache, "weapon.dat real scanned records", "vcs-weapon-0x70-records", 0xBC, weaponOffset, weaponOffset + weaponCount * 0x70u, 0x70, weaponCount, true, note.str());
+        appendVcsWeaponFields(unpackedData, dataFieldsCache, blockIndex, dataBlocksCache[blockIndex]);
+    }
+
+    uint32_t handlingOffset = readU32(unpackedData, 0xA8);
+    if (dtzValidOffset(unpackedData, handlingOffset)) {
+        uint32_t end = inferNextHeaderPointerEnd(unpackedData, handlingOffset);
+        uint32_t count = clampRecordCountBySize(handlingOffset, 0xE0, 64, end);
+        size_t blockIndex = appendDtzDataBlock(dataBlocksCache, "handling/HANDLING.CFG real header range", "generic-0xE0-handling-view", 0xA8, handlingOffset, end, 0xE0, count, true, "real header pointer 0xA8; generic editable 0xE0-row view until the exact VCS subtable split is named");
+        appendGenericPreviewFields(unpackedData, dataFieldsCache, blockIndex, dataBlocksCache[blockIndex], std::min(count, 32u));
+    }
+
+
+    if (!leeds2dfxEffectsCache.empty()) {
+        uint32_t tableOffset = readU32(unpackedData, 0x58);
+        uint32_t count = uint32_t(leeds2dfxEffectsCache.size());
+        uint32_t rowSize = 0x40u;
+        uint64_t end64 = uint64_t(tableOffset) + uint64_t(count) * uint64_t(rowSize);
+        uint32_t end = end64 <= unpackedData.size() ? uint32_t(end64) : uint32_t(unpackedData.size());
+        appendDtzDataBlock(
+            dataBlocksCache,
+            "Leeds GAME.DTZ C2dEffect table",
+            "leeds-c2deffect-table",
+            0x58,
+            tableOffset,
+            end,
+            rowSize,
+            count,
+            false,
+            "Native Leeds-engine 64-byte C2dEffect table from header fields 0x54/0x58. Rows use the Stories serialized layout: float4 position, RGBA, effect type, typed payload, and CBaseModelInfo ownership. Allocated BUILDING/TREADABLE/DUMMY CEntity pools are decoded separately for world-space instances.");
+    }
+
+    std::sort(dataBlocksCache.begin(), dataBlocksCache.end(), [](const StorylandDtzDataBlock& left, const StorylandDtzDataBlock& right) {
+        if (left.offset != right.offset) return left.offset < right.offset;
+        return left.name < right.name;
+    });
+
+
+    std::vector<StorylandDtzDataBlock> sortedBlocks = dataBlocksCache;
+    dataFieldsCache.clear();
+    for (size_t blockIndex = 0; blockIndex < sortedBlocks.size(); ++blockIndex) {
+        const StorylandDtzDataBlock& block = sortedBlocks[blockIndex];
+        if (block.parser == "object.dat-32-byte-records") appendGenericPreviewFields(unpackedData, dataFieldsCache, blockIndex, block, block.rowCount);
+        else if (block.parser == "carcols-rgba-palette") appendCarcolsPaletteFields(unpackedData, dataFieldsCache, blockIndex, block);
+        else if (block.parser == "cull-ipl-16-byte-records") appendCullFields(unpackedData, dataFieldsCache, blockIndex, block);
+        else if (block.parser == "vcs-pedstats-pointer-table") appendPedstatFields(unpackedData, dataFieldsCache, blockIndex, block);
+        else if (block.parser == "particle-named-row-scan") appendParticlePreviewFields(unpackedData, dataFieldsCache, blockIndex, block);
+        else if (block.parser == "timecyc-3d-era-36-byte-hourly-rows") appendTimecycFields(unpackedData, dataFieldsCache, blockIndex, block);
+        else if (block.parser == "timecyc-real-dword-view") appendTimecycFields(unpackedData, dataFieldsCache, blockIndex, block);
+        else if (block.parser == "vcs-weapon-0x70-records") appendVcsWeaponFields(unpackedData, dataFieldsCache, blockIndex, block);
+        else if (block.parser == "generic-0xE0-handling-view") appendGenericPreviewFields(unpackedData, dataFieldsCache, blockIndex, block, std::min(block.rowCount, 32u));
+        else if (block.parser == "leeds-c2deffect-table") appendLeeds2dfxFields(leeds2dfxEffectsCache, dataFieldsCache, blockIndex, block);
+        else if (block.parser == "raw-scanned-header-pointer") appendGenericPreviewFields(unpackedData, dataFieldsCache, blockIndex, block, std::min(block.rowCount, 24u));
+    }
+    dataBlocksCache = std::move(sortedBlocks);
+}
+
+bool StorylandDtzArchive::patchDataField(size_t fieldIndex, const std::string& newValueText, std::string& report, std::string& errorMessage) {
+    if (fieldIndex >= dataFieldsCache.size()) {
+        errorMessage = "Invalid DTZ data field index.";
+        return false;
+    }
+    StorylandDtzDataField field = dataFieldsCache[fieldIndex];
+    if (!field.editable) {
+        errorMessage = "Selected DTZ data field is view-only.";
+        return false;
+    }
+    if (uint64_t(field.absoluteOffset) + uint64_t(field.size) > uint64_t(unpackedData.size())) {
+        errorMessage = "Selected DTZ data field is outside the unpacked GAME.DTZ bytes.";
+        return false;
+    }
+
+    const std::vector<uint8_t> originalUnpackedData = unpackedData;
+    std::string oldValue = field.valueText;
+    if (field.type == "u8") {
+        uint64_t value = 0;
+        if (!parseUnsignedText(newValueText, value) || value > 0xFF) {
+            errorMessage = "Expected an unsigned 8-bit value, decimal or 0x hex.";
+            return false;
+        }
+        unpackedData[field.absoluteOffset] = uint8_t(value);
+    } else if (field.type == "u16") {
+        uint64_t value = 0;
+        if (!parseUnsignedText(newValueText, value) || value > 0xFFFF) {
+            errorMessage = "Expected an unsigned 16-bit value, decimal or 0x hex.";
+            return false;
+        }
+        writeU16(unpackedData, field.absoluteOffset, uint16_t(value));
+    } else if (field.type == "i16") {
+        int64_t value = 0;
+        if (!parseSignedText(newValueText, value) || value < -32768 || value > 32767) {
+            errorMessage = "Expected a signed 16-bit value.";
+            return false;
+        }
+        writeU16(unpackedData, field.absoluteOffset, uint16_t(int16_t(value)));
+    } else if (field.type == "u32") {
+        uint64_t value = 0;
+        if (!parseUnsignedText(newValueText, value) || value > 0xFFFFFFFFull) {
+            errorMessage = "Expected an unsigned 32-bit value, decimal or 0x hex.";
+            return false;
+        }
+        writeU32(unpackedData, field.absoluteOffset, uint32_t(value));
+    } else if (field.type == "i32") {
+        int64_t value = 0;
+        if (!parseSignedText(newValueText, value) || value < std::numeric_limits<int32_t>::min() || value > std::numeric_limits<int32_t>::max()) {
+            errorMessage = "Expected a signed 32-bit value.";
+            return false;
+        }
+        writeU32(unpackedData, field.absoluteOffset, uint32_t(int32_t(value)));
+    } else if (field.type == "float") {
+        float value = 0.0f;
+        if (!parseFloatText(newValueText, value)) {
+            errorMessage = "Expected a float value.";
+            return false;
+        }
+        writeFloat32(unpackedData, field.absoluteOffset, value);
+    } else {
+        errorMessage = "This field type is not editable yet.";
+        return false;
+    }
+
+    if (!parse(errorMessage)) {
+        unpackedData = originalUnpackedData;
+        std::string ignored;
+        parse(ignored);
+        errorMessage = "DTZ field edit was rolled back because the edited GAME.DTZ no longer parses.\r\n" + errorMessage;
+        return false;
+    }
+
+    std::ostringstream ss;
+    ss << "Patched GAME.DTZ data field inside " << field.blockName
+       << " / " << field.rowLabel
+       << " / " << field.name
+       << " at " << hexOffset(field.absoluteOffset)
+       << " type=" << field.type
+       << " old=" << oldValue
+       << " new=" << newValueText
+       << ". Right-click the GAME.DTZ tree and choose Rebuild GAME.DTZ As... to write the modified DTZ.";
+    report = ss.str();
+    return true;
+}
+
+bool StorylandDtzArchive::patchRawBytes(uint32_t absoluteOffset, const std::vector<uint8_t>& bytes, std::string& report, std::string& errorMessage) {
+    if (bytes.empty()) {
+        errorMessage = "No bytes supplied.";
+        return false;
+    }
+    if (uint64_t(absoluteOffset) + uint64_t(bytes.size()) > uint64_t(unpackedData.size())) {
+        errorMessage = "Raw byte patch is outside the unpacked GAME.DTZ bytes.";
+        return false;
+    }
+    const std::vector<uint8_t> originalUnpackedData = unpackedData;
+    std::copy(bytes.begin(), bytes.end(), unpackedData.begin() + absoluteOffset);
+    if (!parse(errorMessage)) {
+        unpackedData = originalUnpackedData;
+        std::string ignored;
+        parse(ignored);
+        errorMessage = "Raw-byte edit was rolled back because the edited GAME.DTZ no longer parses.\r\n" + errorMessage;
+        return false;
+    }
+    std::ostringstream ss;
+    ss << "Patched " << bytes.size() << " raw byte(s) at " << hexOffset(absoluteOffset) << ".";
+    report = ss.str();
+    return true;
+}
+
+bool StorylandDtzArchive::patchSectorRecord(size_t recordIndex, uint32_t newSectorCount, bool shiftLaterStarts, std::string& report, std::string& errorMessage) {
+    if (recordIndex >= records.size()) {
+        errorMessage = "Invalid sector record index.";
+        return false;
+    }
+    const StorylandDtzSectorRecord selected = records[recordIndex];
+    if (newSectorCount == 0) {
+        errorMessage = "New sector count must be non-zero.";
+        return false;
+    }
+
+    std::string coreReport;
+    if (!patchExactSectorPair(selected.startSector, selected.sectorCount, newSectorCount, shiftLaterStarts, coreReport, errorMessage)) return false;
+
+    std::ostringstream ss;
+    ss << "Patched sector record at " << hexOffset(selected.recordOffset);
+    if (!selected.resourceName.empty()) ss << " (" << selected.resourceName << ")";
+    ss << ".\r\n" << coreReport;
+    report = ss.str();
+    return true;
+}
+
+bool StorylandDtzArchive::patchDirEntry(size_t dirEntryIndex, uint32_t newSectorCount, bool shiftLaterStarts, std::string& report, std::string& errorMessage) {
+    if (dirEntryIndex >= dirMap.size()) {
+        errorMessage = "Invalid internal streaming entry index.";
+        return false;
+    }
+    if (newSectorCount == 0) {
+        errorMessage = "New sector count must be non-zero.";
+        return false;
+    }
+
+    const StorylandDtzDirEntry selected = dirMap[dirEntryIndex];
+    std::string coreReport;
+    if (!patchExactSectorPair(selected.startSector, selected.sectorCount, newSectorCount, shiftLaterStarts, coreReport, errorMessage)) return false;
+
+    report = "Patched " + selected.name + ".\r\n" + coreReport;
+    return true;
+}
+
+bool StorylandDtzArchive::findModelDirEntryByModelId(uint32_t modelId, size_t& outIndex, std::string& outName) const {
+    for (size_t index = 0; index < dirMap.size(); ++index) {
+        const StorylandDtzDirEntry& entry = dirMap[index];
+        if (entry.streamingIndex != modelId) continue;
+        if (entry.detectedExtension != ".mdl" && entry.detectedExtension != ".dff") continue;
+        outIndex = index;
+        outName = entry.name;
+        return true;
+    }
+    return false;
+}
+
+bool StorylandDtzArchive::renameDirEntry(size_t dirEntryIndex, const std::string& requestedName, std::string& report, std::string& errorMessage) {
+    report.clear();
+    errorMessage.clear();
+    if (dirEntryIndex >= dirMap.size()) {
+        errorMessage = "Invalid internal streaming entry index.";
+        return false;
+    }
+    const StorylandDtzDirEntry selected = dirMap[dirEntryIndex];
+    if (requestedName.empty()) {
+        errorMessage = "Resource name cannot be empty.";
+        return false;
+    }
+
+    std::string safe = requestedName;
+    const size_t slash = safe.find_last_of("/\\");
+    if (slash != std::string::npos) {
+        errorMessage = "Resource names cannot contain path separators.";
+        return false;
+    }
+    if (safe == "." || safe == ".." || safe.find("..") != std::string::npos) {
+        errorMessage = "Resource name is not valid.";
+        return false;
+    }
+    for (unsigned char c : safe) {
+        if (c < 0x20u || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|') {
+            errorMessage = "Resource name contains a character that is not allowed.";
+            return false;
+        }
+    }
+
+    auto lower = [](std::string text) {
+        std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+        return text;
+    };
+    const std::string extension = selected.detectedExtension;
+    if (!extension.empty() && extension != ".bin") {
+        const std::string lowerSafe = lower(safe);
+        const std::string lowerExt = lower(extension);
+        if (lowerSafe.size() >= lowerExt.size() && lowerSafe.rfind(lowerExt) == lowerSafe.size() - lowerExt.size())
+            safe.resize(safe.size() - extension.size());
+    }
+    while (!safe.empty() && (safe.back() == ' ' || safe.back() == '.')) safe.pop_back();
+    while (!safe.empty() && safe.front() == ' ') safe.erase(safe.begin());
+    if (safe.empty()) {
+        errorMessage = "Resource base name cannot be empty.";
+        return false;
+    }
+    if (safe.size() > 63u) {
+        errorMessage = "Resource base name is too long.";
+        return false;
+    }
+
+    std::vector<uint8_t> original = unpackedData;
+    std::vector<uint8_t> originalDir = dirRawData;
+    std::vector<StorylandDtzDirEntry> originalExternal = externalDirMap;
+    const auto originalExplicitNames = explicitStreamNames;
+
+    bool stored = false;
+    if (selected.nameStorageOffset != 0xFFFFFFFFu && selected.nameStorageLength != 0u) {
+        const uint64_t end = uint64_t(selected.nameStorageOffset) + uint64_t(selected.nameStorageLength);
+        if (end > unpackedData.size()) {
+            errorMessage = "The resource name storage range is outside GAME.DTZ.";
+            return false;
+        }
+        if (selected.nameStoredAsHash) {
+            if (selected.nameStorageLength != 4u) {
+                errorMessage = "The model name hash field has an invalid size.";
+                return false;
+            }
+            std::string upper = safe;
+            std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char c) { return char(std::toupper(c)); });
+            uLong crc = crc32(0L, Z_NULL, 0);
+            crc = crc32(crc, reinterpret_cast<const Bytef*>(upper.data()), static_cast<uInt>(upper.size()));
+            writeU32(unpackedData, selected.nameStorageOffset, uint32_t(crc) ^ 0xFFFFFFFFu);
+            stored = true;
+        } else if (selected.nameStoredAsSplitExtension) {
+            std::string extensionToken = selected.detectedExtension;
+            if (!extensionToken.empty() && extensionToken.front() == '.') extensionToken.erase(extensionToken.begin());
+            if (extensionToken.empty() || safe.size() + 1u + extensionToken.size() + 1u > selected.nameStorageLength) {
+                errorMessage = "The internal GAME.DTZ name field is too small for that base name and extension.";
+                return false;
+            }
+            std::fill(unpackedData.begin() + selected.nameStorageOffset,
+                      unpackedData.begin() + selected.nameStorageOffset + selected.nameStorageLength, uint8_t(0));
+            std::copy(safe.begin(), safe.end(), unpackedData.begin() + selected.nameStorageOffset);
+            const size_t extensionOffset = size_t(selected.nameStorageOffset) + safe.size() + 1u;
+            std::copy(extensionToken.begin(), extensionToken.end(), unpackedData.begin() + std::ptrdiff_t(extensionOffset));
+            stored = true;
+        } else {
+            if (safe.size() + 1u > selected.nameStorageLength) {
+                std::ostringstream message;
+                message << "This name field allows at most " << (selected.nameStorageLength - 1u) << " characters.";
+                errorMessage = message.str();
+                return false;
+            }
+            const uint8_t pad = selected.detectedExtension == ".anim" ? 0xCCu : 0xAAu;
+            std::fill(unpackedData.begin() + selected.nameStorageOffset,
+                      unpackedData.begin() + selected.nameStorageOffset + selected.nameStorageLength, pad);
+            std::copy(safe.begin(), safe.end(), unpackedData.begin() + selected.nameStorageOffset);
+            unpackedData[selected.nameStorageOffset + safe.size()] = 0u;
+            stored = true;
+        }
+    }
+
+    const std::string fullName = safe + ((extension.empty() || extension == ".bin") ? std::string() : extension);
+    for (StorylandDtzDirEntry& external : externalDirMap) {
+        if (external.startSector != selected.startSector || external.sectorCount != selected.sectorCount) continue;
+        if (fullName.size() >= 24u) {
+            unpackedData = std::move(original);
+            dirRawData = std::move(originalDir);
+            externalDirMap = std::move(originalExternal);
+            explicitStreamNames = originalExplicitNames;
+            errorMessage = "The companion DIR name field allows at most 23 characters including the extension.";
+            return false;
+        }
+        external.name = fullName;
+        const size_t nameOffset = size_t(external.dirIndex) * 32u + 8u;
+        if (nameOffset <= dirRawData.size() && 24u <= dirRawData.size() - nameOffset) {
+            std::fill(dirRawData.begin() + nameOffset, dirRawData.begin() + nameOffset + 24u, uint8_t(0));
+            std::copy(fullName.begin(), fullName.end(), dirRawData.begin() + nameOffset);
+        }
+        stored = true;
+    }
+
+    if (!stored && selected.streamingIndex == 0xFFFFFFFFu) {
+        errorMessage = "This recovered entry has no writable name field in GAME.DTZ or the companion DIR.";
+        return false;
+    }
+    if (selected.streamingIndex != 0xFFFFFFFFu) explicitStreamNames[selected.streamingIndex] = safe;
+
+    std::string parseError;
+    if (!parse(parseError)) {
+        unpackedData = std::move(original);
+        dirRawData = std::move(originalDir);
+        externalDirMap = std::move(originalExternal);
+        explicitStreamNames = originalExplicitNames;
+        std::string ignored;
+        parse(ignored);
+        errorMessage = "Rename was rolled back because GAME.DTZ no longer parsed: " + parseError;
+        return false;
+    }
+    rebuildDirMatches();
+    report = "Renamed '" + selected.name + "' to '" + fullName + "'. Replacement data and the resource name are stored independently.";
+    return true;
+}
+
+bool StorylandDtzArchive::replaceDirEntryBytes(size_t dirEntryIndex, const std::vector<uint8_t>& replacementBytes, bool shiftLaterStarts, std::string& report, std::string& errorMessage) {
+    // IMG replacement is an allocation operation, not an MDL/XTX logical-size operation.
+    // The GAME.DTZ sector map owns physical resource boundaries.  A changed allocation must
+    // therefore move all later IMG allocations and their DTZ locators together.
+    shiftLaterStarts = true;
+    if (dirEntryIndex >= dirMap.size()) {
+        errorMessage = "Invalid internal streaming entry index.";
+        return false;
+    }
+    if (replacementBytes.empty()) {
+        errorMessage = "Replacement file is empty.";
+        return false;
+    }
+    if (imgRawData.empty()) {
+        errorMessage = "No companion IMG is loaded, so Storyland cannot replace the internal IMG entry bytes.";
+        return false;
+    }
+
+    constexpr uint64_t kImgSectorSize = 2048ull;
+    if (uint64_t(replacementBytes.size()) > std::numeric_limits<uint64_t>::max() - (kImgSectorSize - 1ull)) {
+        errorMessage = "Replacement size overflows IMG sector allocation arithmetic.";
+        return false;
+    }
+    const uint64_t newSectorCount64 = (uint64_t(replacementBytes.size()) + (kImgSectorSize - 1ull)) / kImgSectorSize;
+    if (newSectorCount64 == 0 || newSectorCount64 > 0xFFFFFFFFull) {
+        errorMessage = "Replacement file is too large for a 32-bit sector count.";
+        return false;
+    }
+    uint32_t newSectorCount = uint32_t(newSectorCount64);
+
+
+    StorylandDtzDirEntry selected = dirMap[dirEntryIndex];
+    if (selected.sectorCount == 0) {
+        errorMessage = "Selected internal IMG entry has a zero sector count.";
+        return false;
+    }
+
+    uint64_t selectedStartByte64 = uint64_t(selected.startSector) * 2048ull;
+    uint64_t selectedOldBudget64 = uint64_t(selected.sectorCount) * 2048ull;
+    if (selectedStartByte64 > uint64_t(imgRawData.size())) {
+        errorMessage = "Selected internal IMG entry starts outside the loaded companion IMG.";
+        return false;
+    }
+    if (selectedOldBudget64 > uint64_t(std::numeric_limits<size_t>::max())) {
+        errorMessage = "Selected internal IMG entry is too large for this build.";
+        return false;
+    }
+
+
+    std::vector<uint8_t> originalUnpackedData = unpackedData;
+    std::vector<uint8_t> originalImgRawData = imgRawData;
+    std::vector<StorylandDtzDirEntry> originalExternalDirMap = externalDirMap;
+
+    // Patch every authoritative GAME.DTZ sector locator, including the compact named
+    // directory that follows CStreamingInfo.  Updating only the live CStreaming rows leaves
+    // cutscene/special MDLs pointing at their old sectors after IMG growth/shrink.
+    uint32_t patchedCounts = 0;
+    uint32_t shiftedStarts = 0;
+    const int64_t delta = int64_t(newSectorCount) - int64_t(selected.sectorCount);
+    const uint64_t oldEnd = uint64_t(selected.startSector) + uint64_t(selected.sectorCount);
+    if (oldEnd > 0x100000000ull) {
+        errorMessage = "Selected GAME.DTZ sector range overflows the 32-bit sector address space.";
+        return false;
+    }
+
+    auto storageRangeValid = [&](uint32_t offset) -> bool {
+        return offset != 0xFFFFFFFFu && uint64_t(offset) + 4ull <= unpackedData.size();
+    };
+
+    std::set<uint32_t> patchedCountOffsets;
+    std::set<uint32_t> shiftedStartOffsets;
+
+    // Snapshot the strict 24-byte stream table before changing anything.  The browser map can
+    // merge/recover aliases and therefore is not guaranteed to expose every physical locator.
+    // Dual replacement used to update whichever representation dirMap exposed and then skip the
+    // strict table entirely because patchedCounts was already non-zero.  That leaves a stale
+    // count/start alias only when a second neighbouring resource is replaced in the same session.
+    rebuildSectorRecords();
+    const std::vector<StorylandDtzSectorRecord> originalSectorRecords = records;
+
+    for (const StorylandDtzDirEntry& entry : dirMap) {
+        if (!storageRangeValid(entry.startStorageOffset) || !storageRangeValid(entry.countStorageOffset)) continue;
+
+        // A resource can be referenced by more than one authoritative locator.  Match the
+        // selected start sector as the identity and normalize every count field at that start.
+        if (entry.startSector == selected.startSector) {
+            if (patchedCountOffsets.insert(entry.countStorageOffset).second) {
+                writeU32(unpackedData, entry.countStorageOffset, newSectorCount);
+                ++patchedCounts;
+            }
+            continue;
+        }
+        if (!shiftLaterStarts || delta == 0 || uint64_t(entry.startSector) < oldEnd) continue;
+        const int64_t shifted = int64_t(entry.startSector) + delta;
+        if (shifted < 0 || shifted > 0xFFFFFFFFLL) {
+            unpackedData = originalUnpackedData;
+            errorMessage = "A GAME.DTZ internal sector start would overflow during the replacement.";
+            return false;
+        }
+        if (shiftedStartOffsets.insert(entry.startStorageOffset).second) {
+            writeU32(unpackedData, entry.startStorageOffset, uint32_t(shifted));
+            ++shiftedStarts;
+        }
+    }
+
+    // ALWAYS patch the strict physical stream table as well.  De-duplicate by storage offset so
+    // records already exposed through dirMap are not shifted twice.
+    for (const StorylandDtzSectorRecord& record : originalSectorRecords) {
+        if (!storageRangeValid(record.startOffset) || !storageRangeValid(record.countOffset)) continue;
+
+        if (record.startSector == selected.startSector) {
+            if (patchedCountOffsets.insert(record.countOffset).second) {
+                writeU32(unpackedData, record.countOffset, newSectorCount);
+                ++patchedCounts;
+            }
+            continue;
+        }
+
+        if (!shiftLaterStarts || delta == 0 || uint64_t(record.startSector) < oldEnd) continue;
+        const int64_t shifted = int64_t(record.startSector) + delta;
+        if (shifted < 0 || shifted > 0xFFFFFFFFLL) {
+            unpackedData = originalUnpackedData;
+            errorMessage = "A strict GAME.DTZ stream-table start would overflow during the replacement.";
+            return false;
+        }
+        if (shiftedStartOffsets.insert(record.startOffset).second) {
+            writeU32(unpackedData, record.startOffset, uint32_t(shifted));
+            ++shiftedStarts;
+        }
+    }
+
+    if (patchedCounts == 0) {
+        errorMessage = "Selected internal IMG entry has no writable GAME.DTZ sector locator.";
+        return false;
+    }
+
+    patchCompanionDirMap(selected.startSector, selected.sectorCount, newSectorCount, shiftLaterStarts);
+
+    std::string imgResizeReport;
+    if (!resizeCompanionImgForSectorPatch(selected.startSector, selected.sectorCount, newSectorCount, shiftLaterStarts, imgResizeReport, errorMessage)) {
+        unpackedData = std::move(originalUnpackedData);
+        imgRawData = std::move(originalImgRawData);
+        externalDirMap = std::move(originalExternalDirMap);
+        std::string ignored;
+        parse(ignored);
+        rebuildDirMatches();
+        return false;
+    }
+
+    uint64_t startByte64 = uint64_t(selected.startSector) * 2048ull;
+    uint64_t newBudgetBytes64 = uint64_t(newSectorCount) * 2048ull;
+    uint64_t endByte64 = startByte64 + newBudgetBytes64;
+    if (startByte64 > uint64_t(imgRawData.size()) || endByte64 > uint64_t(imgRawData.size())) {
+        unpackedData = std::move(originalUnpackedData);
+        imgRawData = std::move(originalImgRawData);
+        externalDirMap = std::move(originalExternalDirMap);
+        std::string ignored;
+        parse(ignored);
+        rebuildDirMatches();
+        errorMessage = "Resized companion IMG does not contain the selected replacement byte range.";
+        return false;
+    }
+    if (newBudgetBytes64 > uint64_t(std::numeric_limits<size_t>::max())) {
+        unpackedData = std::move(originalUnpackedData);
+        imgRawData = std::move(originalImgRawData);
+        externalDirMap = std::move(originalExternalDirMap);
+        std::string ignored;
+        parse(ignored);
+        rebuildDirMatches();
+        errorMessage = "Replacement sector budget is too large for this build.";
+        return false;
+    }
+
+    size_t startByte = size_t(startByte64);
+    size_t endByte = size_t(endByte64);
+    std::fill(imgRawData.begin() + std::ptrdiff_t(startByte), imgRawData.begin() + std::ptrdiff_t(endByte), uint8_t(0));
+    std::copy(replacementBytes.begin(), replacementBytes.end(), imgRawData.begin() + std::ptrdiff_t(startByte));
+
+    // Verify the in-memory IMG immediately.  The DTZ rebuild transaction writes this exact
+    // buffer beside GAME.DTZ, so a successful replacement must already be byte-identical here.
+    if (!std::equal(replacementBytes.begin(), replacementBytes.end(), imgRawData.begin() + std::ptrdiff_t(startByte))) {
+        unpackedData = std::move(originalUnpackedData);
+        imgRawData = std::move(originalImgRawData);
+        externalDirMap = std::move(originalExternalDirMap);
+        std::string ignored;
+        parse(ignored);
+        rebuildDirMatches();
+        errorMessage = "Replacement verification failed: companion IMG bytes do not match the selected replacement.";
+        return false;
+    }
+    if (replacementBytes.size() < size_t(newBudgetBytes64)) {
+        const auto padBegin = imgRawData.begin() + std::ptrdiff_t(startByte + replacementBytes.size());
+        const auto padEnd = imgRawData.begin() + std::ptrdiff_t(endByte);
+        if (!std::all_of(padBegin, padEnd, [](uint8_t value) { return value == 0u; })) {
+            unpackedData = std::move(originalUnpackedData);
+            imgRawData = std::move(originalImgRawData);
+            externalDirMap = std::move(originalExternalDirMap);
+            std::string ignored;
+            parse(ignored);
+            rebuildDirMatches();
+            errorMessage = "Replacement verification failed: sector padding was not cleared.";
+            return false;
+        }
+    }
+
+    if (!parse(errorMessage)) {
+        unpackedData = std::move(originalUnpackedData);
+        imgRawData = std::move(originalImgRawData);
+        externalDirMap = std::move(originalExternalDirMap);
+        std::string ignored;
+        parse(ignored);
+        rebuildDirMatches();
+        return false;
+    }
+    rebuildDirMatches();
+
+    // Postcondition: every browser locator AND every strict physical stream-table row must
+    // agree after the transaction.  This is specifically a dual-replacement guard: a second
+    // adjacent replacement must never inherit a stale first-pass alias.
+    for (const StorylandDtzDirEntry& entry : dirMap) {
+        if (entry.startSector != selected.startSector) continue;
+        if (!storageRangeValid(entry.countStorageOffset)) continue;
+        if (entry.sectorCount != newSectorCount) {
+            unpackedData = std::move(originalUnpackedData);
+            imgRawData = std::move(originalImgRawData);
+            externalDirMap = std::move(originalExternalDirMap);
+            std::string ignored;
+            parse(ignored);
+            rebuildDirMatches();
+            errorMessage = "Replacement verification failed: a GAME.DTZ locator still contains the old sector count.";
+            return false;
+        }
+    }
+
+    rebuildSectorRecords();
+    for (const StorylandDtzSectorRecord& record : records) {
+        if (record.startSector == selected.startSector && record.sectorCount != newSectorCount) {
+            unpackedData = std::move(originalUnpackedData);
+            imgRawData = std::move(originalImgRawData);
+            externalDirMap = std::move(originalExternalDirMap);
+            std::string ignored;
+            parse(ignored);
+            rebuildDirMatches();
+            errorMessage = "Replacement verification failed: strict GAME.DTZ stream-table aliases disagree on the selected sector count.";
+            return false;
+        }
+    }
+
+    // Verify the exact same storage words captured before the edit.  This catches aliases which
+    // parse() may otherwise merge away from the browser view.
+    for (const StorylandDtzSectorRecord& before : originalSectorRecords) {
+        if (!storageRangeValid(before.startOffset) || !storageRangeValid(before.countOffset)) continue;
+        if (before.startSector == selected.startSector) {
+            if (readU32(unpackedData, before.countOffset) != newSectorCount) {
+                unpackedData = std::move(originalUnpackedData);
+                imgRawData = std::move(originalImgRawData);
+                externalDirMap = std::move(originalExternalDirMap);
+                std::string ignored;
+                parse(ignored);
+                rebuildDirMatches();
+                errorMessage = "Replacement verification failed: a physical GAME.DTZ count word remained stale.";
+                return false;
+            }
+        } else if (shiftLaterStarts && delta != 0 && uint64_t(before.startSector) >= oldEnd) {
+            const int64_t expected64 = int64_t(before.startSector) + delta;
+            if (expected64 < 0 || expected64 > 0xFFFFFFFFLL ||
+                readU32(unpackedData, before.startOffset) != uint32_t(expected64)) {
+                unpackedData = std::move(originalUnpackedData);
+                imgRawData = std::move(originalImgRawData);
+                externalDirMap = std::move(originalExternalDirMap);
+                std::string ignored;
+                parse(ignored);
+                rebuildDirMatches();
+                errorMessage = "Replacement verification failed: a physical GAME.DTZ downstream start word remained stale.";
+                return false;
+            }
+        }
+    }
+
+    std::ostringstream ss;
+    ss << "Replaced " << selected.name
+       << ": start=" << selected.startSector
+       << " old_count=" << selected.sectorCount
+       << " new_count=" << newSectorCount
+       << " replacement_bytes=" << replacementBytes.size()
+       << " allocated_sector_bytes=" << (uint64_t(newSectorCount) * kImgSectorSize)
+       << " delta_sectors=" << delta
+       << ". GAME.DTZ sector allocation is authoritative; embedded MDL/XTX logical sizes were not used to locate the next resource. DTZ count fields updated=" << patchedCounts
+       << ", later DTZ start fields shifted=" << shiftedStarts
+       << ". Replacement bytes were written into the loaded companion IMG in memory."
+       << "\r\nTarget was resolved by the selected start/count pair before rebuilding the browser list, so the replacement no longer drifts to the row above/below."
+       << "\r\nRight-click the GAME.DTZ tree and choose Rebuild GAME.DTZ As... to write the rebuilt GAME.DTZ and companion IMG.";
+    if (!imgResizeReport.empty()) ss << "\r\n" << imgResizeReport;
+    report = ss.str();
+    return true;
+}
+
+bool StorylandDtzArchive::patchExactSectorPair(uint32_t oldStartSector, uint32_t oldSectorCount, uint32_t newSectorCount, bool shiftLaterStarts, std::string& report, std::string& errorMessage) {
+    if (newSectorCount == 0) {
+        errorMessage = "New sector count must be non-zero.";
+        return false;
+    }
+
+    std::vector<uint8_t> originalUnpackedData = unpackedData;
+    std::vector<uint8_t> originalImgRawData = imgRawData;
+    std::vector<StorylandDtzDirEntry> originalExternalDirMap = externalDirMap;
+
+    const int64_t delta = int64_t(newSectorCount) - int64_t(oldSectorCount);
+    const uint64_t oldEnd = uint64_t(oldStartSector) + uint64_t(oldSectorCount);
+    if (oldEnd > 0x100000000ull) {
+        errorMessage = "GAME.DTZ sector range overflows the 32-bit sector address space.";
+        return false;
+    }
+    uint32_t patchedCounts = 0;
+    uint32_t shiftedStarts = 0;
+
+    auto storageRangeValid = [&](uint32_t offset) -> bool {
+        return offset != 0xFFFFFFFFu && uint64_t(offset) + 4ull <= unpackedData.size();
+    };
+
+    std::set<uint32_t> patchedCountOffsets;
+    std::set<uint32_t> shiftedStartOffsets;
+    for (const StorylandDtzDirEntry& entry : dirMap) {
+        if (!storageRangeValid(entry.startStorageOffset) || !storageRangeValid(entry.countStorageOffset)) continue;
+        if (entry.startSector == oldStartSector) {
+            if (patchedCountOffsets.insert(entry.countStorageOffset).second) {
+                writeU32(unpackedData, entry.countStorageOffset, newSectorCount);
+                ++patchedCounts;
+            }
+            continue;
+        }
+        if (!shiftLaterStarts || delta == 0 || uint64_t(entry.startSector) < oldEnd) continue;
+        const int64_t shifted = int64_t(entry.startSector) + delta;
+        if (shifted < 0 || shifted > 0xFFFFFFFFLL) {
+            unpackedData = originalUnpackedData;
+            errorMessage = "A GAME.DTZ internal sector start would overflow during the patch.";
+            return false;
+        }
+        if (shiftedStartOffsets.insert(entry.startStorageOffset).second) {
+            writeU32(unpackedData, entry.startStorageOffset, uint32_t(shifted));
+            ++shiftedStarts;
+        }
+    }
+
+    if (patchedCounts == 0) {
+        rebuildSectorRecords();
+        for (const StorylandDtzSectorRecord& record : records) {
+            if (record.startSector == oldStartSector && record.sectorCount == oldSectorCount) {
+                writeU32(unpackedData, record.countOffset, newSectorCount);
+                ++patchedCounts;
+            }
+        }
+        if (shiftLaterStarts && delta != 0) {
+            for (const StorylandDtzSectorRecord& record : records) {
+                if (record.startSector == oldStartSector && record.sectorCount == oldSectorCount) continue;
+                if (uint64_t(record.startSector) < oldEnd) continue;
+                const int64_t shifted = int64_t(record.startSector) + delta;
+                if (shifted < 0 || shifted > 0xFFFFFFFFLL) {
+                    unpackedData = originalUnpackedData;
+                    imgRawData = originalImgRawData;
+                    externalDirMap = originalExternalDirMap;
+                    std::string ignored;
+                    parse(ignored);
+                    rebuildDirMatches();
+                    errorMessage = "A fallback GAME.DTZ stream-table start would overflow during the patch.";
+                    return false;
+                }
+                writeU32(unpackedData, record.startOffset, uint32_t(shifted));
+                ++shiftedStarts;
+            }
+        }
+    }
+
+    if (patchedCounts == 0) {
+        errorMessage = "No writable GAME.DTZ sector pair was found.";
+        return false;
+    }
+
+    patchCompanionDirMap(oldStartSector, oldSectorCount, newSectorCount, shiftLaterStarts);
+
+    std::string imgReport;
+    if (!resizeCompanionImgForSectorPatch(oldStartSector, oldSectorCount, newSectorCount, shiftLaterStarts, imgReport, errorMessage)) {
+        unpackedData = std::move(originalUnpackedData);
+        imgRawData = std::move(originalImgRawData);
+        externalDirMap = std::move(originalExternalDirMap);
+        std::string ignored;
+        parse(ignored);
+        rebuildDirMatches();
+        return false;
+    }
+
+    if (!parse(errorMessage)) {
+        unpackedData = std::move(originalUnpackedData);
+        imgRawData = std::move(originalImgRawData);
+        externalDirMap = std::move(originalExternalDirMap);
+        std::string ignored;
+        parse(ignored);
+        rebuildDirMatches();
+        return false;
+    }
+
+    std::ostringstream ss;
+    ss << "Patched exact sector pair start=" << oldStartSector
+       << " old_count=" << oldSectorCount
+       << " new_count=" << newSectorCount
+       << " old_bytes=" << (oldSectorCount * 2048u)
+       << " new_bytes=" << (newSectorCount * 2048u)
+       << " delta=" << delta
+       << ". Matching count fields=" << patchedCounts
+       << ", shifted later starts=" << shiftedStarts << ".";
+    if (!imgReport.empty()) ss << "\r\n" << imgReport;
+    report = ss.str();
+    return true;
+}
+
+bool StorylandDtzArchive::extractDirEntryBytes(size_t dirEntryIndex, std::vector<uint8_t>& bytes, std::string& errorMessage) const {
+    if (dirEntryIndex >= dirMap.size()) {
+        errorMessage = "DIR entry index is out of range.";
+        return false;
+    }
+    if (imgRawData.empty()) {
+        errorMessage = "No companion IMG is loaded for this GAME.DTZ.";
+        return false;
+    }
+
+    const auto& entry = dirMap[dirEntryIndex];
+    const uint64_t startByte = uint64_t(entry.startSector) * 2048ull;
+    const uint64_t budgetBytes = uint64_t(entry.sectorCount) * 2048ull;
+    if (startByte > uint64_t(imgRawData.size())) {
+        errorMessage = "DIR entry start sector is outside the loaded IMG.";
+        return false;
+    }
+    if (budgetBytes > uint64_t(std::numeric_limits<size_t>::max())) {
+        errorMessage = "DIR entry is too large to extract on this build.";
+        return false;
+    }
+    if (budgetBytes > uint64_t(imgRawData.size()) - startByte) {
+        std::ostringstream ss;
+        ss << "DIR entry range is truncated in the loaded IMG: requested "
+           << budgetBytes << " bytes at offset " << startByte
+           << ", but only " << (uint64_t(imgRawData.size()) - startByte) << " bytes remain.";
+        errorMessage = ss.str();
+        return false;
+    }
+
+    const size_t begin = static_cast<size_t>(startByte);
+    const size_t length = static_cast<size_t>(budgetBytes);
+    bytes.assign(
+        imgRawData.begin() + static_cast<std::ptrdiff_t>(begin),
+        imgRawData.begin() + static_cast<std::ptrdiff_t>(begin + length));
+    return true;
+}
+
+bool StorylandDtzArchive::findDirEntryByStemAndExtension(const std::wstring& stem, const std::vector<std::wstring>& extensions, size_t& outIndex) const {
+    std::wstring wantedStem = lowercaseWide(stem);
+    std::vector<std::wstring> wantedExtensions;
+    wantedExtensions.reserve(extensions.size());
+    for (const auto& extension : extensions) wantedExtensions.push_back(lowercaseWide(extension));
+
+    for (size_t index = 0; index < dirMap.size(); ++index) {
+        std::wstring entryName = canonicalDtzDirEntryWideName(asciiWide(dirMap[index].name));
+        if (widePathStemLower(entryName) != wantedStem) continue;
+        std::wstring entryExtension = widePathExtensionLower(entryName);
+        for (const auto& extension : wantedExtensions) {
+            if (entryExtension == extension) {
+                outIndex = index;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+const std::vector<StorylandDtzHeaderField>& StorylandDtzArchive::headerFields() const { return headers; }
+const std::vector<StorylandDtzSectorRecord>& StorylandDtzArchive::sectorRecords() const { return records; }
+const std::vector<StorylandDtzResourceHint>& StorylandDtzArchive::resourceHints() const { return hints; }
+const std::vector<StorylandDtzDirEntry>& StorylandDtzArchive::dirEntries() const { return dirMap; }
+const std::vector<StorylandDtzDataBlock>& StorylandDtzArchive::dataBlocks() const { return dataBlocksCache; }
+const std::vector<StorylandDtzDataField>& StorylandDtzArchive::dataFields() const { return dataFieldsCache; }
+const std::vector<StorylandDtz2dfxEffect>& StorylandDtzArchive::leeds2dfxEffects() const { return leeds2dfxEffectsCache; }
+const std::vector<StorylandDtz2dfxWorldInstance>& StorylandDtzArchive::leeds2dfxWorldInstances() const { return leeds2dfxWorldInstancesCache; }
+const std::vector<uint8_t>& StorylandDtzArchive::unpackedBytes() const { return unpackedData; }
+const std::wstring& StorylandDtzArchive::sourcePath() const { return path; }
+const std::wstring& StorylandDtzArchive::companionDirPath() const { return dirPath; }
+const std::wstring& StorylandDtzArchive::companionImgPath() const { return imgPath; }
+uint64_t StorylandDtzArchive::companionImgSize() const { return uint64_t(imgRawData.size()); }
+bool StorylandDtzArchive::wasCompressedInput() const { return compressedInput; }
+bool StorylandDtzArchive::hasCompanionDir() const { return !externalDirMap.empty(); }
+bool StorylandDtzArchive::hasCompanionImg() const { return !imgRawData.empty(); }

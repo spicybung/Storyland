@@ -1,0 +1,5 @@
+#pragma once
+
+#define IDI_STORYLAND 1
+#define IDR_VCS_TIMECYC 101
+#define IDR_REIGNS_ERROR_THEME 102
