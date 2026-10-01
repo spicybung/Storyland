@@ -1,5 +1,6 @@
 #define NOMINMAX
 #include <windows.h>
+#include <dbghelp.h>
 #include <commdlg.h>
 #include <commctrl.h>
 #include <shellapi.h>
@@ -19056,26 +19057,107 @@ static int runStorylandApplication(HINSTANCE hInstance, HINSTANCE, LPWSTR comman
     return int(msg.wParam);
 }
 
-static LONG WINAPI storylandUnhandledExceptionFilter(EXCEPTION_POINTERS* exceptionPointers) {
+static std::wstring storylandCrashBasePath() {
     wchar_t tempDir[MAX_PATH] = {};
     DWORD tempLength = GetTempPathW(MAX_PATH, tempDir);
-    std::wstring path = (tempLength > 0 && tempLength < MAX_PATH) ? std::wstring(tempDir) : L".";
-    if (!path.empty() && path.back() != L'\\' && path.back() != L'/') path += L"\\";
-    path += L"StorylandCrash_" + std::to_wstring(GetCurrentProcessId()) + L".txt";
+    std::wstring base = (tempLength > 0 && tempLength < MAX_PATH) ? std::wstring(tempDir) : L".";
+    if (!base.empty() && base.back() != L'\\' && base.back() != L'/') base += L"\\";
+    base += L"StorylandCrash_" + std::to_wstring(GetCurrentProcessId());
+    return base;
+}
 
-    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
+static std::string narrowForCrashReport(const std::wstring& value) {
+    if (value.empty()) return {};
+    int needed = WideCharToMultiByte(CP_UTF8, 0, value.c_str(), int(value.size()), nullptr, 0, nullptr, nullptr);
+    if (needed <= 0) return {};
+    std::string result(size_t(needed), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, value.c_str(), int(value.size()), result.data(), needed, nullptr, nullptr);
+    return result;
+}
+
+static void writeStorylandMiniDump(const std::wstring& dumpPath, EXCEPTION_POINTERS* exceptionPointers) {
+    HMODULE dbgHelp = LoadLibraryW(L"Dbghelp.dll");
+    if (!dbgHelp) return;
+    using MiniDumpWriteDumpFn = BOOL (WINAPI *)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE,
+                                                PMINIDUMP_EXCEPTION_INFORMATION,
+                                                PMINIDUMP_USER_STREAM_INFORMATION,
+                                                PMINIDUMP_CALLBACK_INFORMATION);
+    auto miniDumpWriteDump = reinterpret_cast<MiniDumpWriteDumpFn>(GetProcAddress(dbgHelp, "MiniDumpWriteDump"));
+    if (!miniDumpWriteDump) {
+        FreeLibrary(dbgHelp);
+        return;
+    }
+
+    HANDLE dumpFile = CreateFileW(dumpPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
+                                  FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (dumpFile != INVALID_HANDLE_VALUE) {
+        MINIDUMP_EXCEPTION_INFORMATION info{};
+        info.ThreadId = GetCurrentThreadId();
+        info.ExceptionPointers = exceptionPointers;
+        info.ClientPointers = FALSE;
+        miniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), dumpFile,
+                          MINIDUMP_TYPE(MiniDumpNormal | MiniDumpWithThreadInfo | MiniDumpWithIndirectlyReferencedMemory),
+                          exceptionPointers ? &info : nullptr, nullptr, nullptr);
+        CloseHandle(dumpFile);
+    }
+    FreeLibrary(dbgHelp);
+}
+
+static LONG WINAPI storylandUnhandledExceptionFilter(EXCEPTION_POINTERS* exceptionPointers) {
+    const std::wstring basePath = storylandCrashBasePath();
+    const std::wstring textPath = basePath + L".txt";
+    const std::wstring dumpPath = basePath + L".dmp";
+
+    const EXCEPTION_RECORD* record = exceptionPointers ? exceptionPointers->ExceptionRecord : nullptr;
+    const uintptr_t faultAddress = record ? reinterpret_cast<uintptr_t>(record->ExceptionAddress) : 0;
+
+    MEMORY_BASIC_INFORMATION memoryInfo{};
+    HMODULE faultModule = nullptr;
+    std::wstring faultModulePath;
+    uintptr_t moduleBase = 0;
+    if (faultAddress != 0 && VirtualQuery(reinterpret_cast<LPCVOID>(faultAddress), &memoryInfo, sizeof(memoryInfo))) {
+        faultModule = static_cast<HMODULE>(memoryInfo.AllocationBase);
+        moduleBase = reinterpret_cast<uintptr_t>(faultModule);
+        wchar_t moduleName[MAX_PATH] = {};
+        if (faultModule && GetModuleFileNameW(faultModule, moduleName, MAX_PATH) > 0) faultModulePath = moduleName;
+    }
+
+    HANDLE file = CreateFileW(textPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
                               FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file != INVALID_HANDLE_VALUE) {
         std::ostringstream text;
         text << "Storyland catastrophic error\r\n";
-        if (exceptionPointers && exceptionPointers->ExceptionRecord) {
-            text << "Exception code: 0x" << std::hex << std::uppercase
-                 << exceptionPointers->ExceptionRecord->ExceptionCode << "\r\n";
-            text << "Address: 0x" << reinterpret_cast<uintptr_t>(exceptionPointers->ExceptionRecord->ExceptionAddress)
-                 << "\r\n";
+        text << "----------------------------------------\r\n";
+        if (record) {
+            text << "Exception code: 0x" << std::hex << std::uppercase << record->ExceptionCode << "\r\n";
+            text << "Fault address: 0x" << faultAddress << "\r\n";
+            if (!faultModulePath.empty()) {
+                text << "Fault module: " << narrowForCrashReport(faultModulePath) << "\r\n";
+                text << "Module base: 0x" << moduleBase << "\r\n";
+                text << "Module offset: 0x" << (faultAddress - moduleBase) << "\r\n";
+            }
+            if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2) {
+                const ULONG_PTR operation = record->ExceptionInformation[0];
+                const ULONG_PTR address = record->ExceptionInformation[1];
+                const char* operationName = operation == 0 ? "read" : (operation == 1 ? "write" : (operation == 8 ? "execute" : "unknown"));
+                text << "Access violation: " << operationName << " at 0x" << address << "\r\n";
+            }
         }
-        text << "Process ID: " << std::dec << GetCurrentProcessId() << "\r\n";
-        text << "Please include this file when reporting the crash on the Storyland GitHub.\r\n";
+        text << std::dec;
+        text << "Process ID: " << GetCurrentProcessId() << "\r\n";
+        text << "Thread ID: " << GetCurrentThreadId() << "\r\n";
+        if (exceptionPointers && exceptionPointers->ContextRecord) {
+#ifdef _M_X64
+            const CONTEXT* context = exceptionPointers->ContextRecord;
+            text << std::hex << std::uppercase;
+            text << "RIP: 0x" << context->Rip << "  RSP: 0x" << context->Rsp << "  RBP: 0x" << context->Rbp << "\r\n";
+            text << "RAX: 0x" << context->Rax << "  RBX: 0x" << context->Rbx << "  RCX: 0x" << context->Rcx << "\r\n";
+            text << "RDX: 0x" << context->Rdx << "  RSI: 0x" << context->Rsi << "  RDI: 0x" << context->Rdi << "\r\n";
+            text << std::dec;
+#endif
+        }
+        text << "\r\nA matching .dmp minidump is written beside this report when Windows DbgHelp is available.\r\n";
+        text << "Please include both files when reporting a repeated crash.\r\n";
         const std::string bytes = text.str();
         DWORD written = 0;
         WriteFile(file, bytes.data(), DWORD(std::min<size_t>(bytes.size(), size_t((std::numeric_limits<DWORD>::max)()))), &written, nullptr);
@@ -19083,8 +19165,13 @@ static LONG WINAPI storylandUnhandledExceptionFilter(EXCEPTION_POINTERS* excepti
         CloseHandle(file);
     }
 
-    std::wstring message = L"Storyland encountered a catastrophic error and must close.\r\n\r\nA crash report was written to:\r\n" + path +
-                           L"\r\n\r\nPlease report the error on the Storyland GitHub.";
+    writeStorylandMiniDump(dumpPath, exceptionPointers);
+    stopStorylandTheme();
+
+    std::wstring message = L"Storyland crashed because Windows reported an access violation or another fatal exception.\r\n\r\n"
+                           L"Crash report:\r\n" + textPath +
+                           L"\r\n\r\nMinidump:\r\n" + dumpPath +
+                           L"\r\n\r\nIf the crash repeats, include both files. The module name and exact failing address are now recorded.";
     MessageBoxW(nullptr, message.c_str(), L"Storyland - Catastrophic Error", MB_OK | MB_ICONERROR | MB_TASKMODAL);
     return EXCEPTION_EXECUTE_HANDLER;
 }
