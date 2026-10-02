@@ -3064,8 +3064,17 @@ bool LeedsTextureArchive::replaceTextureAsBpp(size_t textureIndex, const RgbaIma
     }
 
     if (targetBpp == 0) targetBpp = entry.bpp;
+
+    const bool storiesEditableTexture =
+        entry.kind == TextureKind::Ps2 ||
+        entry.kind == TextureKind::Psp ||
+        entry.kind == TextureKind::RwPsp;
+    if (storiesEditableTexture && targetBpp > 8u) {
+        targetBpp = 8u;
+    }
+
     if (targetBpp != 4 && targetBpp != 8 && targetBpp != 16 && targetBpp != 32) {
-        errorMessage = "Target BPP must be 4, 8, 16, or 32. Use 0 to keep the original BPP.";
+        errorMessage = "Target BPP must be 4 or 8 for Stories textures.";
         return false;
     }
     if (entry.kind == TextureKind::CtwTex) {

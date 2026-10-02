@@ -1382,6 +1382,7 @@ static void addTextureMaterial();
 static void applyAnimationToCurrentModel();
 static void editSelectedTextureMaterial();
 static int chooseTextureBpp(UINT initialBpp);
+static bool clampEditableStoriesTexturesTo8Bpp(std::wstring& summaryOut, std::string& errorMessage);
 static void swapSelectedTextureData();
 static void duplicateSelectedTexture();
 static void removeSelectedTexture();
@@ -8969,6 +8970,11 @@ static bool prepareDtzDirEntryPreview(int index, std::wstring& previewSummary) {
             previewSummary = L"Texture preview load failed: " + widen(error);
             return false;
         }
+        std::wstring clampSummary;
+        if (!clampEditableStoriesTexturesTo8Bpp(clampSummary, error)) {
+            previewSummary = L"Texture preview BPP conversion failed: " + widen(error);
+            return false;
+        }
         if (gTextureArchive.textures().empty()) {
             previewSummary = L"Texture preview loaded the archive file, but no textures were decoded from it.";
             return false;
@@ -8986,8 +8992,11 @@ static bool prepareDtzDirEntryPreview(int index, std::wstring& previewSummary) {
         std::wstringstream ss;
         ss << L"Texture preview active in the right pane. Storyland extracted this internal IMG entry to a temp file and decoded the first texture in the archive.\r\n"
            << L"Preview source: " << primaryPath << L"\r\n"
-           << L"Decoded textures in archive: " << gTextureArchive.textures().size() << L"\r\n"
-           << L"Showing texture 0: " << widen(firstTexture.name) << L"  " << firstTexture.width << L"x" << firstTexture.height << L"  bpp=" << int(firstTexture.bpp);
+           << L"Decoded textures in archive: " << gTextureArchive.textures().size() << L"\r\n";
+        if (!clampSummary.empty()) {
+            ss << L"BPP conversion: " << clampSummary << L"\r\n";
+        }
+        ss << L"Showing texture 0: " << widen(firstTexture.name) << L"  " << firstTexture.width << L"x" << firstTexture.height << L"  bpp=" << int(firstTexture.bpp);
         previewSummary = ss.str();
         return true;
     }
@@ -11004,6 +11013,13 @@ static void openStorylandFile(const std::wstring& path) {
             MessageBoxW(gMainWindow, widen(error).c_str(), L"Storyland texture open failed", MB_ICONERROR);
             return;
         }
+
+        std::wstring clampSummary;
+        if (!clampEditableStoriesTexturesTo8Bpp(clampSummary, error)) {
+            MessageBoxW(gMainWindow, widen(error).c_str(), L"Texture BPP conversion failed", MB_ICONERROR);
+            return;
+        }
+
         gMode = StorylandMode::TextureArchive;
         populateTextureList();
 
@@ -11033,6 +11049,9 @@ static void openStorylandFile(const std::wstring& path) {
                 ? StorylandTitleTint::SanAndreas
                 : titleTintFromPath(path));
         refreshModeUi();
+        if (!clampSummary.empty()) {
+            setStatus(L"Opened texture archive | " + clampSummary);
+        }
         return;
     }
 
@@ -12555,6 +12574,40 @@ static int chooseTextureBpp(UINT initialBpp) {
     return int(chosen);
 }
 
+static bool clampEditableStoriesTexturesTo8Bpp(std::wstring& summaryOut, std::string& errorMessage) {
+    summaryOut.clear();
+    size_t clamped = 0;
+
+    for (size_t textureIndex = 0; textureIndex < gTextureArchive.textures().size(); ++textureIndex) {
+        const auto& entry = gTextureArchive.textures()[textureIndex];
+        if (entry.bpp <= 8u) continue;
+
+        const bool editableStoriesTexture =
+            entry.kind == TextureKind::Ps2 ||
+            entry.kind == TextureKind::Psp ||
+            entry.kind == TextureKind::RwPsp;
+        if (!editableStoriesTexture) continue;
+
+        RgbaImage decoded;
+        if (!gTextureArchive.decodeTexture(textureIndex, decoded, errorMessage)) {
+            errorMessage = "Could not decode texture '" + entry.name + "' before clamping it to 8bpp: " + errorMessage;
+            return false;
+        }
+
+        if (!gTextureArchive.replaceTextureAsBpp(textureIndex, decoded, 8u, errorMessage)) {
+            errorMessage = "Could not clamp texture '" + entry.name + "' to 8bpp: " + errorMessage;
+            return false;
+        }
+        ++clamped;
+    }
+
+    if (clamped != 0u) {
+        summaryOut = std::to_wstring(clamped) +
+            (clamped == 1u ? L" texture was clamped to 8bpp." : L" textures were clamped to 8bpp.");
+    }
+    return true;
+}
+
 static void applyAnimationToCurrentModel() {
     if (!(gMode == StorylandMode::ModelFile ||
           (gMode == StorylandMode::DtzArchive && gDtzEmbeddedPreviewKind == DtzEmbeddedPreviewKind::ModelFile))) return;
@@ -12594,12 +12647,22 @@ static void replaceSelectedTexture() {
     }
 
     uint32_t currentBpp = 8u;
+    bool clampedFromHigherBpp = false;
     if (size_t(gSelectedIndex) < gTextureArchive.textures().size()) {
         const uint8_t parsedBpp = gTextureArchive.textures()[size_t(gSelectedIndex)].bpp;
-        if (parsedBpp == 4u || parsedBpp == 8u) currentBpp = parsedBpp;
+        if (parsedBpp == 4u || parsedBpp == 8u) {
+            currentBpp = parsedBpp;
+        } else if (parsedBpp > 8u) {
+            currentBpp = 8u;
+            clampedFromHigherBpp = true;
+        }
     }
-    const int chosenBpp = chooseTextureBpp(currentBpp);
-    if (chosenBpp < 0) return;
+
+    int chosenBpp = 8;
+    if (!clampedFromHigherBpp) {
+        chosenBpp = chooseTextureBpp(currentBpp);
+        if (chosenBpp < 0) return;
+    }
 
     if (!gTextureArchive.replaceTextureAsBpp(size_t(gSelectedIndex), image, uint8_t(chosenBpp), error)) {
         MessageBoxW(gMainWindow, widen(error).c_str(), L"Replace failed", MB_ICONERROR);
@@ -12646,7 +12709,11 @@ static void replaceSelectedTexture() {
     populateTextureList();
     int nextIndex = std::min<int>(gSelectedIndex, int(gTextureArchive.textures().size()) - 1);
     if (nextIndex >= 0) selectTexture(nextIndex);
-    setStatus(L"Texture changed | right-click > Export edited texture archive");
+    if (clampedFromHigherBpp) {
+        setStatus(L"Texture changed | source material was above 8bpp and was clamped to 8bpp | right-click > Export edited texture archive");
+    } else {
+        setStatus(L"Texture changed | right-click > Export edited texture archive");
+    }
 }
 
 static void editSelectedTextureMaterial() {
@@ -12758,8 +12825,13 @@ static void addTextureMaterial() {
         }
     }
 
-    const int chosenBpp = chooseTextureBpp(uint8_t(gNewTextureDefaultBpp));
-    if (chosenBpp < 0) return;
+    const int bppChoice = chooseNewResourceTile(
+        L"New Material",
+        L"4BPP",
+        L"8BPP");
+    if (bppChoice < 0) return;
+    const int chosenBpp = bppChoice == 0 ? 4 : 8;
+    gNewTextureDefaultBpp = chosenBpp;
 
     if (!gTextureArchive.addTexture(name, image, uint8_t(chosenBpp), error)) {
         MessageBoxW(gMainWindow, widen(error).c_str(), L"Add material failed", MB_ICONERROR);
