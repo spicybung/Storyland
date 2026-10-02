@@ -3043,6 +3043,82 @@ static void emitModelPreviewTexcoordInRegion(
     }
 }
 
+static HWND createStorylandResourceTree(HWND parent) {
+    HWND tree = CreateWindowExW(
+        0,
+        WC_TREEVIEWW,
+        nullptr,
+        WS_CHILD | WS_TABSTOP | WS_CLIPSIBLINGS |
+            TVS_HASLINES | TVS_LINESATROOT | TVS_HASBUTTONS |
+            TVS_SHOWSELALWAYS | TVS_NOTOOLTIPS,
+        0, 0, 100, 100,
+        parent,
+        reinterpret_cast<HMENU>(ID_TREE),
+        gInstance,
+        nullptr);
+
+    if (!tree) return nullptr;
+
+    if (gUiFont) {
+        SendMessageW(tree, WM_SETFONT, reinterpret_cast<WPARAM>(gUiFont), TRUE);
+    }
+
+    const COLORREF paneColor = storylandPaneBackgroundColor();
+    TreeView_SetBkColor(tree, paneColor);
+    TreeView_SetTextColor(tree, storylandPaneTextColor());
+    TreeView_SetLineColor(
+        tree,
+        gEyeFriendlyPaneBackground ? RGB(70, 73, 83) : RGB(141, 169, 195));
+
+    return tree;
+}
+
+static void replaceResourceTreeWithoutDeletingItems() {
+    if (!gMainWindow) {
+        gTreePayloads.clear();
+        return;
+    }
+
+    HWND oldTree = gTree;
+    HWND newTree = createStorylandResourceTree(gMainWindow);
+    if (!newTree) {
+        // If Windows cannot create a replacement control, keep the existing
+        // tree rather than destroying its items through COMCTL32.
+        gTreePayloads.clear();
+        return;
+    }
+
+    if (oldTree) {
+        RECT oldRect = {};
+        if (GetWindowRect(oldTree, &oldRect)) {
+            POINT topLeft{oldRect.left, oldRect.top};
+            ScreenToClient(gMainWindow, &topLeft);
+            MoveWindow(
+                newTree,
+                topLeft.x,
+                topLeft.y,
+                oldRect.right - oldRect.left,
+                oldRect.bottom - oldRect.top,
+                FALSE);
+        }
+
+        // The repeated COMCTL32 0x78F13 crash occurs while native TreeView
+        // storage is being torn down.  Do not ask the control to delete its
+        // existing items during a resource switch.  Retire it as a hidden
+        // child and let Windows destroy all child controls once, when the main
+        // window itself is destroyed.  Removing the control ID also prevents
+        // stale WM_NOTIFY traffic from being mistaken for the active tree.
+        SetWindowLongPtrW(oldTree, GWLP_ID, 0);
+        ShowWindow(oldTree, SW_HIDE);
+        EnableWindow(oldTree, FALSE);
+    }
+
+    gTree = newTree;
+    gTreePayloads.clear();
+    ShowWindow(gTree, SW_SHOW);
+    InvalidateRect(gTree, nullptr, TRUE);
+}
+
 static void clearView() {
     setDetailsReadOnly(true);
     clearDtzEmbeddedPreviewState();
@@ -3050,19 +3126,7 @@ static void clearView() {
     gModelDffStructureBytes.clear();
     gModelDffStructureName.clear();
     clearModelTexture();
-    if (gTree) {
-        ++gTreeMutationDepth;
-        SendMessageW(gTree, WM_SETREDRAW, FALSE, 0);
-        TreeView_SelectItem(gTree, nullptr);
-        TreeView_DeleteAllItems(gTree);
-        gTreePayloads.clear();
-        SendMessageW(gTree, WM_SETREDRAW, TRUE, 0);
-        InvalidateRect(gTree, nullptr, TRUE);
-        UpdateWindow(gTree);
-        --gTreeMutationDepth;
-    } else {
-        gTreePayloads.clear();
-    }
+    replaceResourceTreeWithoutDeletingItems();
     setDetails(L"");
     gCurrentImage = {};
     deleteTextureBitmap();
@@ -16362,8 +16426,7 @@ static void exitAnalyzeGraph() {
 static void populateAnalyzeGraphTree() {
     if (!gTree) return;
 
-    TreeView_DeleteAllItems(gTree);
-    gTreePayloads.clear();
+    replaceResourceTreeWithoutDeletingItems();
     gSelectedKind = StorylandTreeKind::None;
     gSelectedIndex = -1;
     setDetails(L"");
@@ -17784,7 +17847,7 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         gMenuStrip = CreateWindowExW(0, menuStripClass.lpszClassName, nullptr,
             WS_CHILD, 0, 0, 100, 28, hwnd,
             reinterpret_cast<HMENU>(ID_MENU_STRIP), gInstance, nullptr);
-        gTree = CreateWindowExW(0, WC_TREEVIEWW, nullptr, WS_CHILD | WS_TABSTOP | WS_CLIPSIBLINGS | TVS_HASLINES | TVS_LINESATROOT | TVS_HASBUTTONS | TVS_SHOWSELALWAYS | TVS_NOTOOLTIPS, 0, 0, 100, 100, hwnd, reinterpret_cast<HMENU>(ID_TREE), gInstance, nullptr);
+        gTree = createStorylandResourceTree(hwnd);
         WNDCLASSW previewClass = {};
         previewClass.lpfnWndProc = previewProc;
         previewClass.hInstance = gInstance;
