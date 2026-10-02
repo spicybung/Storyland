@@ -269,6 +269,7 @@ typedef void (APIENTRY *PFNGLACTIVETEXTUREPROC)(GLenum texture);
 #define ID_FILE_NEW_MODEL_PSP_DFF_WORLD 1104
 #define ID_FILE_NEW_TEXTURE_PSP_XTX 1105
 #define ID_FILE_NEW_TEXTURE_PSP_CHK 1106
+#define ID_FILE_FLUSH 1114
 #define ID_VIEW_SCRIPTING_CONSOLE 1107
 #define ID_ARCHIVE_TEST_LVZ_IMG_PAIR 1108
 #define ID_MEDIA_REPLACE_CURRENT_FRAME 1109
@@ -1393,6 +1394,7 @@ static void importModelDataIntoCurrentDraft();
 static void layoutChildren(HWND hwnd);
 static void refreshModeUi();
 static void exportCurrentOpenedFile(bool exportAs);
+static void flushStoryland();
 static void runCurrentModelTest();
 static void populateMediaList();
 static void selectMediaPayload(const StorylandTreePayload& payload);
@@ -16868,6 +16870,61 @@ static void destroyMenuHandle(HMENU& menu) {
     menu = nullptr;
 }
 
+static void flushStoryland() {
+    // Flush only transient presentation state. Do not discard or reload the
+    // currently opened resource, because that would silently throw away edits.
+    // The parsed model/archive remains authoritative; cached Win32/OpenGL output
+    // is rebuilt from it below.
+    if (gOpenGlContext && gPreview && IsWindow(gPreview)) {
+        HDC dc = GetDC(gPreview);
+        if (dc) {
+            if (wglMakeCurrent(dc, gOpenGlContext)) {
+                glFinish();
+                wglMakeCurrent(nullptr, nullptr);
+            }
+            ReleaseDC(gPreview, dc);
+        }
+    }
+
+    // Rebuild the currently visible decoded texture from the parsed archive.
+    // This deliberately avoids touching on-disk files or archive edit state.
+    if (gMode == StorylandMode::TextureArchive) {
+        const int keepIndex = gSelectedIndex;
+        deleteTextureBitmap();
+        gCurrentImage = {};
+        if (keepIndex >= 0 && size_t(keepIndex) < gTextureArchive.textures().size()) {
+            selectTexture(keepIndex);
+        }
+    } else if (gMode == StorylandMode::ModelFile) {
+        // Drop only the OpenGL copy. Keep the decoded atlas, companion archive,
+        // selected material and unsaved model state intact. The next paint will
+        // upload the already-decoded atlas again.
+        if (gModelTextureId != 0 && gOpenGlContext && gPreview && IsWindow(gPreview)) {
+            HDC dc = GetDC(gPreview);
+            if (dc) {
+                if (wglMakeCurrent(dc, gOpenGlContext)) {
+                    glDeleteTextures(1, &gModelTextureId);
+                    glFinish();
+                    wglMakeCurrent(nullptr, nullptr);
+                    gModelTextureId = 0;
+                    gModelTextureUploadNeeded = gModelTextureLoaded && !gModelTextureImage.rgba.empty();
+                }
+                ReleaseDC(gPreview, dc);
+            }
+        }
+    }
+
+    if (gMainWindow) {
+        RedrawWindow(
+            gMainWindow,
+            nullptr,
+            nullptr,
+            RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW);
+        UpdateWindow(gMainWindow);
+    }
+    setStatus(L"Flushed transient renderer/UI state. Loaded resource and unsaved edits were preserved.");
+}
+
 static void rebuildFileMenu() {
     if (!gFileMenu) return;
     clearMenuItems(gFileMenu);
@@ -16988,6 +17045,8 @@ static void rebuildFileMenu() {
         AppendMenuW(gFileMenu, MF_STRING, ID_FILE_EXPORT_AS, L"Export As...");
     }
 
+    AppendMenuW(gFileMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(gFileMenu, MF_STRING, ID_FILE_FLUSH, L"Flush");
     AppendMenuW(gFileMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(gFileMenu, MF_STRING, ID_FILE_EXPORT_LOG, L"Export Log...");
     AppendMenuW(gFileMenu, MF_SEPARATOR, 0, nullptr);
@@ -18102,6 +18161,10 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         case ID_FILE_NEW_TEXTURE_PSP_TXD:
             beginNewTextureResource(StorylandNewTextureContainer::Txd);
             break;
+        case ID_FILE_FLUSH:
+            flushStoryland();
+            break;
+
         case ID_FILE_OPEN: {
             std::wstring path = openFileDialog(L"Storyland files\0*.scm;*.dtz;*.bin;*.img;*.dir;*.lvz;*.zmg;*.area;*.wbl;*.mdl;*.dff;*.anim;*.chk;*.xtx;*.tex;*.txd;*.sdt;*.raw;*.vag;*.vb;*.wav;*.at3;*.aa3;*.oma;*.mp3;*.ogg;*.flac;*.aac;*.m4a;*.wma;*.ac3;*.aif;*.aiff;*.adx;*.pss;*.pmf;*.mpg;*.mpeg;*.mp4;*.m4v;*.wmv;*.avi;*.mov;*.mkv;*.ts;*.m2ts;*.mts;*.vob;*.3gp;*.3g2;*.webm;*.ogv;*.flv\0Models\0*.mdl;*.dff;*.wbl\0Textures\0*.chk;*.xtx;*.tex;*.txd\0Audio\0*.sdt;*.raw;*.vag;*.vb;*.wav;*.at3;*.aa3;*.oma;*.mp3;*.ogg;*.flac;*.aac;*.m4a;*.wma;*.ac3;*.aif;*.aiff;*.adx\0Video\0*.pss;*.pmf;*.mpg;*.mpeg;*.mp4;*.m4v;*.wmv;*.avi;*.mov;*.mkv;*.ts;*.m2ts;*.mts;*.vob;*.3gp;*.3g2;*.webm;*.ogv;*.flv\0All files\0*.*\0");
             openStorylandFile(path);
@@ -19237,6 +19300,8 @@ static HWND createStorylandSplash(HINSTANCE instance, ULONGLONG& startedAt) {
     SetForegroundWindow(splash);
     SetFocus(splash);
     UpdateWindow(splash);
+    startedAt = GetTickCount64();
+    gSplashVisibleStartedAt = startedAt;
     playStorylandTheme(true);
     for (BYTE alpha = 0; alpha < 238; alpha = BYTE(alpha + 17)) {
         SetLayeredWindowAttributes(splash, 0, alpha, LWA_ALPHA);
@@ -19244,23 +19309,37 @@ static HWND createStorylandSplash(HINSTANCE instance, ULONGLONG& startedAt) {
         Sleep(8);
     }
     SetLayeredWindowAttributes(splash, 0, 255, LWA_ALPHA);
-    startedAt = GetTickCount64();
-    gSplashVisibleStartedAt = startedAt;
     return splash;
 }
 
 static void finishStorylandSplash(HWND splash, ULONGLONG startedAt) {
     if (!splash) return;
-    while (!gSplashSkipRequested && GetTickCount64() - startedAt < 5500u) {
+    constexpr ULONGLONG totalIntroMs = 5500u;
+    constexpr ULONGLONG fadeStepMs = 8u;
+    constexpr int fadeStep = 17;
+    constexpr ULONGLONG fadeSteps = 16u;
+    constexpr ULONGLONG fadeOutMs = fadeStepMs * fadeSteps;
+    const ULONGLONG fadeStartMs = totalIntroMs - fadeOutMs;
+
+    while (!gSplashSkipRequested && GetTickCount64() - startedAt < fadeStartMs) {
         pumpSplashMessages(splash);
-        Sleep(10);
+        Sleep(5);
     }
+
+    if (!gSplashSkipRequested) {
+        for (int alpha = 255; alpha >= 0; alpha -= fadeStep) {
+            SetLayeredWindowAttributes(splash, 0, BYTE(alpha), LWA_ALPHA);
+            pumpSplashMessages(splash);
+            const ULONGLONG elapsed = GetTickCount64() - startedAt;
+            if (elapsed >= totalIntroMs) break;
+            const ULONGLONG remaining = totalIntroMs - elapsed;
+            Sleep(DWORD(std::min<ULONGLONG>(fadeStepMs, remaining)));
+        }
+    }
+
+    // The sting is timed from the instant playback starts, so fade-in, startup
+    // work and fade-out are all included in the same 5.5-second budget.
     stopStorylandTheme();
-    for (int alpha = 255; alpha >= 0; alpha -= 17) {
-        SetLayeredWindowAttributes(splash, 0, BYTE(alpha), LWA_ALPHA);
-        pumpSplashMessages(splash);
-        Sleep(8);
-    }
     DestroyWindow(splash);
 }
 
