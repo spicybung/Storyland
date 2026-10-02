@@ -2581,18 +2581,25 @@ bool LeedsTextureArchive::loadFromMemory(const std::vector<uint8_t>& bytes, Leed
     return parse(platform, errorMessage);
 }
 
+static bool isPs2StoriesXetRuntimeMarker(uint32_t value) {
+    // 0xCC06 is the marker present in the retail empty VCS XTX supplied with
+    // the game. 0x8606 is retained for older/LCS-compatible archives that
+    // Storyland already accepted.
+    return value == 0x0000CC06u || value == 0x00008606u;
+}
+
 static bool ps2StoriesXetLogicalEnd(const std::vector<uint8_t>& bytes, uint32_t& logicalEnd) {
     logicalEnd = 0u;
-    if (bytes.size() < 0x50u ||
+    if (bytes.size() < 0x4Cu ||
         bytes[0] != 'x' || bytes[1] != 'e' || bytes[2] != 't' ||
-        readU32(bytes, 0x20u) != 0x00008606u) {
+        !isPs2StoriesXetRuntimeMarker(readU32(bytes, 0x20u))) {
         return false;
     }
 
     const uint32_t relocationOffset = readU32(bytes, 0x0Cu);
     const uint32_t relocationCount = readU32(bytes, 0x14u);
     const uint64_t end64 = uint64_t(relocationOffset) + uint64_t(relocationCount) * 4ull;
-    if (relocationOffset < 0x50u || end64 > uint64_t(bytes.size()) || end64 > uint64_t(UINT32_MAX)) {
+    if (relocationOffset < 0x44u || end64 > uint64_t(bytes.size()) || end64 > uint64_t(UINT32_MAX)) {
         return false;
     }
     logicalEnd = uint32_t(end64);
@@ -2634,7 +2641,7 @@ bool LeedsTextureArchive::saveToFile(const std::wstring& filePath, std::string& 
     const bool ps2Stories =
         dataBytes.size() >= 0x24u &&
         dataBytes[0] == 'x' && dataBytes[1] == 'e' && dataBytes[2] == 't' &&
-        readU32(dataBytes, 0x20u) == 0x00008606u &&
+        isPs2StoriesXetRuntimeMarker(readU32(dataBytes, 0x20u)) &&
         (entries.empty() || std::all_of(
             entries.begin(), entries.end(),
             [](const LeedsTextureEntry& e) { return e.kind == TextureKind::Ps2; }));
@@ -3340,18 +3347,74 @@ static uint32_t defaultPs2Reserved1(int width, uint8_t bpp) {
     return 0u;
 }
 
-static void initializePs2RuntimeXetHeader(std::vector<uint8_t>& bytes) {
-    bytes.assign(0x50u, 0u);
-    bytes[0] = 'x';
-    bytes[1] = 'e';
-    bytes[2] = 't';
-    bytes[3] = 0;
-    writeU32(bytes, 0x20u, 0x00008606u);
-    writeU32(bytes, 0x24u, 0u);
-    writeU32(bytes, 0x30u, 0x00000001u);
-    writeU32(bytes, 0x34u, 0x0012FD70u);
-    writeU32(bytes, 0x38u, 0x000003B5u);
-    writeU32(bytes, 0x3Cu, 0x0012FDB8u);
+static bool pathUsesVcsXtxProfile(const std::wstring& sourcePath) {
+    if (sourcePath.empty()) return false;
+    std::wstring extension = std::filesystem::path(sourcePath).extension().wstring();
+    std::transform(extension.begin(), extension.end(), extension.begin(), [](wchar_t ch) {
+        return wchar_t(std::towlower(ch));
+    });
+    return extension == L".xtx";
+}
+
+static void initializePs2RuntimeXetHeader(
+    std::vector<uint8_t>& bytes,
+    const std::vector<uint8_t>* sourceTemplate = nullptr,
+    bool vcsXtxProfile = false
+) {
+    // 0x00..0x43 is the fixed collection prefix before the relocation table in
+    // the retail empty VCS XTX. Non-empty dictionaries naturally align the first
+    // raster to 0x50, but 0x44 itself is not part of a mandatory 0x50-byte
+    // preface: the empty retail file starts its two relocation entries there.
+    bytes.assign(0x44u, 0u);
+
+    const bool usableTemplate =
+        sourceTemplate != nullptr &&
+        sourceTemplate->size() >= 0x44u &&
+        (*sourceTemplate)[0] == 'x' &&
+        (*sourceTemplate)[1] == 'e' &&
+        (*sourceTemplate)[2] == 't';
+
+    if (usableTemplate) {
+        std::copy(sourceTemplate->begin(), sourceTemplate->begin() + 0x44u, bytes.begin());
+    } else if (vcsXtxProfile) {
+        // Exact opaque/header constants from the retail empty VCS XTX template.
+        // 0x30/0x34 are intentionally 0xCCCCCCCC in retail; do not "clean" them
+        // into invented runtime pointers.
+        bytes[0] = 'x';
+        bytes[1] = 'e';
+        bytes[2] = 't';
+        bytes[3] = 0;
+        writeU32(bytes, 0x20u, 0x0000CC06u);
+        writeU32(bytes, 0x24u, 0u);
+        writeU32(bytes, 0x30u, 0xCCCCCCCCu);
+        writeU32(bytes, 0x34u, 0xCCCCCCCCu);
+        writeU32(bytes, 0x38u, 0u);
+        writeU32(bytes, 0x3Cu, 0x001D3B1Cu);
+        writeU32(bytes, 0x40u, 0x07070040u);
+    } else {
+        // Preserve the pre-existing Storyland/LCS-compatible profile for CHK/TEX
+        // creation. Existing archives always use their own header as the template.
+        bytes[0] = 'x';
+        bytes[1] = 'e';
+        bytes[2] = 't';
+        bytes[3] = 0;
+        writeU32(bytes, 0x20u, 0x00008606u);
+        writeU32(bytes, 0x24u, 0u);
+        writeU32(bytes, 0x30u, 0x00000001u);
+        writeU32(bytes, 0x34u, 0x0012FD70u);
+        writeU32(bytes, 0x38u, 0x000003B5u);
+        writeU32(bytes, 0x3Cu, 0x0012FDB8u);
+    }
+
+    // These fields are structural and are rebuilt below. Opaque profile words
+    // outside these ranges are intentionally preserved verbatim.
+    writeU32(bytes, 0x08u, 0u);
+    writeU32(bytes, 0x0Cu, 0u);
+    writeU32(bytes, 0x10u, 0u);
+    writeU32(bytes, 0x14u, 0u);
+    writeU32(bytes, 0x18u, 0u);
+    writeU32(bytes, 0x28u, 0x28u);
+    writeU32(bytes, 0x2Cu, 0x28u);
 }
 
 static void normalizePs2SerializedHeaderForRuntime(std::vector<uint8_t>& headerBytes) {
@@ -3458,23 +3521,28 @@ static bool encodeCanonicalPs2Texture(
 static bool buildCanonicalPs2Xet(
     const std::vector<StorylandPs2TextureBuildItem>& items,
     std::vector<uint8_t>& bytesOut,
-    std::string& errorMessage
+    std::string& errorMessage,
+    bool vcsXtxProfile = false
 ) {
     if (items.size() > 4096u) {
         errorMessage = "Too many textures for a Leeds texture dictionary.";
         return false;
     }
 
-    initializePs2RuntimeXetHeader(bytesOut);
+    initializePs2RuntimeXetHeader(bytesOut, nullptr, vcsXtxProfile);
 
     if (items.empty()) {
-        writeU32(bytesOut, 0x28u, 0x28u);
-        writeU32(bytesOut, 0x2Cu, 0x28u);
+        const uint32_t relocationOffset = uint32_t(bytesOut.size());
+        bytesOut.resize(bytesOut.size() + 8u, 0u);
+        writeU32(bytesOut, relocationOffset + 0u, 0x28u);
+        writeU32(bytesOut, relocationOffset + 4u, 0x2Cu);
         writeU32(bytesOut, 0x08u, uint32_t(bytesOut.size()));
-        writeU32(bytesOut, 0x0Cu, uint32_t(bytesOut.size()));
-        writeU32(bytesOut, 0x10u, uint32_t(bytesOut.size()));
-        writeU32(bytesOut, 0x14u, 0u);
+        writeU32(bytesOut, 0x0Cu, relocationOffset);
+        writeU32(bytesOut, 0x10u, relocationOffset);
+        writeU32(bytesOut, 0x14u, 2u);
         writeU32(bytesOut, 0x18u, 0u);
+        constexpr size_t kPs2SectorSize = 2048u;
+        bytesOut.resize(kPs2SectorSize, 0u);
         return true;
     }
 
@@ -3609,23 +3677,32 @@ static bool collectRawPs2BuildItems(
 static bool buildPs2XetPreservingRawTextureData(
     const std::vector<StorylandPs2RawBuildItem>& items,
     std::vector<uint8_t>& bytesOut,
-    std::string& errorMessage
+    std::string& errorMessage,
+    const std::vector<uint8_t>* sourceTemplate = nullptr
 ) {
     if (items.size() > 4096u) {
         errorMessage = "Too many textures for a Leeds texture dictionary.";
         return false;
     }
 
-    initializePs2RuntimeXetHeader(bytesOut);
+    initializePs2RuntimeXetHeader(
+        bytesOut,
+        sourceTemplate,
+        sourceTemplate != nullptr && sourceTemplate->size() >= 0x24u &&
+            readU32(*sourceTemplate, 0x20u) == 0x0000CC06u);
 
     if (items.empty()) {
-        writeU32(bytesOut, 0x28u, 0x28u);
-        writeU32(bytesOut, 0x2Cu, 0x28u);
+        const uint32_t relocationOffset = uint32_t(bytesOut.size());
+        bytesOut.resize(bytesOut.size() + 8u, 0u);
+        writeU32(bytesOut, relocationOffset + 0u, 0x28u);
+        writeU32(bytesOut, relocationOffset + 4u, 0x2Cu);
         writeU32(bytesOut, 0x08u, uint32_t(bytesOut.size()));
-        writeU32(bytesOut, 0x0Cu, uint32_t(bytesOut.size()));
-        writeU32(bytesOut, 0x10u, uint32_t(bytesOut.size()));
-        writeU32(bytesOut, 0x14u, 0u);
+        writeU32(bytesOut, 0x0Cu, relocationOffset);
+        writeU32(bytesOut, 0x10u, relocationOffset);
+        writeU32(bytesOut, 0x14u, 2u);
         writeU32(bytesOut, 0x18u, 0u);
+        constexpr size_t kPs2SectorSize = 2048u;
+        bytesOut.resize(kPs2SectorSize, 0u);
         return true;
     }
 
@@ -3767,7 +3844,7 @@ bool LeedsTextureArchive::normalizePs2RuntimeLayout(std::string& report, std::st
     }
 
     std::vector<uint8_t> rebuilt;
-    if (!buildPs2XetPreservingRawTextureData(items, rebuilt, errorMessage)) return false;
+    if (!buildPs2XetPreservingRawTextureData(items, rebuilt, errorMessage, &dataBytes)) return false;
 
     LeedsTextureArchive trial;
     if (!trial.loadFromMemory(rebuilt, LeedsPlatform::Ps2, errorMessage, path)) return false;
@@ -3795,7 +3872,7 @@ bool LeedsTextureArchive::normalizePs2RuntimeLayout(std::string& report, std::st
 
 bool LeedsTextureArchive::createEmptyPs2(const std::wstring& virtualPath, std::string& errorMessage) {
     std::vector<uint8_t> fresh;
-    if (!buildCanonicalPs2Xet({}, fresh, errorMessage)) return false;
+    if (!buildCanonicalPs2Xet({}, fresh, errorMessage, pathUsesVcsXtxProfile(virtualPath))) return false;
     dataBytes = std::move(fresh);
     path = virtualPath;
     loadedPlatform = LeedsPlatform::Ps2;
@@ -3988,7 +4065,7 @@ bool LeedsTextureArchive::addTexture(const std::string& name, const RgbaImage& i
     }
 
     std::vector<uint8_t> rebuilt;
-    if (!buildPs2XetPreservingRawTextureData(rawItems, rebuilt, errorMessage)) return false;
+    if (!buildPs2XetPreservingRawTextureData(rawItems, rebuilt, errorMessage, &dataBytes)) return false;
     dataBytes = std::move(rebuilt);
     loadedPlatform = LeedsPlatform::Ps2;
     return parse(loadedPlatform, errorMessage);
@@ -4059,7 +4136,7 @@ bool LeedsTextureArchive::swapTextureData(size_t firstTextureIndex, size_t secon
     rawItems[secondTextureIndex].name = secondName;
 
     std::vector<uint8_t> rebuilt;
-    if (!buildPs2XetPreservingRawTextureData(rawItems, rebuilt, errorMessage)) return false;
+    if (!buildPs2XetPreservingRawTextureData(rawItems, rebuilt, errorMessage, &dataBytes)) return false;
 
     // Commit only after the complete rebuilt archive parses successfully.
     LeedsTextureArchive trial;
@@ -4138,7 +4215,7 @@ bool LeedsTextureArchive::duplicateTexture(size_t textureIndex, const std::strin
     rawItems.insert(rawItems.begin() + std::ptrdiff_t(textureIndex + 1u), std::move(copy));
 
     std::vector<uint8_t> rebuilt;
-    if (!buildPs2XetPreservingRawTextureData(rawItems, rebuilt, errorMessage)) return false;
+    if (!buildPs2XetPreservingRawTextureData(rawItems, rebuilt, errorMessage, &dataBytes)) return false;
     LeedsTextureArchive trial;
     if (!trial.loadFromMemory(rebuilt, LeedsPlatform::Ps2, errorMessage, path)) return false;
     dataBytes = std::move(rebuilt);
@@ -4186,7 +4263,7 @@ bool LeedsTextureArchive::removeTexture(size_t textureIndex, std::string& errorM
     rawItems.erase(rawItems.begin() + std::ptrdiff_t(textureIndex));
 
     std::vector<uint8_t> rebuilt;
-    if (!buildPs2XetPreservingRawTextureData(rawItems, rebuilt, errorMessage)) return false;
+    if (!buildPs2XetPreservingRawTextureData(rawItems, rebuilt, errorMessage, &dataBytes)) return false;
     LeedsTextureArchive trial;
     if (!trial.loadFromMemory(rebuilt, LeedsPlatform::Ps2, errorMessage, path)) return false;
     dataBytes = std::move(rebuilt);
@@ -4250,31 +4327,22 @@ bool LeedsTextureArchive::validateStructure(std::string& report, std::string& er
 
     const bool ps2StoriesRuntimeXet =
         dataBytes.size() >= 0x24u &&
-        readU32(dataBytes, 0x20u) == 0x00008606u &&
-        !trial.textures().empty() &&
+        isPs2StoriesXetRuntimeMarker(readU32(dataBytes, 0x20u)) &&
         std::all_of(
             trial.textures().begin(),
             trial.textures().end(),
             [](const LeedsTextureEntry& entry) { return entry.kind == TextureKind::Ps2; });
 
     if (ps2StoriesRuntimeXet) {
-        if (dataBytes.size() < 0x50u) {
-            errorMessage = "PS2 Stories XTX is missing the retail 0x50-byte runtime preface.";
-            return false;
-        }
-        const bool retailRuntimePreface =
-            readU32(dataBytes, 0x30u) == 0x00000001u &&
-            readU32(dataBytes, 0x34u) == 0x0012FD70u &&
-            readU32(dataBytes, 0x38u) == 0x000003B5u &&
-            readU32(dataBytes, 0x3Cu) == 0x0012FDB8u;
-        if (!retailRuntimePreface) {
-            errorMessage =
-                "PS2 Stories XTX is parseable but not canonical runtime serialization: "
-                "runtime preface 0x30..0x3C must be 1, 0x0012FD70, 0x000003B5, 0x0012FDB8. "
-                "Use Export/Export As to rebuild the runtime container.";
+        if (dataBytes.size() < 0x4Cu) {
+            errorMessage = "PS2 Stories XTX is smaller than the retail collection header and relocation sentinel table.";
             return false;
         }
 
+        // Retail VCS proves that 0x30..0x40 are not a universal set of fixed
+        // runtime pointers: a stock empty XTX contains 0xCCCCCCCC at +0x30/+0x34
+        // and different opaque words at +0x3C/+0x40. Treat these as profile data,
+        // preserve them when editing, and validate the actual structural fields.
         const uint32_t relocationOffset = readU32(dataBytes, 0x0Cu);
         const uint32_t relocationCount = readU32(dataBytes, 0x14u);
         const uint64_t relocationEnd64 =
@@ -4290,6 +4358,21 @@ bool LeedsTextureArchive::validateStructure(std::string& report, std::string& er
                 "Header +0x08 must end exactly at the relocation table; "
                 "trailing alignment/sector padding must remain outside the logical collection.";
             return false;
+        }
+        if (relocationCount < 2u || relocationOffset + 8u > dataBytes.size() ||
+            readU32(dataBytes, relocationOffset + 0u) != 0x28u ||
+            readU32(dataBytes, relocationOffset + 4u) != 0x2Cu) {
+            errorMessage = "PS2 Stories XTX relocation table must begin with the collection tail/head pointer fields 0x28 and 0x2C.";
+            return false;
+        }
+        if (trial.textures().empty()) {
+            if (readU32(dataBytes, 0x28u) != 0x28u || readU32(dataBytes, 0x2Cu) != 0x28u || relocationCount != 2u) {
+                errorMessage = "Empty PS2 Stories XTX does not match the retail intrusive-list sentinel layout.";
+                return false;
+            }
+            report = "PS2 Stories XTX structure: valid empty retail dictionary; 2 relocation entries; sector-padded.\n";
+            errorMessage.clear();
+            return true;
         }
 
         uint32_t firstNode = UINT32_MAX;
