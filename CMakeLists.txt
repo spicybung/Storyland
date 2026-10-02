@@ -136,6 +136,7 @@ add_executable(Storyland WIN32
 
 target_include_directories(Storyland PRIVATE
     src/storyland
+    src/thirdparty
     src/shaders
     src/leeds
     src/validation

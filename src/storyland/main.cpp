@@ -272,6 +272,7 @@ typedef void (APIENTRY *PFNGLACTIVETEXTUREPROC)(GLenum texture);
 #define ID_FILE_RELOAD 1114
 #define ID_VIEW_SCRIPTING_CONSOLE 1107
 #define ID_ARCHIVE_TEST_LVZ_IMG_PAIR 1108
+#define ID_ARCHIVE_ADD_RESOURCE 1115
 #define ID_MEDIA_REPLACE_CURRENT_FRAME 1109
 #define ID_SCRIPT_NEW 2101
 #define ID_SCRIPT_OPEN 2102
@@ -892,6 +893,26 @@ static void expandTreeItem(HTREEITEM item) {
 static std::wstring widenResourceName(const std::string& text);
 
 static std::wstring selectedTreeDisplayText() {
+    // Model hierarchy rows describe bones, fields and diagnostics. They must never
+    // replace the file/resource name shown in the renderer overlay.
+    if (gMode == StorylandMode::ModelFile && !gModelFile.sourcePath().empty()) {
+        const std::wstring fileName = std::filesystem::path(gModelFile.sourcePath()).filename().wstring();
+        if (!fileName.empty()) return fileName;
+    }
+    if (gMode == StorylandMode::TextureArchive && !gTextureArchive.sourcePath().empty()) {
+        const std::wstring fileName = std::filesystem::path(gTextureArchive.sourcePath()).filename().wstring();
+        if (!fileName.empty()) return fileName;
+    }
+    if (gDtzEmbeddedPreviewKind != DtzEmbeddedPreviewKind::None && gDtzEmbeddedPreviewIndex >= 0) {
+        const auto& entries = gDtzArchive.dirEntries();
+        const size_t previewIndex = size_t(gDtzEmbeddedPreviewIndex);
+        if (previewIndex < entries.size()) return widenResourceName(entries[previewIndex].name);
+        if (!gDtzEmbeddedPreviewPath.empty()) {
+            const std::wstring fileName = std::filesystem::path(gDtzEmbeddedPreviewPath).filename().wstring();
+            if (!fileName.empty()) return fileName;
+        }
+    }
+
     if (!gTree) return {};
     HTREEITEM selected = TreeView_GetSelection(gTree);
     if (!selected) return {};
@@ -923,19 +944,6 @@ static std::wstring selectedTreeDisplayText() {
             if (index < entries.size()) {
                 return widenResourceName(entries[index].name);
             }
-        }
-    }
-
-    if (gDtzEmbeddedPreviewKind != DtzEmbeddedPreviewKind::None &&
-        gDtzEmbeddedPreviewIndex >= 0) {
-        if (!gDtzEmbeddedPreviewPath.empty()) {
-            const std::wstring fileName = std::filesystem::path(gDtzEmbeddedPreviewPath).filename().wstring();
-            if (!fileName.empty()) return fileName;
-        }
-        const auto& entries = gDtzArchive.dirEntries();
-        const size_t index = size_t(gDtzEmbeddedPreviewIndex);
-        if (index < entries.size()) {
-            return widenResourceName(entries[index].name);
         }
     }
 
@@ -1020,6 +1028,38 @@ static std::wstring widenResourceName(const std::string& text) {
     }
     while (!result.empty() && (result.back() == L' ' || result.back() == L'?')) result.pop_back();
     return result.empty() ? L"unnamed" : result;
+}
+
+static std::wstring archiveExtensionForIdent(uint32_t ident) {
+    switch (ident) {
+    case 0x006D646Cu: return L".mdl";   // ldm\0
+    case 0x00746578u: return L".xtx";   // tex\0
+    case 0x57524C44u: return L".wrld";  // DLRW
+    case 0x41455241u:                   // AREA
+    case 0x41524541u: return L".area";  // AERA
+    case 0x47544147u: return L".dtz";   // GTAG
+    case 0x6D696E61u: return L".anim";  // anim
+    case 0x636F6C32u: return L".col";   // col2
+    default: return L".bin";
+    }
+}
+
+static std::wstring archiveDisplayName(const StorylandArchiveEntry& entry, size_t entryIndex) {
+    std::wstring display = widenResourceName(entry.name);
+    size_t useful = 0;
+    size_t question = 0;
+    for (wchar_t ch : display) {
+        if (ch == L'?') ++question;
+        else if ((ch >= L'A' && ch <= L'Z') || (ch >= L'a' && ch <= L'z') ||
+                 (ch >= L'0' && ch <= L'9') || ch == L'_' || ch == L'-' || ch == L'.') ++useful;
+    }
+    const bool bad = display.empty() || display == L"unnamed" || useful < 2 ||
+        (question >= 3 && question * 2 >= display.size());
+    if (!bad) return display;
+
+    std::wstring ext = archiveExtensionForIdent(entry.chunkIdent);
+    if (ext.empty()) ext = L".bin";
+    return L"resource" + std::to_wstring(entryIndex) + ext;
 }
 
 static std::string narrow(const std::wstring& text) {
@@ -1256,7 +1296,7 @@ static void applyStorylandTitleTint(StorylandTitleTint tint) {
                 pane,
                 nullptr,
                 nullptr,
-                RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW | RDW_ERASE);
+                RDW_INVALIDATE | RDW_FRAME);
         }
     }
 }
@@ -1361,8 +1401,7 @@ static void refreshScmMissionTree();
 static std::wstring buildDtzPreviewExtractRoot();
 static void clearDtzEmbeddedPreviewState();
 static bool currentModeUsesInteractiveModelViewport();
-static void drawOpenGlViewCube(HWND hwnd, int width, int height);
-static void drawOpenGlViewCubeLabels(HWND hwnd, HDC dc);
+static void drawOpenGlViewCube(HWND hwnd, HDC dc, int width, int height);
 static void showRenderModePie(HWND owner);
 static void drawWblPreviewOpenGl(HWND hwnd, HDC dc, RECT rc);
 static void applyModelViewportZoom(float scale);
@@ -3249,28 +3288,36 @@ static bool moveArchiveViewportKey(WPARAM key) {
 }
 
 static RECT renderPieButtonRect(UINT id) {
+    const int cx = 80;
+    const int cy = 80;
     switch (id) {
-    case ID_RENDER_PIE_STORIES:   return RECT{88, 12, 192, 62};
-    case ID_RENDER_PIE_SOLID:     return RECT{176, 76, 272, 126};
-    case ID_RENDER_PIE_TEXTURED:  return RECT{88, 140, 192, 190};
-    case ID_RENDER_PIE_WIREFRAME: return RECT{8, 76, 104, 126};
+    case ID_RENDER_PIE_WIREFRAME: return RECT{4, 58, 56, 102};
+    case ID_RENDER_PIE_SOLID:     return RECT{104, 58, 156, 102};
+    case ID_RENDER_PIE_TEXTURED:  return RECT{52, 108, 108, 156};
+    case ID_RENDER_PIE_STORIES:   return RECT{52, 4, 108, 52};
     default: return RECT{};
     }
 }
 
-static void drawRenderPieButton(HDC dc, UINT id, const wchar_t* label, bool active) {
+static int renderPieSelectionFromPoint(POINT pt) {
+    const float dx = float(pt.x - 80);
+    const float dy = float(pt.y - 80);
+    if (std::abs(dx) <= 10.0f && std::abs(dy) <= 10.0f) return -1;
+    if (std::abs(dx) > std::abs(dy)) return dx < 0.0f ? 0 : 1;
+    return dy < 0.0f ? 3 : 2;
+}
+
+static void drawRenderPieButton(HDC dc, UINT id, const wchar_t* label, bool active, bool hovered) {
     RECT rc = renderPieButtonRect(id);
-    HBRUSH brush = CreateSolidBrush(active ? RGB(68, 88, 108) : RGB(44, 47, 54));
-    HPEN pen = CreatePen(PS_SOLID, 1, active ? RGB(126, 180, 220) : RGB(78, 82, 92));
-    HGDIOBJ oldBrush = SelectObject(dc, brush);
-    HGDIOBJ oldPen = SelectObject(dc, pen);
-    RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, 8, 8);
-    SelectObject(dc, oldPen);
-    SelectObject(dc, oldBrush);
-    DeleteObject(pen);
-    DeleteObject(brush);
+    if (active || hovered) {
+        HBRUSH brush = CreateSolidBrush(active ? RGB(54, 91, 139) : RGB(62, 79, 108));
+        HGDIOBJ old = SelectObject(dc, brush);
+        RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, 8, 8);
+        SelectObject(dc, old);
+        DeleteObject(brush);
+    }
     SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, RGB(235, 238, 242));
+    SetTextColor(dc, RGB(245, 245, 250));
     DrawTextW(dc, label, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 }
 
@@ -3280,40 +3327,56 @@ static LRESULT CALLBACK renderPieProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         PAINTSTRUCT ps{};
         HDC dc = BeginPaint(hwnd, &ps);
         RECT client{}; GetClientRect(hwnd, &client);
-        HBRUSH background = CreateSolidBrush(RGB(28, 30, 35));
+        HBRUSH background = CreateSolidBrush(RGB(31, 34, 41));
         FillRect(dc, &client, background);
         DeleteObject(background);
-        drawRenderPieButton(dc, ID_RENDER_PIE_STORIES, L"Render", gOpenGlRenderMode == StorylandOpenGlRenderMode::Stories);
-        drawRenderPieButton(dc, ID_RENDER_PIE_SOLID, L"Solid", gOpenGlRenderMode == StorylandOpenGlRenderMode::Solid);
-        drawRenderPieButton(dc, ID_RENDER_PIE_TEXTURED, L"Material", gOpenGlRenderMode == StorylandOpenGlRenderMode::Textured);
-        drawRenderPieButton(dc, ID_RENDER_PIE_WIREFRAME, L"Wireframe", gOpenGlRenderMode == StorylandOpenGlRenderMode::Wireframe);
-        RECT center{118, 82, 162, 120};
-        SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, RGB(160, 165, 174));
-        DrawTextW(dc, L"Z", -1, &center, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+        POINT mouse{}; GetCursorPos(&mouse); ScreenToClient(hwnd, &mouse);
+        const int hover = renderPieSelectionFromPoint(mouse);
+        const int cx = 80, cy = 80, radius = 74;
+        HBRUSH fill = CreateSolidBrush(RGB(42, 46, 56));
+        HPEN ring = CreatePen(PS_SOLID, 1, RGB(170, 178, 196));
+        HGDIOBJ oldBrush = SelectObject(dc, fill);
+        HGDIOBJ oldPen = SelectObject(dc, ring);
+        Ellipse(dc, cx - radius, cy - radius, cx + radius, cy + radius);
+        SelectObject(dc, oldPen); SelectObject(dc, oldBrush);
+        DeleteObject(ring); DeleteObject(fill);
+        HPEN inner = CreatePen(PS_SOLID, 1, RGB(135, 140, 155));
+        oldPen = SelectObject(dc, inner);
+        Ellipse(dc, cx - 18, cy - 18, cx + 18, cy + 18);
+        MoveToEx(dc, cx - 18, cy, nullptr); LineTo(dc, cx - radius + 8, cy);
+        MoveToEx(dc, cx + 18, cy, nullptr); LineTo(dc, cx + radius - 8, cy);
+        MoveToEx(dc, cx, cy - 18, nullptr); LineTo(dc, cx, cy - radius + 8);
+        MoveToEx(dc, cx, cy + 18, nullptr); LineTo(dc, cx, cy + radius - 8);
+        SelectObject(dc, oldPen); DeleteObject(inner);
+
+        drawRenderPieButton(dc, ID_RENDER_PIE_WIREFRAME, L"Wireframe", gOpenGlRenderMode == StorylandOpenGlRenderMode::Wireframe, hover == 0);
+        drawRenderPieButton(dc, ID_RENDER_PIE_SOLID, L"Solid", gOpenGlRenderMode == StorylandOpenGlRenderMode::Solid, hover == 1);
+        drawRenderPieButton(dc, ID_RENDER_PIE_TEXTURED, L"Material", gOpenGlRenderMode == StorylandOpenGlRenderMode::Textured, hover == 2);
+        drawRenderPieButton(dc, ID_RENDER_PIE_STORIES, L"Render", gOpenGlRenderMode == StorylandOpenGlRenderMode::Stories, hover == 3);
         EndPaint(hwnd, &ps);
         return 0;
     }
     case WM_LBUTTONUP: {
         POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-        struct Choice { UINT id; StorylandOpenGlRenderMode mode; } choices[] = {
-            {ID_RENDER_PIE_STORIES, StorylandOpenGlRenderMode::Stories},
-            {ID_RENDER_PIE_SOLID, StorylandOpenGlRenderMode::Solid},
-            {ID_RENDER_PIE_TEXTURED, StorylandOpenGlRenderMode::Textured},
-            {ID_RENDER_PIE_WIREFRAME, StorylandOpenGlRenderMode::Wireframe},
-        };
-        for (const Choice& choice : choices) {
-            RECT rc = renderPieButtonRect(choice.id);
-            if (PtInRect(&rc, pt)) {
-                setOpenGlRenderMode(choice.mode);
-                setStatus(std::wstring(L"Viewport shading: ") + openGlRenderModeName(choice.mode) + L".");
-                ShowWindow(hwnd, SW_HIDE);
-                SetFocus(gPreview ? gPreview : gMainWindow);
-                return 0;
-            }
+        const int selection = renderPieSelectionFromPoint(pt);
+        if (selection >= 0) {
+            const StorylandOpenGlRenderMode modes[4] = {
+                StorylandOpenGlRenderMode::Wireframe,
+                StorylandOpenGlRenderMode::Solid,
+                StorylandOpenGlRenderMode::Textured,
+                StorylandOpenGlRenderMode::Stories
+            };
+            setOpenGlRenderMode(modes[selection]);
+            setStatus(std::wstring(L"Viewport shading: ") + openGlRenderModeName(modes[selection]) + L".");
+            ShowWindow(hwnd, SW_HIDE);
+            SetFocus(gPreview ? gPreview : gMainWindow);
         }
         return 0;
     }
+    case WM_MOUSEMOVE:
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
     case WM_KEYDOWN:
         if (wParam == VK_ESCAPE || wParam == 'Z') {
             ShowWindow(hwnd, SW_HIDE);
@@ -3342,10 +3405,18 @@ static void showRenderModePie(HWND owner) {
 
     if (!gRenderPieWindow || !IsWindow(gRenderPieWindow)) {
         gRenderPieWindow = CreateWindowExW(
-            0, kClassName, L"", WS_CHILD | WS_CLIPSIBLINGS,
-            0, 0, 280, 202, gPreview, nullptr, gInstance, nullptr);
+            WS_EX_TOOLWINDOW, kClassName, L"", WS_CHILD | WS_CLIPSIBLINGS,
+            0, 0, 160, 160, gPreview, nullptr, gInstance, nullptr);
     }
     if (!gRenderPieWindow) return;
+
+    // Keep the render selector physically circular.  Using a color-keyed layered
+    // child window made the control disappear on some Windows/common-controls
+    // configurations and was the reason the pie appeared to have been removed.
+    // A real window region gives us the ODFF-style circular selector without a
+    // rectangular background or layered-child quirks.
+    HRGN pieRegion = CreateEllipticRgn(0, 0, 160, 160);
+    SetWindowRgn(gRenderPieWindow, pieRegion, TRUE);
 
     if (IsWindowVisible(gRenderPieWindow)) {
         ShowWindow(gRenderPieWindow, SW_HIDE);
@@ -3354,14 +3425,15 @@ static void showRenderModePie(HWND owner) {
     }
 
     RECT rc{}; GetClientRect(gPreview, &rc);
-    const int width = 280, height = 202;
-    const int x = std::max(0, (int(rc.right - rc.left) - width) / 2);
-    const int y = std::max(0, (int(rc.bottom - rc.top) - height) / 2);
+    const int width = 160, height = 160;
+    POINT mouse{}; GetCursorPos(&mouse); ScreenToClient(gPreview, &mouse);
+    const int x = std::clamp(int(mouse.x) - width / 2, 0, std::max(0, int(rc.right - rc.left) - width));
+    const int y = std::clamp(int(mouse.y) - height / 2, 0, std::max(0, int(rc.bottom - rc.top) - height));
     MoveWindow(gRenderPieWindow, x, y, width, height, TRUE);
     ShowWindow(gRenderPieWindow, SW_SHOW);
     BringWindowToTop(gRenderPieWindow);
     SetFocus(gRenderPieWindow);
-    InvalidateRect(gRenderPieWindow, nullptr, TRUE);
+    InvalidateRect(gRenderPieWindow, nullptr, FALSE);
 }
 
 static bool handleModelViewportShortcut(WPARAM key) {
@@ -3824,7 +3896,8 @@ static void drawSelectedViewportLabelOpenGl(HDC dc, int width, int height) {
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_LIGHTING);
     glDisable(GL_TEXTURE_2D);
-    glDisable(GL_BLEND);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
     glMatrixMode(GL_PROJECTION);
     glPushMatrix();
@@ -3835,7 +3908,7 @@ static void drawSelectedViewportLabelOpenGl(HDC dc, int width, int height) {
     glLoadIdentity();
 
     const float boxWidth = std::min(float(width - 20), 18.0f + float(text.size()) * 8.5f);
-    glColor4f(0.095f, 0.102f, 0.122f, 1.0f);
+    glColor4f(0.055f, 0.060f, 0.075f, 0.42f);
     glBegin(GL_QUADS);
     glVertex2f(10.0f, float(height) - 38.0f);
     glVertex2f(10.0f + boxWidth, float(height) - 38.0f);
@@ -3843,9 +3916,79 @@ static void drawSelectedViewportLabelOpenGl(HDC dc, int width, int height) {
     glVertex2f(10.0f, float(height) - 10.0f);
     glEnd();
 
-    glColor3f(0.93f, 0.94f, 0.96f);
+    glColor4f(0.72f, 0.75f, 0.82f, 0.38f);
+    glBegin(GL_LINE_LOOP);
+    glVertex2f(10.5f, float(height) - 37.5f);
+    glVertex2f(9.5f + boxWidth, float(height) - 37.5f);
+    glVertex2f(9.5f + boxWidth, float(height) - 10.5f);
+    glVertex2f(10.5f, float(height) - 10.5f);
+    glEnd();
+
+    glColor4f(0.95f, 0.96f, 0.98f, 0.98f);
     glRasterPos2f(18.0f, float(height) - 29.0f);
     glListBase(listBase - 32);
+    glCallLists(GLsizei(text.size()), GL_UNSIGNED_BYTE, text.data());
+
+    glPopMatrix();
+    glMatrixMode(GL_PROJECTION);
+    glPopMatrix();
+    glMatrixMode(GL_MODELVIEW);
+    glPopAttrib();
+
+    glDeleteLists(listBase, 96);
+    SelectObject(dc, oldFont);
+    DeleteObject(font);
+}
+
+
+static void drawViewportTextOpenGl(HDC dc, int width, int height, int x, int yFromTop,
+                                   const std::wstring& wideText, bool semibold = false) {
+    if (!dc || wideText.empty() || width <= 0 || height <= 0) return;
+    const std::string text = viewportLabelAscii(wideText);
+    if (text.empty()) return;
+
+    HFONT font = CreateFontW(
+        -15, 0, 0, 0, semibold ? FW_SEMIBOLD : FW_NORMAL,
+        FALSE, FALSE, FALSE, ANSI_CHARSET,
+        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+        DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+    if (!font) return;
+
+    HGDIOBJ oldFont = SelectObject(dc, font);
+    GLuint listBase = glGenLists(96);
+    if (listBase == 0 || !wglUseFontBitmapsW(dc, 32, 96, listBase)) {
+        if (listBase != 0) glDeleteLists(listBase, 96);
+        SelectObject(dc, oldFont);
+        DeleteObject(font);
+        return;
+    }
+
+    glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_CURRENT_BIT | GL_TRANSFORM_BIT);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_LIGHTING);
+    glDisable(GL_TEXTURE_2D);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    glMatrixMode(GL_PROJECTION);
+    glPushMatrix();
+    glLoadIdentity();
+    glOrtho(0.0, double(width), 0.0, double(height), -1.0, 1.0);
+    glMatrixMode(GL_MODELVIEW);
+    glPushMatrix();
+    glLoadIdentity();
+
+    const float px = float(x);
+    const float py = float(height - yFromTop - 15);
+
+    // Small two-pass shadow instead of an opaque label rectangle.
+    glColor4f(0.0f, 0.0f, 0.0f, 0.72f);
+    glRasterPos2f(px + 1.0f, py - 1.0f);
+    glListBase(listBase - 32);
+    glCallLists(GLsizei(text.size()), GL_UNSIGNED_BYTE, text.data());
+
+    glColor4f(0.94f, 0.95f, 0.97f, 0.98f);
+    glRasterPos2f(px, py);
     glCallLists(GLsizei(text.size()), GL_UNSIGNED_BYTE, text.data());
 
     glPopMatrix();
@@ -4088,7 +4231,7 @@ static void selectDtzOverview() {
     ss << L"  Valid decoded effects: " << decodedLeeds2dfxEffects << L"\r\n";
     ss << L"  Valid decoded light definitions: " << decodedLeeds2dfxLights << L"\r\n";
     ss << L"  Definitions linked through CBaseModelInfo ranges: " << modelLinkedLeeds2dfxEffects << L"\r\n";
-    ss << L"  Allocated BUILDING/TREADABLE/DUMMY world light instances: " << worldLeeds2dfxLights << L"\r\n";
+    ss << L"  World light placements: " << worldLeeds2dfxLights << L"\r\n";
     ss << L"  The right viewport uses each allocated CEntity world matrix to place native model-space effects. It falls back to a model-definition atlas only when no allocated pool instances can be resolved.\r\n\r\n";
 
     ss << L"World placement / map structures:\r\n";
@@ -4456,7 +4599,7 @@ static void populateDtzList() {
     }
 
     std::wstringstream worldTitle;
-    worldTitle << L"Allocated BUILDING/TREADABLE/DUMMY CEntity world instances  lights=" << leeds2dfxWorldLightCount
+    worldTitle << L"World placements  lights=" << leeds2dfxWorldLightCount
                << L"  all-effects=" << leeds2dfxWorldInstances.size();
     HTREEITEM worldRoot = addTreeItem(leeds2dfxRoot, worldTitle.str());
     if (leeds2dfxWorldInstances.empty()) {
@@ -5252,7 +5395,7 @@ static void selectWblPayload(const StorylandTreePayload& payload) {
 
 static void addArchiveEntryTreeItem(HTREEITEM parent, const StorylandArchiveEntry& entry, size_t entryIndex) {
     std::wstringstream line;
-    line << widenResourceName(entry.name)
+    line << archiveDisplayName(entry, entryIndex)
          << L" | start=" << entry.startSector
          << L" count=" << entry.sectorCount
          << L" bytes=" << entry.byteSize
@@ -5692,7 +5835,7 @@ static void selectArchiveEntry(int index) {
 
     std::wstringstream ss;
     ss << (gArchiveBrowser.hasLvzContext() ? L"LVZ + IMG entry\r\n\r\n" : L"IMG archive entry\r\n\r\n")
-       << L"Name: " << widenResourceName(entry.name) << L"\r\n"
+       << L"Name: " << archiveDisplayName(entry, size_t(index)) << L"\r\n"
        << L"Kind: " << ext << L"\r\n"
        << L"Index: " << entry.index << L"\r\n"
        << L"Start sector: " << entry.startSector << L"\r\n"
@@ -11921,6 +12064,55 @@ static void replaceSelectedMeshResourceWithResourceId() {
     setStatus(L"Sector mesh resource cloned in memory; right-click the archive tree to rebuild or overwrite the LVZ + IMG pair.");
 }
 
+static void addResourceToCurrentArchive() {
+    if (gMode != StorylandMode::ArchiveFile || !gArchiveBrowser.hasLvzContext() || !gArchiveBrowser.hasImgContext()) {
+        MessageBoxW(gMainWindow,
+            L"Open a retail LVZ + IMG pair before adding a resource.",
+            L"Add Resource", MB_ICONINFORMATION);
+        return;
+    }
+
+    std::wstring sourcePath = openFileDialog(
+        L"Leeds resources\0*.mdl;*.xtx;*.chk;*.tex\0Models\0*.mdl\0Textures\0*.xtx;*.chk;*.tex\0All files\0*.*\0");
+    if (sourcePath.empty()) return;
+
+    std::vector<uint8_t> bytes;
+    std::string readError;
+    if (!readBinaryFileForUi(sourcePath, bytes, readError)) {
+        MessageBoxW(gMainWindow, widen(readError).c_str(), L"Add Resource", MB_ICONERROR);
+        return;
+    }
+
+    std::string resourceName = narrow(std::filesystem::path(sourcePath).filename().wstring());
+    std::string report;
+    std::string error;
+    if (!gArchiveBrowser.addResourceBytes(resourceName, bytes, report, error)) {
+        MessageBoxW(gMainWindow, widen(error).c_str(), L"Add Resource failed", MB_ICONERROR);
+        return;
+    }
+
+    populateArchiveList();
+    const auto& entries = gArchiveBrowser.entries();
+    int addedIndex = -1;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        if (_stricmp(entries[i].name.c_str(), resourceName.c_str()) == 0) {
+            addedIndex = int(i);
+            break;
+        }
+    }
+    if (addedIndex >= 0) {
+        selectTreePayloadItem(StorylandTreeKind::ArchiveEntry, addedIndex);
+        gSelectedKind = StorylandTreeKind::ArchiveEntry;
+        gSelectedIndex = addedIndex;
+    }
+
+    setDetails(widen(report));
+    setStatus(L"Added " + std::filesystem::path(sourcePath).filename().wstring() +
+              L" to the loaded LVZ + IMG pair in memory.");
+    refreshModeUi();
+    InvalidateRect(gPreview, nullptr, FALSE);
+}
+
 static void replaceSelectedArchiveResourceFromFile() {
     bool selectedArchiveEntry =
         gMode == StorylandMode::ArchiveFile &&
@@ -14225,12 +14417,11 @@ static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
         glPointSize(1.0f);
     }
 
-    drawOpenGlViewCube(hwnd, width, height);
+    drawOpenGlViewCube(hwnd, dc, width, height);
     drawSelectedViewportLabelOpenGl(dc, width, height);
 
     glFlush();
     SwapBuffers(dc);
-    drawOpenGlViewCubeLabels(hwnd, dc);
     wglMakeCurrent(nullptr, nullptr);
 
     std::wstring title = L"OpenGL LVZ+IMG mesh viewport  |  ";
@@ -14291,97 +14482,113 @@ static void emitPreviewVertexWithNormal(const StorylandModelPoint& p, const Stor
     glVertex3f(p.x, p.y, p.z);
 }
 
-static void drawOpenGlViewCube(HWND hwnd, int width, int height) {
+static void drawOpenGlViewCube(HWND hwnd, HDC dc, int width, int height) {
     if (!gOpenGlShowViewCube) return;
 
-    RECT cubeRc = viewCubeRect(hwnd);
-    int cubeW = std::max<int>(1, int(cubeRc.right - cubeRc.left));
-    int cubeH = std::max<int>(1, int(cubeRc.bottom - cubeRc.top));
-    float cubeCenterX = float(cubeRc.left + cubeRc.right) * 0.5f;
-    float cubeCenterY = float(height) - float(cubeRc.top + cubeRc.bottom) * 0.5f;
-    float cubeScale = float(std::min(cubeW, cubeH)) * 0.78f;
+    RECT rc = viewCubeRect(hwnd);
+    const float centerX = float(rc.left + rc.right) * 0.5f;
+    const float centerYTop = float(rc.top + rc.bottom) * 0.5f;
+    const float centerY = float(height) - centerYTop;
+    const float axisLength = 36.0f;
 
     stopStoriesShaderProgram();
     setupFixedPipelineStoriesLighting(false);
 
     glViewport(0, 0, width, height);
     glDisable(GL_SCISSOR_TEST);
-    glDepthMask(GL_TRUE);
-    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
-    glClear(GL_DEPTH_BUFFER_BIT);
-    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-
-    glMatrixMode(GL_PROJECTION);
-    glLoadIdentity();
-    glOrtho(0.0, double(width), 0.0, double(height), -4.0, 4.0);
-
-    glMatrixMode(GL_MODELVIEW);
-    glLoadIdentity();
-    glTranslatef(cubeCenterX, cubeCenterY, 0.0f);
-    glScalef(cubeScale, cubeScale, 1.0f);
-    glMultModelQuat(gModelViewRotation);
-
     glDisable(GL_TEXTURE_2D);
-    glEnable(GL_DEPTH_TEST);
     glDisable(GL_LIGHTING);
     glDisable(GL_CULL_FACE);
     glDisable(GL_BLEND);
+    glDisable(GL_DEPTH_TEST);
 
-    glPointSize(8.0f);
-    glBegin(GL_POINTS);
-    glColor3f(0.94f, 0.94f, 0.96f); glVertex3f(0.0f, 0.0f, 0.0f);
-    glEnd();
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glOrtho(0.0, double(width), 0.0, double(height), -1.0, 1.0);
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
 
-    glLineWidth(3.2f);
+    struct Axis2D { StorylandVec3 axis; float r, g, b; };
+    const Axis2D axes[3] = {
+        {{1.0f, 0.0f, 0.0f}, 235.0f / 255.0f, 75.0f / 255.0f, 75.0f / 255.0f},
+        {{0.0f, 1.0f, 0.0f}, 85.0f / 255.0f, 220.0f / 255.0f, 105.0f / 255.0f},
+        {{0.0f, 0.0f, 1.0f}, 90.0f / 255.0f, 145.0f / 255.0f, 245.0f / 255.0f}
+    };
+
+    auto projected = [&](StorylandVec3 axis, int index) {
+        StorylandVec3 v = rotateVecByQuat(gModelViewRotation, axis);
+        float sx = v.x;
+        float sy = v.y;
+        float len = std::sqrt(sx * sx + sy * sy);
+        if (len < 0.08f) {
+            sx = index == 0 ? 1.0f : 0.3f;
+            sy = index == 2 ? 1.0f : -0.3f;
+            len = std::sqrt(sx * sx + sy * sy);
+        }
+        sx /= len;
+        sy /= len;
+        return StorylandVec3{sx, sy, 0.0f};
+    };
+
+    glLineWidth(2.2f);
     glBegin(GL_LINES);
-    glColor3f(1.0f, 0.18f, 0.14f); glVertex3f(0.0f, 0.0f, 0.0f); glVertex3f(0.95f, 0.0f, 0.0f);
-    glColor3f(0.20f, 0.95f, 0.25f); glVertex3f(0.0f, 0.0f, 0.0f); glVertex3f(0.0f, 0.95f, 0.0f);
-    glColor3f(0.25f, 0.52f, 1.0f); glVertex3f(0.0f, 0.0f, 0.0f); glVertex3f(0.0f, 0.0f, 0.95f);
+    for (int i = 0; i < 3; ++i) {
+        StorylandVec3 p = projected(axes[i].axis, i);
+        glColor3f(axes[i].r, axes[i].g, axes[i].b);
+        glVertex2f(centerX, centerY);
+        glVertex2f(centerX + p.x * axisLength, centerY + p.y * axisLength);
+    }
     glEnd();
 
-    glPointSize(6.0f);
-    glBegin(GL_POINTS);
-    glColor3f(1.0f, 0.18f, 0.14f); glVertex3f(0.95f, 0.0f, 0.0f);
-    glColor3f(0.20f, 0.95f, 0.25f); glVertex3f(0.0f, 0.95f, 0.0f);
-    glColor3f(0.25f, 0.52f, 1.0f); glVertex3f(0.0f, 0.0f, 0.95f);
-    glEnd();
-}
-
-static void drawOpenGlViewCubeLabels(HWND hwnd, HDC dc) {
-    if (!gOpenGlShowViewCube) return;
-
-    RECT rc = viewCubeRect(hwnd);
-    int size = std::max<int>(1, int(rc.right - rc.left));
-    int cx = (rc.left + rc.right) / 2;
-    int cy = (rc.top + rc.bottom) / 2;
-    float labelRadius = float(size) * 0.38f;
-
-    auto labelPoint = [&](StorylandVec3 axis) -> POINT {
-        StorylandVec3 r = rotateVecByQuat(gModelViewRotation, axis);
-        POINT p{};
-        p.x = int(std::round(float(cx) + r.x * labelRadius));
-        p.y = int(std::round(float(cy) - r.y * labelRadius));
-        return p;
+    auto circle = [&](float x, float y, float radius, float r, float g, float b) {
+        glColor3f(r, g, b);
+        glBegin(GL_TRIANGLE_FAN);
+        glVertex2f(x, y);
+        for (int step = 0; step <= 20; ++step) {
+            const float a = float(step) * 6.28318530718f / 20.0f;
+            glVertex2f(x + std::cos(a) * radius, y + std::sin(a) * radius);
+        }
+        glEnd();
     };
 
-    SetBkMode(dc, TRANSPARENT);
-    HFONT oldFont = nullptr;
-    HFONT font = CreateFontW(-13, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-    if (font) oldFont = reinterpret_cast<HFONT>(SelectObject(dc, font));
+    circle(centerX, centerY, 3.0f, 0.78f, 0.79f, 0.82f);
+    for (int i = 0; i < 3; ++i) {
+        StorylandVec3 p = projected(axes[i].axis, i);
+        circle(centerX + p.x * axisLength, centerY + p.y * axisLength,
+               7.0f, axes[i].r, axes[i].g, axes[i].b);
+    }
 
-    auto drawLabel = [&](const wchar_t* text, COLORREF color, POINT p) {
-        SetTextColor(dc, color);
-        TextOutW(dc, p.x - 5, p.y - 7, text, 1);
-    };
-
-    drawLabel(L"X", RGB(255, 80, 64), labelPoint({1.0f, 0.0f, 0.0f}));
-    drawLabel(L"Y", RGB(80, 240, 96), labelPoint({0.0f, 1.0f, 0.0f}));
-    drawLabel(L"Z", RGB(96, 150, 255), labelPoint({0.0f, 0.0f, 1.0f}));
-
-    if (oldFont) SelectObject(dc, oldFont);
-    if (font) DeleteObject(font);
+    // Draw X/Y/Z into the OpenGL back buffer before SwapBuffers.
+    // Drawing these later with GDI caused the labels to flicker because the next
+    // OpenGL frame immediately replaced the GDI pixels.
+    if (dc) {
+        HFONT font = CreateFontW(
+            -13, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, ANSI_CHARSET,
+            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+            DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+        if (font) {
+            HGDIOBJ oldFont = SelectObject(dc, font);
+            GLuint listBase = glGenLists(96);
+            if (listBase != 0 && wglUseFontBitmapsW(dc, 32, 96, listBase)) {
+                const char labels[3] = {'X', 'Y', 'Z'};
+                glColor3f(0.98f, 0.98f, 0.99f);
+                for (int i = 0; i < 3; ++i) {
+                    StorylandVec3 q = projected(axes[i].axis, i);
+                    const float x = centerX + q.x * axisLength - 4.0f;
+                    const float y = centerY + q.y * axisLength - 5.0f;
+                    glRasterPos2f(x, y);
+                    glListBase(listBase - 32);
+                    glCallLists(1, GL_UNSIGNED_BYTE, &labels[i]);
+                }
+                glDeleteLists(listBase, 96);
+            } else if (listBase != 0) {
+                glDeleteLists(listBase, 96);
+            }
+            SelectObject(dc, oldFont);
+            DeleteObject(font);
+        }
+    }
 }
-
 
 static void drawWblPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
     const auto& vertices = gWblFile.vertices();
@@ -14518,10 +14725,9 @@ static void drawWblPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
         glEnd();
     }
 
-    drawOpenGlViewCube(hwnd, width, height);
+    drawOpenGlViewCube(hwnd, dc, width, height);
     glFlush();
     SwapBuffers(dc);
-    drawOpenGlViewCubeLabels(hwnd, dc);
     wglMakeCurrent(nullptr, nullptr);
 }
 
@@ -15061,12 +15267,11 @@ static void drawModelPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
         return;
     }
 
-    drawOpenGlViewCube(hwnd, width, height);
+    drawOpenGlViewCube(hwnd, dc, width, height);
     drawSelectedViewportLabelOpenGl(dc, width, height);
 
     glFlush();
     SwapBuffers(dc);
-    drawOpenGlViewCubeLabels(hwnd, dc);
     wglMakeCurrent(nullptr, nullptr);
 }
 
@@ -15635,17 +15840,11 @@ static void drawDtzLeeds2dfxPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glDisable(GL_BLEND);
 
-    drawOpenGlViewCube(hwnd, width, height);
-    glFlush();
-    SwapBuffers(dc);
-    drawOpenGlViewCubeLabels(hwnd, dc);
-    wglMakeCurrent(nullptr, nullptr);
+    drawOpenGlViewCube(hwnd, dc, width, height);
 
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, RGB(18, 34, 50));
     std::wstringstream overlay;
     if (loadedAreas) {
-        overlay << L"GAME.DTZ map: " << loadedAreas << L" areas (";
+        overlay << L"GAME.DTZ  |  " << loadedAreas << L" areas (";
         bool first = true;
         for (size_t index = 0; index < areaBrowsers.size(); ++index) {
             if (!areaBrowsers[index]) continue;
@@ -15653,18 +15852,21 @@ static void drawDtzLeeds2dfxPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
             overlay << gAreaArchives[index].name;
             first = false;
         }
-        overlay << L") | " << drawnAreaInstances << L" mesh instances, "
-                << drawnAreaTriangles << L" triangles, "
-                << drawnTexturedTriangles << L" textured | " << lights.size() << L" world lights";
+        overlay << L")  |  " << drawnAreaInstances << L" models  |  "
+                << drawnAreaTriangles << L" triangles  |  "
+                << lights.size() << L" lights";
     } else if (worldPositioned) {
-        overlay << L"Leeds GAME.DTZ world 2DFX: " << lights.size()
-                << L" allocated CEntity light instances | BUILDING/TREADABLE/DUMMY native matrices";
+        overlay << L"GAME.DTZ world preview  |  " << lights.size()
+                << L" lights  |  building / treadable / dummy placements";
     } else {
-        overlay << L"Leeds GAME.DTZ model-local fallback atlas: " << lights.size()
-                << L" light definitions | no allocated world instances resolved";
+        overlay << L"GAME.DTZ  |  " << lights.size()
+                << L" lights  |  model preview";
     }
-    std::wstring overlayText = overlay.str();
-    TextOutW(dc, rc.left + 10, rc.top + 10, overlayText.c_str(), int(overlayText.size()));
+    drawViewportTextOpenGl(dc, width, height, 10, 10, overlay.str(), true);
+
+    glFlush();
+    SwapBuffers(dc);
+    wglMakeCurrent(nullptr, nullptr);
 }
 
 static bool selectArchiveResourceFromViewportPoint(int x, int y) {
@@ -15878,6 +16080,19 @@ static void updateActionBar() {
         ShowWindow(gActionBar, SW_SHOW);
         ShowWindow(gActionPrimary, SW_SHOW);
         ShowWindow(gActionSecondary, SW_SHOW);
+    } else if (gMode == StorylandMode::ArchiveFile && gArchiveBrowser.hasLvzContext()) {
+        SetWindowTextW(gActionPrimary, L"Add Resource...");
+        SetWindowTextW(gActionSecondary, L"Replace Resource...");
+        SetWindowTextW(gActionTertiary, L"Test LVZ/IMG");
+        SetWindowTextW(gActionQuaternary, L"Save LVZ + IMG");
+        ShowWindow(gActionBar, SW_SHOW);
+        ShowWindow(gActionPrimary, SW_SHOW);
+        ShowWindow(gActionSecondary, SW_SHOW);
+        ShowWindow(gActionTertiary, SW_SHOW);
+        ShowWindow(gActionQuaternary, SW_SHOW);
+        const bool haveEntry = gSelectedKind == StorylandTreeKind::ArchiveEntry &&
+            gSelectedIndex >= 0 && size_t(gSelectedIndex) < gArchiveBrowser.entries().size();
+        EnableWindow(gActionSecondary, haveEntry);
     } else if (gMode == StorylandMode::MediaFile) {
         SetWindowTextW(gActionPrimary, L"Play");
         SetWindowTextW(gActionSecondary, L"Stop");
@@ -15935,7 +16150,7 @@ static StorylandUiRect storylandInsetRect(const StorylandUiRect& rect, int amoun
     return result;
 }
 
-static void storylandMoveWindowToRect(HWND hwnd, const StorylandUiRect& rect, BOOL repaint = TRUE) {
+static void storylandMoveWindowToRect(HWND hwnd, const StorylandUiRect& rect, BOOL repaint = FALSE) {
     if (!hwnd) return;
     MoveWindow(
         hwnd,
@@ -15952,7 +16167,7 @@ static void storylandInvalidatePaneFrame(HWND hwnd) {
         hwnd,
         nullptr,
         nullptr,
-        RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW | RDW_ERASE);
+        RDW_INVALIDATE | RDW_FRAME);
 }
 
 static void storylandInvalidateAllPaneFrames() {
@@ -15966,12 +16181,12 @@ static void layoutChildren(HWND hwnd) {
 
     constexpr int menuHeight = 28;
     constexpr int statusHeight = 22;
-    constexpr int gutter = 8;
+    constexpr int gutter = 6;
     constexpr int paneBorder = 1;
-    constexpr int actionPadding = 6;
+    constexpr int actionPadding = 7;
 
     const int actionHeight =
-        (gActionBar && IsWindowVisible(gActionBar)) ? 36 : 0;
+        (gActionBar && IsWindowVisible(gActionBar)) ? 42 : 0;
     const int clientWidth = std::max(0, int(rc.right - rc.left));
     const int clientHeight = std::max(0, int(rc.bottom - rc.top));
 
@@ -16034,8 +16249,8 @@ static void layoutChildren(HWND hwnd) {
     // One canonical set of pane rectangles drives both child placement and
     // border painting. No control is allowed to extend beyond its pane.
     const int leftW = gModelDffStructureTreeActive
-        ? std::clamp(clientWidth * 36 / 100, 360, 560)
-        : std::clamp(clientWidth / 4, 270, 360);
+        ? std::clamp(clientWidth * 34 / 100, 350, 540)
+        : std::clamp(clientWidth * 28 / 100, 280, 420);
 
     const int treeRight = std::clamp(leftW, gutter, std::max(gutter, clientWidth - gutter));
     const int rightX = std::clamp(treeRight + gutter, gutter, std::max(gutter, clientWidth - gutter));
@@ -16058,7 +16273,7 @@ static void layoutChildren(HWND hwnd) {
     const int detailsH = videoFrameViewer && usableRightH > 240
         ? std::clamp(usableRightH / 5, 100, 180)
         : usableRightH > 240
-            ? std::clamp(usableRightH * 32 / 100, 150, 300)
+            ? std::clamp(usableRightH * 28 / 100, 140, 260)
             : usableRightH / 2;
     const int previewH =
         std::max(0, usableRightH - detailsH - gutter);
@@ -16140,7 +16355,7 @@ static void layoutChildren(HWND hwnd) {
                         y,
                         actualWidth,
                         buttonH,
-                        TRUE);
+                        FALSE);
                     x += actualWidth + buttonGap;
                     if (x > maxRight) x = maxRight;
                 }
@@ -16160,9 +16375,11 @@ static void layoutChildren(HWND hwnd) {
     };
     storylandMoveWindowToRect(gDetails, detailsRect);
 
-    // Force the non-client border to repaint after the final geometry settles.
-    // This avoids stale one-pixel fragments after repeated resizing.
-    storylandInvalidateAllPaneFrames();
+    // Child controls are repositioned without repainting one-by-one. Repaint the
+    // settled layout once, which avoids button/tree fragments while resizing.
+    if (hwnd && IsWindow(hwnd)) {
+        RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN);
+    }
 }
 static void selectPayloadForCurrentMode(const StorylandTreePayload& payload) {
     if (gAnalyzeGraphActive) {
@@ -16762,6 +16979,7 @@ static bool buildTreeContextMenu(HMENU menu) {
         }
         if (gArchiveBrowser.hasLvzContext() && gArchiveBrowser.hasImgContext()) {
             if (hasItems) AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            hasItems = addContextMenuItem(menu, ID_ARCHIVE_ADD_RESOURCE, L"Add Resource...") || hasItems;
             hasItems = addContextMenuItem(menu, ID_ARCHIVE_TEST_LVZ_IMG_PAIR, L"Test LVZ/IMG Pair") || hasItems;
             hasItems = addContextMenuItem(menu, ID_ARCHIVE_EXPORT_LVZ_IMG_PAIR, L"Rebuild LVZ + IMG As...") || hasItems;
             hasItems = addContextMenuItem(menu, ID_ARCHIVE_OVERWRITE_LVZ_IMG_PAIR, L"Overwrite Current LVZ + IMG...") || hasItems;
@@ -17988,12 +18206,13 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 std::max(draw->rcItem.left, draw->rcItem.right - 1);
             const int buttonBottom =
                 std::max(draw->rcItem.top, draw->rcItem.bottom - 1);
-            Rectangle(
+            RoundRect(
                 draw->hDC,
                 draw->rcItem.left,
                 draw->rcItem.top,
                 buttonRight,
-                buttonBottom);
+                buttonBottom,
+                8, 8);
             SelectObject(draw->hDC, oldBrush);
             SelectObject(draw->hDC, oldPen);
             DeleteObject(pen);
@@ -18302,6 +18521,8 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             } else if (gMode == StorylandMode::TextureArchive ||
                        (gMode == StorylandMode::DtzArchive && gDtzEmbeddedPreviewKind == DtzEmbeddedPreviewKind::TextureArchive)) {
                 runCurrentTextureTest();
+            } else if (gMode == StorylandMode::ArchiveFile && gArchiveBrowser.hasLvzContext()) {
+                addResourceToCurrentArchive();
             } else if (gMode == StorylandMode::MediaFile) {
                 std::string mediaError;
                 if (!gMediaFile.play(mediaError)) MessageBoxW(gMainWindow, widen(mediaError).c_str(), L"Storyland media playback", MB_ICONERROR);
@@ -18320,6 +18541,8 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 addTextureMaterial();
             } else if (gMode == StorylandMode::DtzArchive && gDtzEmbeddedPreviewKind == DtzEmbeddedPreviewKind::TextureArchive) {
                 returnToGameDtz();
+            } else if (gMode == StorylandMode::ArchiveFile && gArchiveBrowser.hasLvzContext()) {
+                replaceSelectedArchiveResourceFromFile();
             } else if (gMode == StorylandMode::MediaFile) {
                 gMediaFile.stop();
                 updateActionBar();
@@ -18333,6 +18556,8 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 updateActionBar();
             } else if (gMode == StorylandMode::TextureArchive) {
                 editSelectedTextureMaterial();
+            } else if (gMode == StorylandMode::ArchiveFile && gArchiveBrowser.hasLvzContext()) {
+                testCurrentLvzImgPair();
             } else if (gMode == StorylandMode::MediaFile && gMediaFile.kind() == StorylandMediaKind::Video) {
                 std::string mediaError;
                 if (!gMediaFile.stepVideoFrame(-1, mediaError))
@@ -18351,6 +18576,8 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 updateActionBar();
             } else if (gMode == StorylandMode::TextureArchive) {
                 removeSelectedTexture();
+            } else if (gMode == StorylandMode::ArchiveFile && gArchiveBrowser.hasLvzContext()) {
+                overwriteCurrentLvzImgPair();
             } else if (gMode == StorylandMode::MediaFile && gMediaFile.kind() == StorylandMediaKind::Video) {
                 std::string mediaError;
                 if (!gMediaFile.stepVideoFrame(1, mediaError))
@@ -18373,6 +18600,7 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         case ID_MODEL_IMPORT_DATA: importModelDataIntoCurrentDraft(); break;
         case ID_DTZ_REPLACE_SELECTED_ENTRY: replaceSelectedDtzDirEntryFromFile(); break;
         case ID_DTZ_RENAME_RESOURCE: renameSelectedDtzDirEntry(); break;
+        case ID_ARCHIVE_ADD_RESOURCE: addResourceToCurrentArchive(); break;
         case ID_ARCHIVE_REPLACE_SELECTED_RESOURCE: replaceSelectedArchiveResourceFromFile(); break;
         case ID_ARCHIVE_REPLACE_MESH_WITH_RESOURCE_ID: replaceSelectedMeshResourceWithResourceId(); break;
         case ID_ARCHIVE_CHANGE_SELECTED_MESH_RESOURCE_ID: changeSelectedMeshResourceId(); break;

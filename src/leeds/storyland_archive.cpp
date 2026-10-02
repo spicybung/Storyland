@@ -1746,6 +1746,7 @@ void StorylandArchiveBrowser::clear() {
     directTextureCache.clear();
     imgResourceRowCache.clear();
     resourceResolutionCache.clear();
+    archiveNameOverrides.clear();
 }
 
 bool StorylandArchiveBrowser::readWholeFile(const std::wstring& path, std::vector<uint8_t>& outBytes, std::string& errorMessage) const {
@@ -3502,7 +3503,11 @@ bool StorylandArchiveBrowser::buildEntriesFromLvzAndImg(std::string& errorMessag
         return a.lvzHeaderOffset < b.lvzHeaderOffset;
     });
 
-    for (size_t i = 0; i < archiveEntries.size(); ++i) archiveEntries[i].index = uint32_t(i);
+    for (size_t i = 0; i < archiveEntries.size(); ++i) {
+        archiveEntries[i].index = uint32_t(i);
+        auto overrideIt = archiveNameOverrides.find(archiveEntries[i].byteOffset);
+        if (overrideIt != archiveNameOverrides.end()) archiveEntries[i].name = overrideIt->second;
+    }
 
     currentImgKind = StorylandImgKind::LvzPair;
     currentLevelSummary =
@@ -4813,6 +4818,175 @@ bool StorylandArchiveBrowser::changeWorldMeshResourceId(uint32_t oldResourceId, 
 
 
 
+
+
+bool StorylandArchiveBrowser::addResourceBytes(
+    const std::string& resourceName,
+    const std::vector<uint8_t>& resourceBytes,
+    std::string& report,
+    std::string& errorMessage
+) {
+    report.clear();
+    errorMessage.clear();
+
+    if (currentImgKind != StorylandImgKind::LvzPair || currentLvzBytes.empty() || currentImgBytes.empty()) {
+        errorMessage = "Add Resource is available for a loaded retail LVZ+IMG pair.";
+        return false;
+    }
+    if (resourceBytes.size() < 0x20u) {
+        errorMessage = "The resource is too small to contain a Leeds 0x20-byte resource header.";
+        return false;
+    }
+    if (resourceBytes.size() > 0x08000000u) {
+        errorMessage = "The resource is too large for a Leeds LVZ+IMG chunk.";
+        return false;
+    }
+
+    uint32_t ident = readU32(resourceBytes, 0x00u);
+    if (!knownChunkIdent(ident) || ident == WRLD_IDENT || isAreaIdent(ident) || ident == GTAG_IDENT) {
+        std::ostringstream message;
+        message << "This file is not a supported loose LVZ+IMG resource.\r\n\r\n"
+                << "Add Resource currently accepts Leeds MDL and XTX/TEX resource files whose first 0x20 bytes are the runtime chunk header.";
+        errorMessage = message.str();
+        return false;
+    }
+
+    std::string cleanName = resourceName;
+    if (cleanName.empty()) cleanName = std::string(labelForIdent(ident)) + extensionForIdent(ident);
+    for (char& ch : cleanName) {
+        const unsigned char c = static_cast<unsigned char>(ch);
+        if (c < 0x20u || c >= 0x7fu || ch == '/' || ch == '\\' || ch == ':') ch = '_';
+    }
+    if (cleanName.size() > 95u) cleanName.resize(95u);
+
+    std::string cleanLower = cleanName;
+    std::transform(cleanLower.begin(), cleanLower.end(), cleanLower.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    for (const StorylandArchiveEntry& entry : archiveEntries) {
+        std::string existing = entry.name;
+        std::transform(existing.begin(), existing.end(), existing.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+        if (existing == cleanLower) {
+            errorMessage = "An archive resource with this name already exists: " + cleanName;
+            return false;
+        }
+    }
+
+    // Reuse a retail LVZ chunk header of the same resource type when possible.
+    // Standalone MDL/XTX headers contain file-local fields that are not equivalent
+    // to the runtime LVZ sChunkHeader fields. Copying those 0x20 bytes verbatim can
+    // produce an archive that Storyland can scan but the game cannot consume.
+    std::vector<uint8_t> newHeader;
+    for (const StorylandArchiveEntry& entry : archiveEntries) {
+        if (!entry.usesLvzChunkHeader || entry.chunkIdent != ident) continue;
+        if (entry.lvzHeaderOffset + 0x20u > currentLvzBytes.size()) continue;
+        newHeader.assign(
+            currentLvzBytes.begin() + entry.lvzHeaderOffset,
+            currentLvzBytes.begin() + entry.lvzHeaderOffset + 0x20u);
+        break;
+    }
+    if (newHeader.empty()) {
+        newHeader.assign(resourceBytes.begin(), resourceBytes.begin() + 0x20u);
+    }
+
+    std::vector<uint8_t> newPayload(resourceBytes.begin() + 0x20u, resourceBytes.end());
+    if (newPayload.empty()) {
+        errorMessage = "The resource contains a header but no IMG payload.";
+        return false;
+    }
+
+    const size_t logicalSizeFromHeader = size_t(readU32(resourceBytes, 0x08u));
+    if (logicalSizeFromHeader >= 0x20u && logicalSizeFromHeader <= resourceBytes.size()) {
+        // Do not import sector padding from a standalone file. The IMG owns its
+        // own sector padding and the runtime header records the logical size.
+        newPayload.assign(resourceBytes.begin() + 0x20u, resourceBytes.begin() + logicalSizeFromHeader);
+    }
+
+    const size_t imgAlignment = 2048u;
+    const size_t oldImgSize = currentImgBytes.size();
+    const size_t payloadOffset = (oldImgSize + imgAlignment - 1u) & ~(imgAlignment - 1u);
+    if (payloadOffset > uint32_t(-1) || newPayload.size() > uint32_t(-1) - payloadOffset) {
+        errorMessage = "The resulting IMG offset would exceed the 32-bit Leeds resource address space.";
+        return false;
+    }
+
+    const size_t oldLvzSize = currentLvzBytes.size();
+    const size_t headerOffset = (oldLvzSize + 3u) & ~size_t(3u);
+
+    const std::vector<uint8_t> originalLvzBytes = currentLvzBytes;
+    const std::vector<uint8_t> originalImgBytes = currentImgBytes;
+    const auto originalNameOverrides = archiveNameOverrides;
+    archiveNameOverrides[uint64_t(payloadOffset)] = cleanName;
+    auto rollback = [&]() {
+        currentLvzBytes = originalLvzBytes;
+        currentImgBytes = originalImgBytes;
+        archiveNameOverrides = originalNameOverrides;
+        std::string ignored;
+        rebuildParsedCaches(ignored);
+    };
+
+    currentImgBytes.resize(payloadOffset, 0u);
+    currentImgBytes.insert(currentImgBytes.end(), newPayload.begin(), newPayload.end());
+    const size_t paddedImgEnd = (currentImgBytes.size() + imgAlignment - 1u) & ~(imgAlignment - 1u);
+    currentImgBytes.resize(paddedImgEnd, 0u);
+
+    currentLvzBytes.resize(headerOffset, 0u);
+    writeU32(newHeader, 0x00u, ident);
+    writeU32(newHeader, 0x08u, uint32_t(newPayload.size() + 0x20u));
+    writeU32(newHeader, 0x18u, uint32_t(payloadOffset));
+    currentLvzBytes.insert(currentLvzBytes.end(), newHeader.begin(), newHeader.end());
+
+    // Keep the LVZ container's top-level logical extent large enough to include
+    // the newly appended runtime chunk header. Only grow plausible size fields;
+    // never shrink or invent offsets in unrelated header words.
+    if (currentLvzBytes.size() >= 0x10u) {
+        const uint32_t logicalLvzSize = uint32_t(std::min<size_t>(currentLvzBytes.size(), uint32_t(-1)));
+        const uint32_t oldTopFileSize = readU32(currentLvzBytes, 0x08u);
+        const uint32_t oldTopDataSize = readU32(currentLvzBytes, 0x0Cu);
+        if (oldTopFileSize >= 0x20u && oldTopFileSize <= oldLvzSize + 0x1000u)
+            writeU32(currentLvzBytes, 0x08u, logicalLvzSize);
+        if (oldTopDataSize >= 0x20u && oldTopDataSize <= oldLvzSize + 0x1000u)
+            writeU32(currentLvzBytes, 0x0Cu, logicalLvzSize);
+    }
+
+    std::string rebuildError;
+    if (!rebuildParsedCaches(rebuildError)) {
+        rollback();
+        errorMessage = "The resource was not added because the rebuilt LVZ/IMG index failed validation: " + rebuildError;
+        return false;
+    }
+
+    const StorylandArchiveEntry* added = nullptr;
+    for (const StorylandArchiveEntry& entry : archiveEntries) {
+        if (entry.byteOffset == payloadOffset && entry.chunkIdent == ident) {
+            added = &entry;
+            break;
+        }
+    }
+    if (!added || added->byteSize != newPayload.size()) {
+        rollback();
+        errorMessage = "The resource was not added because Storyland could not recover the new LVZ chunk after rebuilding the archive index.";
+        return false;
+    }
+
+    std::string validationReport;
+    std::string validationError;
+    if (!validateLvzImgPair(validationReport, validationError)) {
+        rollback();
+        errorMessage = "The new resource failed LVZ/IMG validation and was rolled back: " + validationError;
+        return false;
+    }
+
+    std::ostringstream message;
+    message << "Added resource: " << cleanName << "\r\n"
+            << "Type: " << labelForIdent(ident) << "\r\n"
+            << "LVZ header offset: 0x" << std::hex << std::uppercase << headerOffset << std::dec << "\r\n"
+            << "IMG offset: " << payloadOffset << "\r\n"
+            << "Payload: " << newPayload.size() << " bytes\r\n"
+            << "IMG sector: " << (payloadOffset / 2048u) << "\r\n\r\n"
+            << "The archive pair is modified in memory. Use Overwrite Current LVZ + IMG or Rebuild LVZ + IMG As to write it.";
+    report = message.str();
+    currentImgSize = currentImgBytes.size();
+    return true;
+}
 
 bool StorylandArchiveBrowser::saveLvzImgPair(const std::wstring& lvzPath, const std::wstring& imgPath, bool compressLvz, std::string& errorMessage) const {
     if (currentLvzBytes.empty() || currentImgBytes.empty()) {

@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <initializer_list>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -158,6 +159,7 @@ public:
 
     bool extractEntryBytes(size_t index, std::vector<uint8_t>& outBytes, std::string& errorMessage) const;
     bool replaceEntryBytes(size_t index, const std::vector<uint8_t>& replacementBytes, std::string& report, std::string& errorMessage);
+    bool addResourceBytes(const std::string& resourceName, const std::vector<uint8_t>& resourceBytes, std::string& report, std::string& errorMessage);
     bool extractWorldMeshResourceBytes(uint32_t resourceId, std::vector<uint8_t>& outBytes, std::string& errorMessage) const;
     bool replaceWorldMeshResourceBytes(uint32_t resourceId, const std::vector<uint8_t>& replacementBytes, std::string& report, std::string& errorMessage);
     bool changeWorldMeshResourceId(uint32_t oldResourceId, uint32_t newResourceId, std::string& report, std::string& errorMessage);
@@ -182,6 +184,7 @@ private:
     std::vector<StorylandDirectTextureResource> directTextureCache;
     std::vector<StorylandImgResourceRow> imgResourceRowCache;
     std::vector<StorylandResourceResolution> resourceResolutionCache;
+    std::map<uint64_t, std::string> archiveNameOverrides;
 
     bool autoFindCompanionImgForLvz(const std::wstring& lvzPath, std::wstring& outImgPath) const;
     bool autoFindCompanionLvzForImg(const std::wstring& imgPath, std::wstring& outLvzPath) const;
