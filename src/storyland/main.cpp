@@ -269,7 +269,7 @@ typedef void (APIENTRY *PFNGLACTIVETEXTUREPROC)(GLenum texture);
 #define ID_FILE_NEW_MODEL_PSP_DFF_WORLD 1104
 #define ID_FILE_NEW_TEXTURE_PSP_XTX 1105
 #define ID_FILE_NEW_TEXTURE_PSP_CHK 1106
-#define ID_FILE_FLUSH 1114
+#define ID_FILE_RELOAD 1114
 #define ID_VIEW_SCRIPTING_CONSOLE 1107
 #define ID_ARCHIVE_TEST_LVZ_IMG_PAIR 1108
 #define ID_MEDIA_REPLACE_CURRENT_FRAME 1109
@@ -1394,7 +1394,7 @@ static void importModelDataIntoCurrentDraft();
 static void layoutChildren(HWND hwnd);
 static void refreshModeUi();
 static void exportCurrentOpenedFile(bool exportAs);
-static void flushStoryland();
+static void flushStoryland(bool showStatus = false);
 static void runCurrentModelTest();
 static void populateMediaList();
 static void selectMediaPayload(const StorylandTreePayload& payload);
@@ -15901,6 +15901,11 @@ static void refreshModeUi() {
     rebuildViewMenu();
     updateActionBar();
     if (gMainWindow) layoutChildren(gMainWindow);
+
+    // Presentation flushing is automatic. Any operation that refreshes the
+    // active mode now finishes pending GL work and repaints the UI without
+    // exposing a manual File > Flush command.
+    flushStoryland(false);
 }
 
 
@@ -16933,7 +16938,7 @@ static void destroyMenuHandle(HMENU& menu) {
     menu = nullptr;
 }
 
-static void flushStoryland() {
+static void flushStoryland(bool showStatus) {
     // Flush only transient presentation state. Do not discard or reload the
     // currently opened resource, because that would silently throw away edits.
     // The parsed model/archive remains authoritative; cached Win32/OpenGL output
@@ -16985,7 +16990,7 @@ static void flushStoryland() {
             RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW);
         UpdateWindow(gMainWindow);
     }
-    setStatus(L"Flushed transient renderer/UI state. Loaded resource and unsaved edits were preserved.");
+    if (showStatus) setStatus(L"Refreshed renderer/UI state.");
 }
 
 static void rebuildFileMenu() {
@@ -17109,7 +17114,7 @@ static void rebuildFileMenu() {
     }
 
     AppendMenuW(gFileMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(gFileMenu, MF_STRING, ID_FILE_FLUSH, L"Flush");
+    AppendMenuW(gFileMenu, gMode == StorylandMode::Empty ? (MF_STRING | MF_GRAYED) : MF_STRING, ID_FILE_RELOAD, L"Reload");
     AppendMenuW(gFileMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(gFileMenu, MF_STRING, ID_FILE_EXPORT_LOG, L"Export Log...");
     AppendMenuW(gFileMenu, MF_SEPARATOR, 0, nullptr);
@@ -18224,9 +18229,35 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         case ID_FILE_NEW_TEXTURE_PSP_TXD:
             beginNewTextureResource(StorylandNewTextureContainer::Txd);
             break;
-        case ID_FILE_FLUSH:
-            flushStoryland();
+        case ID_FILE_RELOAD: {
+            std::wstring reloadPath;
+            switch (gMode) {
+                case StorylandMode::TextureArchive: reloadPath = gTextureArchive.sourcePath(); break;
+                case StorylandMode::DtzArchive: reloadPath = gDtzArchive.sourcePath(); break;
+                case StorylandMode::ModelFile: reloadPath = gModelFile.sourcePath(); break;
+                case StorylandMode::WblFile: reloadPath = gWblFile.sourcePath(); break;
+                case StorylandMode::AnimFile: reloadPath = gAnimFile.sourcePath(); break;
+                case StorylandMode::ScmFile: reloadPath = gScmFile.sourcePath(); break;
+                case StorylandMode::MediaFile: reloadPath = gMediaFile.sourcePath(); break;
+                case StorylandMode::ArchiveFile:
+                    reloadPath = !gArchiveBrowser.lvzPath().empty() ? gArchiveBrowser.lvzPath() : gArchiveBrowser.imgPath();
+                    break;
+                case StorylandMode::Empty: break;
+            }
+            if (reloadPath.empty()) {
+                MessageBoxW(gMainWindow, L"The current resource has no file on disk to reload.", L"Storyland Reload", MB_ICONINFORMATION);
+                break;
+            }
+            if (GetFileAttributesW(reloadPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                std::wstring message = L"The current resource no longer exists on disk:\r\n\r\n" + reloadPath;
+                MessageBoxW(gMainWindow, message.c_str(), L"Storyland Reload", MB_ICONERROR);
+                break;
+            }
+            openStorylandFile(reloadPath);
+            flushStoryland(false);
+            setStatus(L"Reloaded from disk: " + reloadPath);
             break;
+        }
 
         case ID_FILE_OPEN: {
             std::wstring path = openFileDialog(L"Storyland files\0*.scm;*.dtz;*.bin;*.img;*.dir;*.lvz;*.zmg;*.area;*.wbl;*.mdl;*.dff;*.anim;*.chk;*.xtx;*.tex;*.txd;*.sdt;*.raw;*.vag;*.vb;*.wav;*.at3;*.aa3;*.oma;*.mp3;*.ogg;*.flac;*.aac;*.m4a;*.wma;*.ac3;*.aif;*.aiff;*.adx;*.pss;*.pmf;*.mpg;*.mpeg;*.mp4;*.m4v;*.wmv;*.avi;*.mov;*.mkv;*.ts;*.m2ts;*.mts;*.vob;*.3gp;*.3g2;*.webm;*.ogv;*.flv\0Models\0*.mdl;*.dff;*.wbl\0Textures\0*.chk;*.xtx;*.tex;*.txd\0Audio\0*.sdt;*.raw;*.vag;*.vb;*.wav;*.at3;*.aa3;*.oma;*.mp3;*.ogg;*.flac;*.aac;*.m4a;*.wma;*.ac3;*.aif;*.aiff;*.adx\0Video\0*.pss;*.pmf;*.mpg;*.mpeg;*.mp4;*.m4v;*.wmv;*.avi;*.mov;*.mkv;*.ts;*.m2ts;*.mts;*.vob;*.3gp;*.3g2;*.webm;*.ogv;*.flv\0All files\0*.*\0");
