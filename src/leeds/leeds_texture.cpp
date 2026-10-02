@@ -3606,6 +3606,12 @@ static bool buildCanonicalPs2Xet(
         const std::string safeName = meta[i].name.empty() ? ("texture_" + std::to_string(i)) : meta[i].name;
         const size_t copyCount = std::min<size_t>(63u, safeName.size());
         std::copy(safeName.begin(), safeName.begin() + copyCount, bytesOut.begin() + base + 0x10u);
+        // Retail VCS Rsl texture node tail. This 0x10-byte region is part of the
+        // 0x60-byte runtime object and must not be occupied by the next node.
+        writeU32(bytesOut, base + 0x50u, 1u);
+        writeU32(bytesOut, base + 0x54u, 0u);
+        writeU32(bytesOut, base + 0x58u, 0u);
+        writeU32(bytesOut, base + 0x5Cu, 0u);
     }
 
     alignVector16(bytesOut);
@@ -3750,6 +3756,12 @@ static bool buildPs2XetPreservingRawTextureData(
         const std::string safeName = items[i].name.empty() ? ("texture_" + std::to_string(i)) : items[i].name;
         const size_t copyCount = std::min<size_t>(63u, safeName.size());
         std::copy(safeName.begin(), safeName.begin() + copyCount, bytesOut.begin() + base + 0x10u);
+        // Retail VCS Rsl texture node tail. This 0x10-byte region is part of the
+        // 0x60-byte runtime object and must not be occupied by the next node.
+        writeU32(bytesOut, base + 0x50u, 1u);
+        writeU32(bytesOut, base + 0x54u, 0u);
+        writeU32(bytesOut, base + 0x58u, 0u);
+        writeU32(bytesOut, base + 0x5Cu, 0u);
     }
 
     alignVector16(bytesOut);
@@ -3823,9 +3835,11 @@ bool LeedsTextureArchive::normalizePs2RuntimeLayout(std::string& report, std::st
         writeU32(item.headerBytes, 0x00u, entry.reserved0);
 
         uint32_t transfer = entry.reserved1;
-        const bool generic8 = entry.bpp == 8u && (transfer & 0xFFFF0000u) == 0x00250000u;
-        const bool generic4 = entry.bpp == 4u && (transfer & 0xFFFF0000u) == 0x00450000u;
-        if (transfer == 0u || generic8 || generic4) {
+        // Preserve non-zero retail transfer metadata exactly. This field is not a
+        // deterministic BPP/width encoding: retail VCS player textures demonstrate
+        // 4bpp entries using the 0x0025xxxx family. Only repair the old Storyland
+        // zero-value bug when normalizing a broken archive.
+        if (transfer == 0u) {
             transfer = defaultPs2Reserved1(entry.width, entry.bpp);
         }
         writeU32(item.headerBytes, 0x04u, transfer);
@@ -3862,6 +3876,7 @@ bool LeedsTextureArchive::normalizePs2RuntimeLayout(std::string& report, std::st
     stream << "Runtime preface: 0x50 bytes.\n";
     stream << "Serialized texture flags: Leeds PS2 runtime bit layout.\n";
     stream << "Object ordering: raster data, 0x60-byte linked texture nodes, texture headers, relocation table.\n";
+    stream << "Runtime node tail: +0x50={1,0,0,0}; 0x50-byte legacy node packing rejected.\n";
     stream << "Runtime list: +0x2C head, +0x28 tail, node +0x08 previous, node +0x0C next.\n";
     stream << validationReport;
     report = stream.str();
@@ -4388,18 +4403,24 @@ bool LeedsTextureArchive::validateStructure(std::string& report, std::string& er
                 return false;
             }
             const uint32_t transfer = readU32(dataBytes, entry.textureHeaderOffset + 0x04u);
-            if (entry.bpp == 8u) {
-                const uint32_t expected = defaultPs2Reserved1(entry.width, entry.bpp);
-                if (transfer == 0u || ((transfer & 0xFFFF0000u) == 0x00250000u && transfer != expected)) {
-                    errorMessage =
-                        "PS2 Stories XTX has an invalid 8bpp transfer-layout word at texture header +0x04.";
-                    return false;
-                }
-            } else if (entry.bpp == 4u) {
-                const uint32_t expected = defaultPs2Reserved1(entry.width, entry.bpp);
-                if (transfer == 0u || ((transfer & 0xFFFF0000u) == 0x00450000u && transfer != expected)) {
-                    errorMessage =
-                        "PS2 Stories XTX has an invalid 4bpp transfer-layout word at texture header +0x04.";
+            if (entry.bpp == 8u || entry.bpp == 4u) {
+                // Retail VCS disproves the old assumption that this word can be
+                // derived solely from decoded BPP + width. Known-good plr.xtx
+                // materials can use either 0x0025xxxx or 0x0045xxxx families
+                // regardless of the decoded 4/8bpp field. Treat it as runtime
+                // transfer metadata and preserve it verbatim when it is present.
+                // Zero is still invalid for the retail runtime path.
+                const uint32_t transferFamily = transfer & 0xFFFF0000u;
+                if (transfer == 0u ||
+                    (transferFamily != 0x00250000u && transferFamily != 0x00450000u)) {
+                    std::ostringstream transferError;
+                    transferError
+                        << "PS2 Stories XTX texture '" << entry.name
+                        << "' has an invalid PS2 transfer-layout word at texture header +0x04: 0x"
+                        << std::hex << std::uppercase << transfer << std::dec
+                        << ". Retail VCS uses non-zero 0x0025xxxx/0x0045xxxx runtime transfer metadata; "
+                           "Storyland must not infer this field from BPP alone.";
+                    errorMessage = transferError.str();
                     return false;
                 }
             }
@@ -4482,6 +4503,118 @@ bool LeedsTextureArchive::validateStructure(std::string& report, std::string& er
             return false;
         }
 
+        // A retail VCS texture node is 0x60 bytes, not 0x50. The final 0x10-byte
+        // runtime tail begins at +0x50 and retail plr.xtx uses {1,0,0,0} there.
+        // Old BLeeds/Storyland output packed nodes every 0x50 bytes; Storyland could
+        // parse that because the next node happened to begin where the runtime tail
+        // should have been, but the game dereferences the missing tail and can crash.
+        // Validate the actual occupied ranges, not just the linked-list pointers.
+        std::vector<std::pair<uint32_t, uint32_t>> nodeRanges;
+        nodeRanges.reserve(trial.textures().size());
+        for (const LeedsTextureEntry& entry : trial.textures()) {
+            if (entry.containerBase > UINT32_MAX - 0x60u ||
+                uint64_t(entry.containerBase) + 0x60ull > uint64_t(dataBytes.size())) {
+                errorMessage = "PS2 Stories XTX contains a truncated runtime texture node; retail nodes are 0x60 bytes.";
+                return false;
+            }
+            nodeRanges.emplace_back(entry.containerBase, entry.containerBase + 0x60u);
+
+            const uint32_t runtimeTag = readU32(dataBytes, entry.containerBase + 0x50u);
+            const uint32_t runtimeTail1 = readU32(dataBytes, entry.containerBase + 0x54u);
+            const uint32_t runtimeTail2 = readU32(dataBytes, entry.containerBase + 0x58u);
+            const uint32_t runtimeTail3 = readU32(dataBytes, entry.containerBase + 0x5Cu);
+            if (runtimeTag != 1u || runtimeTail1 != 0u || runtimeTail2 != 0u || runtimeTail3 != 0u) {
+                std::ostringstream nodeError;
+                nodeError
+                    << "PS2 Stories XTX texture node '" << entry.name
+                    << "' does not contain the retail 0x60-byte runtime tail at +0x50. "
+                    << "Expected {0x00000001,0,0,0}, found {0x"
+                    << std::hex << std::uppercase << runtimeTag << ",0x" << runtimeTail1
+                    << ",0x" << runtimeTail2 << ",0x" << runtimeTail3 << std::dec << "}. "
+                    << "This is characteristic of the old 0x50-byte node writer and is unsafe in VCS.";
+                errorMessage = nodeError.str();
+                return false;
+            }
+        }
+        std::sort(nodeRanges.begin(), nodeRanges.end());
+        for (size_t i = 1u; i < nodeRanges.size(); ++i) {
+            if (nodeRanges[i].first < nodeRanges[i - 1u].second) {
+                std::ostringstream nodeError;
+                nodeError
+                    << "PS2 Stories XTX runtime texture nodes overlap. Retail VCS requires independent 0x60-byte nodes; "
+                    << "node at 0x" << std::hex << std::uppercase << nodeRanges[i].first
+                    << " begins before the previous node ends at 0x" << nodeRanges[i - 1u].second << std::dec << ".";
+                errorMessage = nodeError.str();
+                return false;
+            }
+        }
+
+        // Runtime relocation metadata must describe every pointer-bearing field that
+        // the Leeds loader fixes up. A file can still be parseable in Storyland while
+        // being unsafe in-game if these entries are missing or point at unrelated data.
+        std::vector<uint32_t> expectedRelocations;
+        expectedRelocations.reserve(2u + trial.textures().size() * 5u);
+        expectedRelocations.push_back(0x28u);
+        expectedRelocations.push_back(0x2Cu);
+        for (const LeedsTextureEntry& entry : trial.textures()) {
+            expectedRelocations.push_back(entry.containerBase + 0x00u);
+            expectedRelocations.push_back(entry.containerBase + 0x04u);
+            expectedRelocations.push_back(entry.containerBase + 0x08u);
+            expectedRelocations.push_back(entry.containerBase + 0x0Cu);
+        }
+        for (const LeedsTextureEntry& entry : trial.textures()) {
+            expectedRelocations.push_back(entry.textureHeaderOffset + 0x08u);
+        }
+
+        if (relocationCount != expectedRelocations.size()) {
+            std::ostringstream relocationError;
+            relocationError
+                << "PS2 Stories XTX relocation count is incomplete for the decoded runtime objects. "
+                << "Expected " << expectedRelocations.size() << " entries, found " << relocationCount << ".";
+            errorMessage = relocationError.str();
+            return false;
+        }
+        std::set<uint32_t> expectedRelocationSet(expectedRelocations.begin(), expectedRelocations.end());
+        std::set<uint32_t> actualRelocationSet;
+        for (uint32_t i = 0u; i < relocationCount; ++i) {
+            const uint32_t actual = readU32(dataBytes, relocationOffset + i * 4u);
+            if (!actualRelocationSet.insert(actual).second) {
+                std::ostringstream relocationError;
+                relocationError
+                    << "PS2 Stories XTX relocation table contains duplicate pointer field 0x"
+                    << std::hex << std::uppercase << actual << std::dec << ".";
+                errorMessage = relocationError.str();
+                return false;
+            }
+        }
+        if (actualRelocationSet != expectedRelocationSet) {
+            uint32_t missing = 0u;
+            for (uint32_t expected : expectedRelocationSet) {
+                if (actualRelocationSet.count(expected) == 0u) {
+                    missing = expected;
+                    break;
+                }
+            }
+            std::ostringstream relocationError;
+            relocationError << "PS2 Stories XTX relocation metadata does not match its runtime objects.";
+            if (missing != 0u) {
+                relocationError << " Missing pointer field 0x" << std::hex << std::uppercase << missing << std::dec << ".";
+            }
+            errorMessage = relocationError.str();
+            return false;
+        }
+
+        if ((dataBytes.size() & 0x7FFu) != 0u) {
+            errorMessage = "PS2 Stories XTX physical file size is not padded to a 2048-byte sector boundary.";
+            return false;
+        }
+        for (size_t i = logicalSize; i < dataBytes.size(); ++i) {
+            if (dataBytes[i] != 0u) {
+                errorMessage = "PS2 Stories XTX contains non-zero garbage after the logical relocation-table end.";
+                return false;
+            }
+        }
+
         const bool retailObjectOrder =
             firstNode != UINT32_MAX && firstHeader != UINT32_MAX &&
             lastRasterEnd <= firstNode && firstNode <= firstHeader;
@@ -4500,6 +4633,7 @@ bool LeedsTextureArchive::validateStructure(std::string& report, std::string& er
     if (ps2StoriesRuntimeXet) {
         stream << "PS2 runtime preface: recognized working profile\n";
         stream << "PS2 serialized flag layout: PASS\n";
+        stream << "PS2 runtime node size/tail: 0x60 bytes / PASS\n";
         stream << "PS2 object ordering: recognized working profile\n";
     }
     for (size_t i = 0; i < trial.textures().size(); ++i) {

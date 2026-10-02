@@ -835,6 +835,7 @@ struct StorylandTreePayload {
 };
 
 static std::vector<StorylandTreePayload> gTreePayloads;
+static int gTreeMutationDepth = 0;
 
 static std::vector<uint32_t> gArchiveMeshResourceIds;
 static std::vector<uint32_t> gArchiveTextureIds;
@@ -1387,6 +1388,7 @@ static void swapSelectedTextureData();
 static void duplicateSelectedTexture();
 static void removeSelectedTexture();
 static void validateCurrentTextureArchive();
+static void runCurrentTextureTest();
 static void importModelDataIntoCurrentDraft();
 static void layoutChildren(HWND hwnd);
 static void refreshModeUi();
@@ -3046,8 +3048,19 @@ static void clearView() {
     gModelDffStructureBytes.clear();
     gModelDffStructureName.clear();
     clearModelTexture();
-    if (gTree) TreeView_DeleteAllItems(gTree);
-    gTreePayloads.clear();
+    if (gTree) {
+        ++gTreeMutationDepth;
+        SendMessageW(gTree, WM_SETREDRAW, FALSE, 0);
+        TreeView_SelectItem(gTree, nullptr);
+        TreeView_DeleteAllItems(gTree);
+        gTreePayloads.clear();
+        SendMessageW(gTree, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(gTree, nullptr, TRUE);
+        UpdateWindow(gTree);
+        --gTreeMutationDepth;
+    } else {
+        gTreePayloads.clear();
+    }
     setDetails(L"");
     gCurrentImage = {};
     deleteTextureBitmap();
@@ -12295,6 +12308,39 @@ static void runCurrentModelTest() {
             "A companion texture archive was found, but the preview atlas could not be decoded safely.");
     }
 
+    bool companionStructureChecked = false;
+    bool companionStructureValid = false;
+    std::string companionStructureReport;
+    std::string companionStructureError;
+    size_t companionPs2Textures = 0u;
+    size_t companionUnsupportedBpp = 0u;
+    if (gModelTextureLoaded) {
+        companionStructureChecked = true;
+        companionStructureValid = gModelTextureArchive.validateStructure(
+            companionStructureReport, companionStructureError);
+        if (!companionStructureValid) {
+            ++errors;
+            extraErrors.push_back(
+                "Companion texture archive failed retail/runtime structure validation: " +
+                companionStructureError);
+        }
+
+        for (const LeedsTextureEntry& entry : gModelTextureArchive.textures()) {
+            if (entry.kind != TextureKind::Ps2) continue;
+            ++companionPs2Textures;
+            if (entry.bpp != 4u && entry.bpp != 8u) {
+                ++companionUnsupportedBpp;
+            }
+        }
+        if (companionUnsupportedBpp != 0u) {
+            ++errors;
+            extraErrors.push_back(
+                "Companion PS2 Stories texture archive contains " +
+                std::to_string(companionUnsupportedBpp) +
+                " texture(s) outside the supported retail 4bpp/8bpp authoring range.");
+        }
+    }
+
     std::ostringstream report;
     const char* overallStatus = errors ? "FAIL" : warnings ? "PASS WITH WARNINGS" : "PASS";
 
@@ -12322,7 +12368,31 @@ static void runCurrentModelTest() {
            << "TEXTURES\r\n"
            << "============================================================\r\n"
            << "References        : " << textureReferences << "\r\n"
-           << "Companion archive : " << (gModelTextureLoaded ? "loaded" : "not loaded") << "\r\n\r\n";
+           << "Companion archive : " << (gModelTextureLoaded ? "loaded" : "not loaded") << "\r\n";
+    if (gModelTextureLoaded) {
+        const std::filesystem::path companionPath(gModelTextureArchive.sourcePath());
+        report << "Archive file      : "
+               << (companionPath.empty() ? std::string("(embedded/in-memory)") : companionPath.filename().string())
+               << "\r\n"
+               << "Materials         : " << gModelTextureArchive.textures().size() << "\r\n"
+               << "PS2 materials     : " << companionPs2Textures << "\r\n"
+               << "4/8bpp compliance : " << (companionUnsupportedBpp == 0u ? "PASS" : "FAIL") << "\r\n"
+               << "Runtime layout    : "
+               << (!companionStructureChecked ? "not checked" : companionStructureValid ? "PASS" : "FAIL")
+               << "\r\n";
+        if (leedsMdl && companionPs2Textures != 0u) {
+            report << "UV convention     : native Leeds top-origin; no automatic V inversion\r\n";
+        }
+        if (companionStructureValid && !companionStructureReport.empty()) {
+            std::string oneLine = companionStructureReport;
+            for (char& c : oneLine) {
+                if (c == '\n' || c == '\r') c = ' ';
+            }
+            while (!oneLine.empty() && oneLine.back() == ' ') oneLine.pop_back();
+            if (!oneLine.empty()) report << "Layout detail     : " << oneLine << "\r\n";
+        }
+    }
+    report << "\r\n";
 
     if (renderWareDff) {
         report << "============================================================\r\n"
@@ -12917,7 +12987,8 @@ static void removeSelectedTexture() {
 }
 
 static void validateCurrentTextureArchive() {
-    if (gMode != StorylandMode::TextureArchive) return;
+    if (gMode != StorylandMode::TextureArchive &&
+        !(gMode == StorylandMode::DtzArchive && gDtzEmbeddedPreviewKind == DtzEmbeddedPreviewKind::TextureArchive)) return;
     std::string report, error;
     if (!gTextureArchive.validateStructure(report, error)) {
         MessageBoxW(gMainWindow, widen(error).c_str(), L"Texture Archive Validation", MB_ICONERROR);
@@ -12925,6 +12996,184 @@ static void validateCurrentTextureArchive() {
     }
     setDetails(widen(report));
     setStatus(L"Texture archive validation passed.");
+}
+
+static const wchar_t* textureKindLabel(TextureKind kind) {
+    switch (kind) {
+    case TextureKind::CtwTex: return L"CTW TEX";
+    case TextureKind::Dds: return L"DDS";
+    case TextureKind::Ps2: return L"PS2";
+    case TextureKind::Psp: return L"PSP";
+    case TextureKind::RwPsp: return L"PSP RenderWare";
+    case TextureKind::RwPc: return L"PC RenderWare";
+    default: return L"Unknown";
+    }
+}
+
+static void runCurrentTextureTest() {
+    const bool standaloneArchive = gMode == StorylandMode::TextureArchive;
+    const bool embeddedArchive =
+        gMode == StorylandMode::DtzArchive &&
+        gDtzEmbeddedPreviewKind == DtzEmbeddedPreviewKind::TextureArchive;
+    if (!standaloneArchive && !embeddedArchive) {
+        MessageBoxW(gMainWindow, L"Open or preview a texture archive first.", L"Test Texture", MB_ICONINFORMATION);
+        return;
+    }
+
+    const auto& textures = gTextureArchive.textures();
+    std::string structureReport;
+    std::string structureError;
+    const bool structureOk = gTextureArchive.validateStructure(structureReport, structureError);
+
+    size_t decodePass = 0;
+    size_t decodeFail = 0;
+    size_t ps2Count = 0;
+    size_t pspCount = 0;
+    size_t invalidStoriesBpp = 0;
+    size_t invalidDimensions = 0;
+    size_t invalidMipCount = 0;
+    size_t alphaTextures = 0;
+    std::vector<std::wstring> issues;
+
+    // Test Texture must be safe even for malformed archives. Do not run every
+    // raster through the full preview decoder here: validation is a metadata/
+    // bounds operation, not a rendering stress test. A corrupt raster must be
+    // reported, never allowed to corrupt process memory and crash later inside
+    // a Windows common control.
+    const size_t archiveSize = gTextureArchive.rawBytes().size();
+    for (size_t i = 0; i < textures.size(); ++i) {
+        const LeedsTextureEntry& entry = textures[i];
+        if (entry.kind == TextureKind::Ps2) ++ps2Count;
+        if (entry.kind == TextureKind::Psp || entry.kind == TextureKind::RwPsp) ++pspCount;
+
+        if (entry.kind == TextureKind::Ps2 && entry.bpp != 4 && entry.bpp != 8) {
+            ++invalidStoriesBpp;
+            std::wstringstream issue;
+            issue << L"Texture " << i << L" ('" << widen(entry.name) << L"') uses "
+                  << int(entry.bpp) << L"bpp; Stories PS2 authoring must be 4bpp or 8bpp.";
+            issues.push_back(issue.str());
+        }
+        if (entry.width <= 0 || entry.height <= 0) {
+            ++invalidDimensions;
+            std::wstringstream issue;
+            issue << L"Texture " << i << L" ('" << widen(entry.name) << L"') has invalid dimensions "
+                  << entry.width << L"x" << entry.height << L".";
+            issues.push_back(issue.str());
+        }
+        if (entry.mipCount == 0) {
+            ++invalidMipCount;
+            std::wstringstream issue;
+            issue << L"Texture " << i << L" ('" << widen(entry.name) << L"') reports zero mip levels.";
+            issues.push_back(issue.str());
+        }
+
+        uint64_t pixels = 0;
+        uint64_t rasterBytes = 0;
+        if (entry.width > 0 && entry.height > 0) {
+            pixels = uint64_t(entry.width) * uint64_t(entry.height);
+            if (entry.bpp == 4) rasterBytes = (pixels + 1u) / 2u;
+            else if (entry.bpp == 8) rasterBytes = pixels;
+            else if (entry.bpp == 16) rasterBytes = pixels * 2u;
+            else if (entry.bpp == 32) rasterBytes = pixels * 4u;
+        }
+
+        const uint64_t rasterEnd = uint64_t(entry.rasterOffset) + rasterBytes;
+        if (rasterBytes == 0u || uint64_t(entry.rasterOffset) >= uint64_t(archiveSize) ||
+            rasterEnd > uint64_t(archiveSize)) {
+            ++decodeFail;
+            std::wstringstream issue;
+            issue << L"Texture " << i << L" ('" << widen(entry.name)
+                  << L"') has raster bytes outside the archive.";
+            issues.push_back(issue.str());
+        } else {
+            ++decodePass;
+        }
+    }
+    const int testedTextureIndex = embeddedArchive ? (textures.empty() ? -1 : 0) : gSelectedIndex;
+    const bool selectedValid =
+        testedTextureIndex >= 0 && size_t(testedTextureIndex) < textures.size();
+    const LeedsTextureEntry* selected = selectedValid ? &textures[size_t(testedTextureIndex)] : nullptr;
+
+    std::wstringstream ss;
+    ss << L"============================================================\r\n"
+       << L"TEXTURE TEST\r\n"
+       << L"============================================================\r\n";
+
+    if (!gTextureArchive.sourcePath().empty()) {
+        ss << L"Archive            : " << gTextureArchive.sourcePath() << L"\r\n";
+    } else if (!gDtzEmbeddedPreviewPath.empty()) {
+        ss << L"Archive            : " << gDtzEmbeddedPreviewPath << L"\r\n";
+    }
+
+    ss << L"Archive bytes       : " << gTextureArchive.rawBytes().size() << L"\r\n"
+       << L"Materials           : " << textures.size() << L"\r\n"
+       << L"PS2                 : " << ps2Count << L"\r\n"
+       << L"PSP                 : " << pspCount << L"\r\n"
+       << L"Raster ranges       : " << decodePass << L" / " << textures.size() << L"\r\n"
+       << L"With alpha          : " << alphaTextures << L"\r\n\r\n";
+
+    ss << L"------------------------------------------------------------\r\n"
+       << L"SELECTED TEXTURE\r\n"
+       << L"------------------------------------------------------------\r\n";
+
+    if (selected) {
+        ss << L"Index               : " << testedTextureIndex << L"\r\n"
+           << L"Name                : " << widen(selected->name) << L"\r\n"
+           << L"Kind                : " << textureKindLabel(selected->kind) << L"\r\n"
+           << L"Dimensions          : " << selected->width << L" x " << selected->height << L"\r\n"
+           << L"BPP                 : " << int(selected->bpp) << L"\r\n"
+           << L"Mip count           : " << int(selected->mipCount) << L"\r\n"
+           << L"Swizzle             : " << (selected->swizzleMask ? L"encoded/swizzled" : L"linear") << L"\r\n"
+           << L"Texture header      : " << hexWide(selected->textureHeaderOffset, 6) << L"\r\n"
+           << L"Raster              : " << hexWide(selected->rasterOffset, 6) << L"\r\n"
+           << L"Block size          : " << selected->blockSize << L" bytes\r\n";
+    } else {
+        ss << L"No texture is currently selected.\r\n";
+    }
+
+    ss << L"\r\n"
+       << L"------------------------------------------------------------\r\n"
+       << L"STORIES AUTHORING RULES\r\n"
+       << L"------------------------------------------------------------\r\n"
+       << L"PS2 4/8bpp only     : " << (invalidStoriesBpp == 0 ? L"PASS" : L"FAIL") << L"\r\n"
+       << L"Valid dimensions    : " << (invalidDimensions == 0 ? L"PASS" : L"FAIL") << L"\r\n"
+       << L"Mip metadata        : " << (invalidMipCount == 0 ? L"PASS" : L"FAIL") << L"\r\n"
+       << L"Raster bounds       : " << (decodeFail == 0 ? L"PASS" : L"FAIL") << L"\r\n";
+
+    ss << L"\r\n"
+       << L"------------------------------------------------------------\r\n"
+       << L"ARCHIVE STRUCTURE\r\n"
+       << L"------------------------------------------------------------\r\n"
+       << L"Result              : " << (structureOk ? L"PASS" : L"FAIL") << L"\r\n";
+
+    if (structureOk) {
+        if (!structureReport.empty()) {
+            ss << widen(structureReport) << L"\r\n";
+        }
+    } else if (!structureError.empty()) {
+        ss << L"Error               : " << widen(structureError) << L"\r\n";
+    }
+
+    if (!issues.empty()) {
+        ss << L"\r\n"
+           << L"------------------------------------------------------------\r\n"
+           << L"ISSUES\r\n"
+           << L"------------------------------------------------------------\r\n";
+        for (const std::wstring& issue : issues) {
+            ss << L"- " << issue << L"\r\n";
+        }
+    }
+
+    const bool passed = structureOk && decodeFail == 0 && invalidStoriesBpp == 0 &&
+                        invalidDimensions == 0 && invalidMipCount == 0;
+
+    ss << L"\r\n"
+       << L"============================================================\r\n"
+       << L"RESULT: " << (passed ? L"PASS" : L"FAIL") << L"\r\n"
+       << L"============================================================\r\n";
+
+    setDetails(ss.str());
+    setStatus(passed ? L"Test Texture | PASS" : L"Test Texture | FAIL");
 }
 
 static void importModelDataIntoCurrentDraft() {
@@ -15539,26 +15788,30 @@ static void updateActionBar() {
         ShowWindow(gActionTertiary, SW_SHOW);
         ShowWindow(gActionQuaternary, SW_SHOW);
     } else if (gMode == StorylandMode::TextureArchive) {
-        SetWindowTextW(gActionPrimary, L"Add Material...");
-        SetWindowTextW(gActionSecondary, L"Edit Material...");
-        SetWindowTextW(gActionTertiary, L"Remove Material");
-        SetWindowTextW(gActionQuaternary, gDtzReturnAvailable ? L"Back to GAME.DTZ" : L"Validate Archive");
+        SetWindowTextW(gActionPrimary, L"Test Texture");
+        SetWindowTextW(gActionSecondary, L"Add Material...");
+        SetWindowTextW(gActionTertiary, L"Edit Material...");
+        SetWindowTextW(gActionQuaternary, L"Remove Material");
         ShowWindow(gActionBar, SW_SHOW);
         ShowWindow(gActionPrimary, SW_SHOW);
-
-        // Material actions belong to the XTX editor, so keep them visible for
-        // the entire time an XTX is open. A missing selection disables them
-        // instead of making the controls mysteriously appear only after another
-        // action changes selection state.
         ShowWindow(gActionSecondary, SW_SHOW);
         ShowWindow(gActionTertiary, SW_SHOW);
+        ShowWindow(gActionQuaternary, SW_SHOW);
+
         const BOOL haveMaterialSelection =
             (gSelectedIndex >= 0 &&
              size_t(gSelectedIndex) < gTextureArchive.textures().size()) ? TRUE : FALSE;
-        EnableWindow(gActionSecondary, haveMaterialSelection);
+        EnableWindow(gActionPrimary, TRUE);
+        EnableWindow(gActionSecondary, TRUE);
         EnableWindow(gActionTertiary, haveMaterialSelection);
-
-        ShowWindow(gActionQuaternary, SW_SHOW);
+        EnableWindow(gActionQuaternary, haveMaterialSelection);
+    } else if (gMode == StorylandMode::DtzArchive &&
+               gDtzEmbeddedPreviewKind == DtzEmbeddedPreviewKind::TextureArchive) {
+        SetWindowTextW(gActionPrimary, L"Test Texture");
+        SetWindowTextW(gActionSecondary, L"Back to GAME.DTZ");
+        ShowWindow(gActionBar, SW_SHOW);
+        ShowWindow(gActionPrimary, SW_SHOW);
+        ShowWindow(gActionSecondary, SW_SHOW);
     } else if (gMode == StorylandMode::MediaFile) {
         SetWindowTextW(gActionPrimary, L"Play");
         SetWindowTextW(gActionSecondary, L"Stop");
@@ -17472,7 +17725,7 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         gMenuStrip = CreateWindowExW(0, menuStripClass.lpszClassName, nullptr,
             WS_CHILD, 0, 0, 100, 28, hwnd,
             reinterpret_cast<HMENU>(ID_MENU_STRIP), gInstance, nullptr);
-        gTree = CreateWindowExW(0, WC_TREEVIEWW, nullptr, WS_CHILD | WS_TABSTOP | WS_CLIPSIBLINGS | TVS_HASLINES | TVS_LINESATROOT | TVS_HASBUTTONS | TVS_SHOWSELALWAYS, 0, 0, 100, 100, hwnd, reinterpret_cast<HMENU>(ID_TREE), gInstance, nullptr);
+        gTree = CreateWindowExW(0, WC_TREEVIEWW, nullptr, WS_CHILD | WS_TABSTOP | WS_CLIPSIBLINGS | TVS_HASLINES | TVS_LINESATROOT | TVS_HASBUTTONS | TVS_SHOWSELALWAYS | TVS_NOTOOLTIPS, 0, 0, 100, 100, hwnd, reinterpret_cast<HMENU>(ID_TREE), gInstance, nullptr);
         WNDCLASSW previewClass = {};
         previewClass.lpfnWndProc = previewProc;
         previewClass.hInstance = gInstance;
@@ -17502,23 +17755,16 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             WS_CHILD | WS_TABSTOP | TBS_HORZ | TBS_NOTICKS | TBS_ENABLESELRANGE,
             0, 0, 100, 28, hwnd, reinterpret_cast<HMENU>(ID_MEDIA_TIMELINE), gInstance, nullptr);
         SendMessageW(gMediaTimeline, TBM_SETRANGE, TRUE, MAKELPARAM(0, 1));
-        SetWindowSubclass(gTree, storylandPaneBorderSubclassProc, 1, 0);
-        SetWindowSubclass(gPreview, storylandPaneBorderSubclassProc, 2, 0);
-        SetWindowSubclass(gDetails, storylandPaneBorderSubclassProc, 3, 0);
-        SetWindowSubclass(gActionBar, storylandPaneBorderSubclassProc, 4, 0);
-
-        // The subclasses reserve a real one-pixel non-client border. Force
-        // Windows to recalculate each client rectangle immediately instead of
-        // waiting for a later resize.
-        for (HWND pane : {gTree, gPreview, gDetails, gActionBar}) {
-            if (!pane) continue;
-            SetWindowPos(
-                pane,
-                nullptr,
-                0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
-                SWP_NOACTIVATE | SWP_FRAMECHANGED);
-        }
+        // Do not install SetWindowSubclass hooks on the main panes.
+        // In particular, subclassing the Win32 TreeView and changing its
+        // non-client rectangle from inside WM_NCCALCSIZE can leave COMCTL32
+        // with stale internal geometry while the tree is being deleted and
+        // repopulated. That can surface as an access violation inside
+        // COMCTL32.dll during otherwise-valid XTX loads/tests.
+        //
+        // Storyland already provides pane separation through the parent
+        // background/gutters, so the extra non-client subclass is unnecessary.
+        // Keeping the controls native also avoids resize paint corruption.
 
         gStatus = CreateWindowExW(0, STATUSCLASSNAMEW, nullptr, WS_CHILD, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(ID_STATUS), gInstance, nullptr);
 
@@ -17896,8 +18142,9 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             } else if (gMode == StorylandMode::ModelFile ||
                 (gMode == StorylandMode::DtzArchive && gDtzEmbeddedPreviewKind == DtzEmbeddedPreviewKind::ModelFile)) {
                 runCurrentModelTest();
-            } else if (gMode == StorylandMode::TextureArchive) {
-                addTextureMaterial();
+            } else if (gMode == StorylandMode::TextureArchive ||
+                       (gMode == StorylandMode::DtzArchive && gDtzEmbeddedPreviewKind == DtzEmbeddedPreviewKind::TextureArchive)) {
+                runCurrentTextureTest();
             } else if (gMode == StorylandMode::MediaFile) {
                 std::string mediaError;
                 if (!gMediaFile.play(mediaError)) MessageBoxW(gMainWindow, widen(mediaError).c_str(), L"Storyland media playback", MB_ICONERROR);
@@ -17913,7 +18160,9 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 (gMode == StorylandMode::DtzArchive && gDtzEmbeddedPreviewKind == DtzEmbeddedPreviewKind::ModelFile)) {
                 applyAnimationToCurrentModel();
             } else if (gMode == StorylandMode::TextureArchive) {
-                editSelectedTextureMaterial();
+                addTextureMaterial();
+            } else if (gMode == StorylandMode::DtzArchive && gDtzEmbeddedPreviewKind == DtzEmbeddedPreviewKind::TextureArchive) {
+                returnToGameDtz();
             } else if (gMode == StorylandMode::MediaFile) {
                 gMediaFile.stop();
                 updateActionBar();
@@ -17926,7 +18175,7 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 stepAnimPlayback(-1.0f / std::max(1.0f, gAnimFile.framesPerSecond()));
                 updateActionBar();
             } else if (gMode == StorylandMode::TextureArchive) {
-                removeSelectedTexture();
+                editSelectedTextureMaterial();
             } else if (gMode == StorylandMode::MediaFile && gMediaFile.kind() == StorylandMediaKind::Video) {
                 std::string mediaError;
                 if (!gMediaFile.stepVideoFrame(-1, mediaError))
@@ -17944,8 +18193,7 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 stepAnimPlayback(1.0f / std::max(1.0f, gAnimFile.framesPerSecond()));
                 updateActionBar();
             } else if (gMode == StorylandMode::TextureArchive) {
-                if (gDtzReturnAvailable) returnToGameDtz();
-                else validateCurrentTextureArchive();
+                removeSelectedTexture();
             } else if (gMode == StorylandMode::MediaFile && gMediaFile.kind() == StorylandMediaKind::Video) {
                 std::string mediaError;
                 if (!gMediaFile.stepVideoFrame(1, mediaError))
@@ -18146,6 +18394,7 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         return 0;
     }
     case WM_NOTIFY: {
+        if (gTreeMutationDepth > 0) return 0;
         LPNMHDR header = reinterpret_cast<LPNMHDR>(lParam);
         if (header && header->idFrom == ID_TREE && header->code == TVN_SELCHANGEDW) {
             NMTREEVIEWW* changed = reinterpret_cast<NMTREEVIEWW*>(lParam);
