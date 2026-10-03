@@ -4842,13 +4842,33 @@ bool StorylandArchiveBrowser::addResourceBytes(
         return false;
     }
 
-    uint32_t ident = readU32(resourceBytes, 0x00u);
+    uint32_t ident = sourceChunkIdentOrMdl(resourceBytes);
     if (!knownChunkIdent(ident) || ident == WRLD_IDENT || isAreaIdent(ident) || ident == GTAG_IDENT) {
         std::ostringstream message;
         message << "This file is not a supported loose LVZ+IMG resource.\r\n\r\n"
-                << "Add Resource currently accepts Leeds MDL and XTX/TEX resource files whose first 0x20 bytes are the runtime chunk header.";
+                << "Add Resource accepts standalone Leeds MDL and XTX/CHK/TEX files and converts their file-local container form into the LVZ+IMG runtime resource form.";
         errorMessage = message.str();
         return false;
+    }
+
+    if (ident == MDL_IDENT) {
+        StorylandModelFile sourceModel;
+        std::string modelError;
+        if (!sourceModel.loadFromMemory(resourceBytes, L"added_resource.mdl", modelError)) {
+            errorMessage = "The selected MDL could not be parsed as a Leeds model: " + modelError;
+            return false;
+        }
+        if (sourceModel.modelKind() != StorylandModelKind::SimpleModel) {
+            errorMessage =
+                "Add Resource currently accepts SimpleModel MDLs for LVZ/IMG world archives. "
+                "Detected model kind: " + sourceModel.modelKindName() + ". "
+                "Ped, cutscene, and vehicle MDLs need different runtime ownership and are not inserted as world resources.";
+            return false;
+        }
+        if (sourceModel.previewTriangles().empty() || sourceModel.previewPoints().empty()) {
+            errorMessage = "The selected SimpleModel MDL has no parseable render geometry.";
+            return false;
+        }
     }
 
     std::string cleanName = resourceName;
@@ -4870,10 +4890,11 @@ bool StorylandArchiveBrowser::addResourceBytes(
         }
     }
 
-    // Reuse a retail LVZ chunk header of the same resource type when possible.
-    // Standalone MDL/XTX headers contain file-local fields that are not equivalent
-    // to the runtime LVZ sChunkHeader fields. Copying those 0x20 bytes verbatim can
-    // produce an archive that Storyland can scan but the game cannot consume.
+    // A standalone MDL/XTX has a file-local 0x20-byte container header.  The
+    // LVZ copy is a runtime sChunkHeader.  Never copy the standalone header into
+    // the LVZ: fields such as relocation-table offsets and entry counts mean
+    // something completely different there.  Reuse a proven retail runtime
+    // header of the same resource type and replace only the structural fields.
     std::vector<uint8_t> newHeader;
     for (const StorylandArchiveEntry& entry : archiveEntries) {
         if (!entry.usesLvzChunkHeader || entry.chunkIdent != ident) continue;
@@ -4884,20 +4905,17 @@ bool StorylandArchiveBrowser::addResourceBytes(
         break;
     }
     if (newHeader.empty()) {
-        newHeader.assign(resourceBytes.begin(), resourceBytes.begin() + 0x20u);
-    }
-
-    std::vector<uint8_t> newPayload(resourceBytes.begin() + 0x20u, resourceBytes.end());
-    if (newPayload.empty()) {
-        errorMessage = "The resource contains a header but no IMG payload.";
+        errorMessage =
+            std::string("This LVZ does not contain a retail runtime ") + labelForIdent(ident) +
+            " chunk header that Storyland can use as a safe template. "
+            "The standalone file header is intentionally not copied because doing so creates invalid LVZ runtime metadata.";
         return false;
     }
 
-    const size_t logicalSizeFromHeader = size_t(readU32(resourceBytes, 0x08u));
-    if (logicalSizeFromHeader >= 0x20u && logicalSizeFromHeader <= resourceBytes.size()) {
-        // Do not import sector padding from a standalone file. The IMG owns its
-        // own sector padding and the runtime header records the logical size.
-        newPayload.assign(resourceBytes.begin() + 0x20u, resourceBytes.begin() + logicalSizeFromHeader);
+    std::vector<uint8_t> newPayload = sourceChunkPayloadForLvzStyle(resourceBytes);
+    if (newPayload.empty()) {
+        errorMessage = "The selected resource resolves to an empty IMG payload.";
+        return false;
     }
 
     const size_t imgAlignment = 2048u;
@@ -4980,6 +4998,7 @@ bool StorylandArchiveBrowser::addResourceBytes(
             << "Type: " << labelForIdent(ident) << "\r\n"
             << "LVZ header offset: 0x" << std::hex << std::uppercase << headerOffset << std::dec << "\r\n"
             << "IMG offset: " << payloadOffset << "\r\n"
+            << "Input converted from standalone container: yes; file-local 0x20-byte header removed and retail LVZ runtime header template used\r\n"
             << "Payload: " << newPayload.size() << " bytes\r\n"
             << "IMG sector: " << (payloadOffset / 2048u) << "\r\n\r\n"
             << "The archive pair is modified in memory. Use Overwrite Current LVZ + IMG or Rebuild LVZ + IMG As to write it.";
