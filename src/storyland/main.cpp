@@ -854,6 +854,11 @@ struct ArchiveViewportPick {
 static std::vector<ArchiveViewportPick> gArchiveViewportPicks;
 static bool gModelDragMoved = false;
 static POINT gModelMouseDownPoint = {};
+static bool gArchiveViewFocusActive = false;
+static float gArchiveViewFocusX = 0.0f;
+static float gArchiveViewFocusY = 0.0f;
+static float gArchiveViewFocusZ = 0.0f;
+static float gArchiveViewFocusSpan = 1.0f;
 
 static HWND gScriptWindow = nullptr;
 static HWND gScriptToolbar = nullptr;
@@ -1407,6 +1412,10 @@ static void drawWblPreviewOpenGl(HWND hwnd, HDC dc, RECT rc);
 static void applyModelViewportZoom(float scale);
 static void fitModelViewportCloser();
 static bool handleModelViewportShortcut(WPARAM key);
+static bool canViewSelectedInRenderer();
+static bool viewSelectedInRenderer();
+static void showRendererContextMenu(HWND hwnd, int clientX, int clientY);
+static std::string archiveEntryExtensionLower(const std::string& name);
 static bool prepareDtzDirEntryPreview(int index, std::wstring& previewSummary);
 static void openDtzDirEntryStandaloneByIndex(int entryIndex, int preferredTextureIndex);
 static void openSelectedDtzDirEntryStandalone();
@@ -3159,6 +3168,7 @@ static void replaceResourceTreeWithoutDeletingItems() {
 }
 
 static void clearView() {
+    gArchiveViewFocusActive = false;
     setDetailsReadOnly(true);
     clearDtzEmbeddedPreviewState();
     gModelDffStructureTreeActive = false;
@@ -3175,6 +3185,7 @@ static void clearView() {
 }
 
 static void resetModelViewport() {
+    gArchiveViewFocusActive = false;
     gModelViewRotation = {};
     gModelDragStartRotation = gModelViewRotation;
     gModelDragStartPoint = {};
@@ -3197,6 +3208,127 @@ static void fitModelViewportCloser() {
     gModelPanX = 0.0f;
     gModelPanY = 0.0f;
     if (gPreview) InvalidateRect(gPreview, nullptr, FALSE);
+}
+
+static bool selectedArchiveResourceId(uint32_t& resourceIdOut) {
+    if (gMode != StorylandMode::ArchiveFile) return false;
+
+    if (gSelectedKind == StorylandTreeKind::ArchiveMeshResource &&
+        gSelectedIndex >= 0 && size_t(gSelectedIndex) < gArchiveMeshResourceIds.size()) {
+        resourceIdOut = gArchiveMeshResourceIds[size_t(gSelectedIndex)];
+        return true;
+    }
+
+    if (gSelectedKind == StorylandTreeKind::ArchiveEntry &&
+        gSelectedIndex >= 0 && size_t(gSelectedIndex) < gArchiveBrowser.entries().size()) {
+        const std::string ext = archiveEntryExtensionLower(gArchiveBrowser.entries()[size_t(gSelectedIndex)].name);
+        if (ext == ".mdl" || ext == ".dff") {
+            resourceIdOut = uint32_t(gSelectedIndex);
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool canViewSelectedInRenderer() {
+    if (!currentModeUsesInteractiveModelViewport()) return false;
+    if (gMode == StorylandMode::ModelFile ||
+        (gMode == StorylandMode::DtzArchive && gDtzEmbeddedPreviewKind == DtzEmbeddedPreviewKind::ModelFile)) {
+        return true;
+    }
+    if (gMode == StorylandMode::ArchiveFile) {
+        uint32_t resourceId = 0;
+        if (!selectedArchiveResourceId(resourceId)) return false;
+        for (const auto& placement : gArchiveBrowser.placements()) {
+            if (placement.resourceIndex == resourceId) return true;
+        }
+    }
+    return false;
+}
+
+static bool viewSelectedInRenderer() {
+    if (gMode == StorylandMode::ModelFile ||
+        (gMode == StorylandMode::DtzArchive && gDtzEmbeddedPreviewKind == DtzEmbeddedPreviewKind::ModelFile)) {
+        gArchiveViewFocusActive = false;
+        gModelViewRotation = {};
+        gModelDragStartRotation = gModelViewRotation;
+        gModelDistance = 2.25f;
+        gModelPanX = 0.0f;
+        gModelPanY = 0.0f;
+        if (gPreview) InvalidateRect(gPreview, nullptr, FALSE);
+        setStatus(L"View centered on the selected model.");
+        return true;
+    }
+
+    if (gMode != StorylandMode::ArchiveFile) return false;
+
+    uint32_t resourceId = 0;
+    if (!selectedArchiveResourceId(resourceId)) return false;
+
+    bool found = false;
+    float minX = 0.0f, minY = 0.0f, minZ = 0.0f;
+    float maxX = 0.0f, maxY = 0.0f, maxZ = 0.0f;
+    for (const auto& placement : gArchiveBrowser.placements()) {
+        if (placement.resourceIndex != resourceId) continue;
+        const float radius = std::max(0.5f, std::min(100.0f, std::fabs(placement.boundRadius)));
+        if (!found) {
+            minX = placement.x - radius; maxX = placement.x + radius;
+            minY = placement.y - radius; maxY = placement.y + radius;
+            minZ = placement.z - radius; maxZ = placement.z + radius;
+            found = true;
+        } else {
+            minX = std::min(minX, placement.x - radius); maxX = std::max(maxX, placement.x + radius);
+            minY = std::min(minY, placement.y - radius); maxY = std::max(maxY, placement.y + radius);
+            minZ = std::min(minZ, placement.z - radius); maxZ = std::max(maxZ, placement.z + radius);
+        }
+    }
+    if (!found) return false;
+
+    gArchiveViewFocusX = (minX + maxX) * 0.5f;
+    gArchiveViewFocusY = (minY + maxY) * 0.5f;
+    gArchiveViewFocusZ = (minZ + maxZ) * 0.5f;
+    const float spanX = std::max(1.0f, maxX - minX);
+    const float spanY = std::max(1.0f, maxY - minY);
+    const float spanZ = std::max(1.0f, maxZ - minZ);
+    gArchiveViewFocusSpan = std::max(2.0f, std::max(spanX, std::max(spanY, spanZ)));
+    gArchiveViewFocusActive = true;
+
+    // "View Selected" is an inspection view: put the camera directly in front
+    // of the selected placed resource instead of preserving an arbitrary orbit.
+    gModelViewRotation = {};
+    gModelDragStartRotation = gModelViewRotation;
+    gModelDistance = 3.0f;
+    gModelPanX = 0.0f;
+    gModelPanY = 0.0f;
+    if (gPreview) InvalidateRect(gPreview, nullptr, FALSE);
+    setStatus(L"View centered in front of selected LVZ/IMG resource " + std::to_wstring(resourceId) + L".");
+    return true;
+}
+
+static void showRendererContextMenu(HWND hwnd, int clientX, int clientY) {
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+
+    constexpr UINT kResetView = 1;
+    constexpr UINT kViewSelected = 2;
+    AppendMenuW(menu, MF_STRING, kResetView, L"Reset View");
+    AppendMenuW(menu, MF_STRING | (canViewSelectedInRenderer() ? MF_ENABLED : MF_GRAYED),
+                kViewSelected, L"View Selected");
+
+    POINT screenPoint{clientX, clientY};
+    ClientToScreen(hwnd, &screenPoint);
+    const UINT command = TrackPopupMenu(menu,
+        TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_TOPALIGN,
+        screenPoint.x, screenPoint.y, 0, hwnd, nullptr);
+    DestroyMenu(menu);
+
+    if (command == kResetView) {
+        resetModelViewport();
+        if (gPreview) InvalidateRect(gPreview, nullptr, FALSE);
+        setStatus(L"Viewport reset.");
+    } else if (command == kViewSelected) {
+        viewSelectedInRenderer();
+    }
 }
 
 static const wchar_t* openGlRenderModeName(StorylandOpenGlRenderMode mode) {
@@ -14157,6 +14289,19 @@ static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
     float spanY = std::max(1.0f, maxY - minY);
     float spanZ = std::max(1.0f, maxZ - minZ);
     float largestSpan = std::max(spanX, std::max(spanY, spanZ));
+
+    if (gArchiveViewFocusActive) {
+        centerX = gArchiveViewFocusX;
+        centerY = gArchiveViewFocusY;
+        centerZ = gArchiveViewFocusZ;
+        largestSpan = std::max(1.0f, gArchiveViewFocusSpan);
+
+        const float gridHalfExtent = largestSpan * 2.0f;
+        minX = centerX - gridHalfExtent; maxX = centerX + gridHalfExtent;
+        minY = centerY - gridHalfExtent; maxY = centerY + gridHalfExtent;
+        minZ = centerZ - gridHalfExtent; maxZ = centerZ + gridHalfExtent;
+    }
+
     float modelScale = 2.4f / std::max(1.0f, largestSpan);
 
     glMultModelQuat(gModelViewRotation);
@@ -15940,6 +16085,12 @@ static LRESULT CALLBACK previewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         EndPaint(hwnd, &ps);
         return 0;
     }
+    if (msg == WM_KEYDOWN && wParam == VK_SPACE && currentModeUsesInteractiveModelViewport()) {
+        resetModelViewport();
+        InvalidateRect(hwnd, nullptr, FALSE);
+        setStatus(L"Viewport reset.");
+        return 0;
+    }
     if (msg == WM_KEYDOWN && handleModelViewportShortcut(wParam)) {
         return 0;
     }
@@ -15960,8 +16111,11 @@ static LRESULT CALLBACK previewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     }
     if (msg == WM_RBUTTONDOWN && currentModeUsesInteractiveModelViewport()) {
         gModelRightDrag = true;
+        gModelDragMoved = false;
         gModelLastMouse.x = GET_X_LPARAM(lParam);
         gModelLastMouse.y = GET_Y_LPARAM(lParam);
+        gModelMouseDownPoint = gModelLastMouse;
+        SetFocus(hwnd);
         SetCapture(hwnd);
         return 0;
     }
@@ -15978,7 +16132,17 @@ static LRESULT CALLBACK previewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                 return 0;
             }
         }
-        if (msg == WM_RBUTTONUP) gModelRightDrag = false;
+        if (msg == WM_RBUTTONUP) {
+            const bool wasClick = !gModelDragMoved;
+            const int clickX = GET_X_LPARAM(lParam);
+            const int clickY = GET_Y_LPARAM(lParam);
+            gModelRightDrag = false;
+            if (!gModelLeftDrag) ReleaseCapture();
+            if (wasClick) {
+                showRendererContextMenu(hwnd, clickX, clickY);
+                return 0;
+            }
+        }
         if (!gModelLeftDrag && !gModelRightDrag) ReleaseCapture();
         return 0;
     }
@@ -16000,6 +16164,7 @@ static LRESULT CALLBACK previewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             return 0;
         }
         if (gModelRightDrag) {
+            if (std::abs(x - gModelMouseDownPoint.x) > 3 || std::abs(y - gModelMouseDownPoint.y) > 3) gModelDragMoved = true;
             float panScale = std::max(0.0025f, gModelDistance * 0.0045f);
             if ((GetKeyState(VK_SHIFT) & 0x8000) != 0) panScale *= 2.5f;
             gModelPanX += float(dx) * panScale;
