@@ -14267,7 +14267,7 @@ static void createNewStorylandResource() {
 static void showAboutDialog() {
     MessageBoxW(
         gMainWindow,
-        L"Storyland 1.1.5.2\r\n\r\nauthor: spicybung\r\nhttps://github.com/spicybung/BLeeds\r\nReigns Studios\r\n\r\nAn analyzer, editor, and viewer for Grand Theft Auto Stories file formats.",
+        L"Storyland 1.1.7\r\n\r\nauthor: spicybung\r\nhttps://github.com/spicybung/BLeeds\r\nReigns Studios\r\n\r\nAn analyzer, editor, and viewer for Grand Theft Auto Stories file formats.",
         L"About Storyland",
         MB_OK | MB_ICONINFORMATION
     );
