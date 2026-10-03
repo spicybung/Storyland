@@ -1919,7 +1919,6 @@ static bool decodeLegacyTextureReference(
     outTexture.width = chosenW;
     outTexture.height = chosenH;
     outTexture.bpp = 4;
-    outTexture.legacyRaw4bpp = true;
     outTexture.rgba.assign(size_t(chosenW) * size_t(chosenH) * 4u, 255);
     size_t palette = end - 64u;
     for (int y = 0; y < chosenH; ++y) {
@@ -4124,7 +4123,7 @@ bool StorylandArchiveBrowser::hasClassicDirContext() const { return currentImgKi
 std::string StorylandArchiveBrowser::resourceDisplayName(uint32_t resourceId) const {
     auto found = masterResourceNameOverrides.find(resourceId);
     if (found != masterResourceNameOverrides.end() && !found->second.empty()) return found->second;
-    return "model" + std::to_string(resourceId) + ".mdl";
+    return "resource" + std::to_string(resourceId) + ".mdl";
 }
 
 bool StorylandArchiveBrowser::extractEntryBytes(size_t index, std::vector<uint8_t>& outBytes, std::string& errorMessage) const {
@@ -5001,11 +5000,9 @@ bool StorylandArchiveBrowser::replaceDirectTextureFromArchive(
         errorMessage = "The selected texture raster allocation is outside the loaded LVZ/IMG buffer.";
         return false;
     }
-    const bool directRuntimeTexture =
-        uint64_t(target.headerOffset) + 16ull <= destination.size() &&
-        readU32(destination, target.headerOffset) == 0xCCCCCCCCu;
-    if (!directRuntimeTexture && !target.legacyRaw4bpp) {
-        errorMessage = "Storyland can preview this texture, but its writable raster layout is not proven yet.";
+    if (uint64_t(target.headerOffset) + 16ull > destination.size() ||
+        readU32(destination, target.headerOffset) != 0xCCCCCCCCu) {
+        errorMessage = "This texture was recovered through a legacy/reference-only path and does not have a proven writable runtime texture header.";
         return false;
     }
 
@@ -5035,7 +5032,7 @@ bool StorylandArchiveBrowser::replaceDirectTextureFromArchive(
         return false;
     }
 
-    const bool swizzled = target.legacyRaw4bpp ? true : (((target.rasterFlags >> 24u) & 0xFFu) != 0u);
+    const bool swizzled = ((target.rasterFlags >> 24u) & 0xFFu) != 0u;
     std::vector<uint8_t> raster;
     std::vector<uint8_t> palette;
     if (!leedsEncodeCanonicalPs2TextureBlock(image, uint8_t(target.bpp), swizzled, raster, palette, errorMessage)) {
@@ -5073,7 +5070,6 @@ bool StorylandArchiveBrowser::replaceDirectTextureFromArchive(
     for (const StorylandDirectTextureResource& texture : directTextureCache) {
         if (texture.storedInImg != target.storedInImg) continue;
         if (texture.headerOffset != target.headerOffset) continue;
-        if (texture.legacyRaw4bpp != target.legacyRaw4bpp) continue;
         verified = &texture;
         break;
     }
@@ -5096,8 +5092,7 @@ bool StorylandArchiveBrowser::replaceDirectTextureFromArchive(
             << "Texture: " << target.name << "\r\n"
             << "Size: " << target.width << "x" << target.height << "\r\n"
             << "BPP preserved: " << target.bpp << "\r\n"
-            << (target.legacyRaw4bpp ? "Raster offset: 0x" : "Runtime header offset: 0x")
-            << std::hex << std::uppercase << target.headerOffset << std::dec << "\r\n"
+            << "Runtime header offset: 0x" << std::hex << std::uppercase << target.headerOffset << std::dec << "\r\n"
             << "Raster allocation preserved: " << target.storageBytes << " bytes\r\n"
             << "Stored in: " << (target.storedInImg ? "IMG" : "LVZ") << "\r\n"
             << "Pointers shifted: no\r\n"

@@ -5634,15 +5634,17 @@ static void selectWblPayload(const StorylandTreePayload& payload) {
     else if (payload.kind == StorylandTreeKind::WblBox) selectWblBox(payload.index);
 }
 
-static std::wstring archiveTreeLabel(const StorylandArchiveEntry& entry, size_t entryIndex) {
-    const std::string ext = archiveEntryExtensionLower(entry.name);
-    if (ext == ".area") return L"Area " + std::to_wstring(entryIndex + 1u);
-    if (ext == ".wrld") return L"World " + std::to_wstring(entryIndex + 1u);
-    return archiveDisplayName(entry, entryIndex);
-}
-
 static void addArchiveEntryTreeItem(HTREEITEM parent, const StorylandArchiveEntry& entry, size_t entryIndex) {
-    addTreeItem(parent, archiveTreeLabel(entry, entryIndex), StorylandTreeKind::ArchiveEntry, int(entryIndex));
+    std::wstringstream line;
+    line << archiveDisplayName(entry, entryIndex)
+         << L" | start=" << entry.startSector
+         << L" count=" << entry.sectorCount
+         << L" bytes=" << entry.byteSize
+         << L" offset=" << entry.byteOffset;
+    if (entry.usesLvzChunkHeader) {
+        line << L" header=" << hexWide(entry.lvzHeaderOffset, 6);
+    }
+    addTreeItem(parent, line.str(), StorylandTreeKind::ArchiveEntry, int(entryIndex));
 }
 
 static void populateArchiveList() {
@@ -12524,7 +12526,7 @@ static void exportSelectedArchiveDirectTexture() {
     }
 
     const std::wstring outputPath = saveFileDialogWithInitial(
-        L"GTA Stories texture archive\0*.xtx;*.chk;*.tex\0XTX\0*.xtx\0CHK\0*.chk\0TEX\0*.tex\0All files\0*.*\0",
+        L"GTA Stories texture archive\0*.xtx;*.chk\0XTX\0*.xtx\0CHK\0*.chk\0All files\0*.*\0",
         suggestedExtension == L".chk" ? L"chk" : L"xtx",
         suggestedName);
     if (outputPath.empty()) return;
@@ -17628,7 +17630,7 @@ static bool buildTreeContextMenu(HMENU menu) {
             hasItems = addContextMenuItem(menu, ID_ARCHIVE_REPLACE_SELECTED_RESOURCE, L"Replace Model...") || hasItems;
             hasItems = addContextMenuItem(menu, ID_FILE_EXPORT_SELECTED_RESOURCE, L"Export Model Resource...") || hasItems;
         } else if (gSelectedKind == StorylandTreeKind::ArchiveDirectTexture) {
-            hasItems = addContextMenuItem(menu, ID_ARCHIVE_EXPORT_DIRECT_TEXTURE, L"Export Texture...") || hasItems;
+            hasItems = addContextMenuItem(menu, ID_ARCHIVE_EXPORT_DIRECT_TEXTURE, L"Export Texture as XTX...") || hasItems;
             hasItems = addContextMenuItem(menu, ID_ARCHIVE_REPLACE_DIRECT_TEXTURE, L"Replace Texture...") || hasItems;
         }
         if (gArchiveBrowser.hasLvzContext() && gArchiveBrowser.hasImgContext()) {
@@ -18837,6 +18839,19 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
              draw->CtlID == ID_ACTION_SECONDARY ||
              draw->CtlID == ID_ACTION_TERTIARY ||
              draw->CtlID == ID_ACTION_QUATERNARY)) {
+            const int drawWidth = std::max(1, static_cast<int>(draw->rcItem.right - draw->rcItem.left));
+            const int drawHeight = std::max(1, static_cast<int>(draw->rcItem.bottom - draw->rcItem.top));
+            HDC bufferDc = CreateCompatibleDC(draw->hDC);
+            HBITMAP bufferBitmap = bufferDc
+                ? CreateCompatibleBitmap(draw->hDC, drawWidth, drawHeight)
+                : nullptr;
+            HGDIOBJ oldBitmap = bufferBitmap ? SelectObject(bufferDc, bufferBitmap) : nullptr;
+            const bool buffered = oldBitmap && oldBitmap != HGDI_ERROR;
+            HDC drawDc = buffered ? bufferDc : draw->hDC;
+            if (buffered) {
+                SetViewportOrgEx(bufferDc, -draw->rcItem.left, -draw->rcItem.top, nullptr);
+            }
+
             const bool disabled = (draw->itemState & ODS_DISABLED) != 0;
             const bool pressed = (draw->itemState & ODS_SELECTED) != 0;
             const COLORREF accent = storylandPaneBorderColor();
@@ -18851,47 +18866,55 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 ? (disabled ? RGB(119, 123, 132) : RGB(238, 239, 243))
                 : (disabled ? RGB(130, 150, 170) : RGB(24, 57, 91));
 
-            paintStorylandAeroGradient(draw->hDC, draw->rcItem, top, bottom);
+            paintStorylandAeroGradient(drawDc, draw->rcItem, top, bottom);
 
             HPEN pen = CreatePen(PS_SOLID, 1, border);
-            HGDIOBJ oldPen = SelectObject(draw->hDC, pen);
-            HGDIOBJ oldBrush = SelectObject(draw->hDC, GetStockObject(HOLLOW_BRUSH));
+            HGDIOBJ oldPen = SelectObject(drawDc, pen);
+            HGDIOBJ oldBrush = SelectObject(drawDc, GetStockObject(HOLLOW_BRUSH));
             const int buttonRight =
                 std::max(draw->rcItem.left, draw->rcItem.right - 1);
             const int buttonBottom =
                 std::max(draw->rcItem.top, draw->rcItem.bottom - 1);
             RoundRect(
-                draw->hDC,
+                drawDc,
                 draw->rcItem.left,
                 draw->rcItem.top,
                 buttonRight,
                 buttonBottom,
                 8, 8);
-            SelectObject(draw->hDC, oldBrush);
-            SelectObject(draw->hDC, oldPen);
+            SelectObject(drawDc, oldBrush);
+            SelectObject(drawDc, oldPen);
             DeleteObject(pen);
 
             wchar_t text[128] = {};
             GetWindowTextW(draw->hwndItem, text, int(sizeof(text) / sizeof(text[0])));
             RECT textRect = draw->rcItem;
             if (pressed) OffsetRect(&textRect, 1, 1);
-            SetBkMode(draw->hDC, TRANSPARENT);
-            SetTextColor(draw->hDC, textColor);
+            SetBkMode(drawDc, TRANSPARENT);
+            SetTextColor(drawDc, textColor);
             HFONT font = reinterpret_cast<HFONT>(SendMessageW(draw->hwndItem, WM_GETFONT, 0, 0));
-            HGDIOBJ oldFont = font ? SelectObject(draw->hDC, font) : nullptr;
+            HGDIOBJ oldFont = font ? SelectObject(drawDc, font) : nullptr;
             DrawTextW(
-                draw->hDC,
+                drawDc,
                 text,
                 -1,
                 &textRect,
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-            if (oldFont) SelectObject(draw->hDC, oldFont);
+            if (oldFont) SelectObject(drawDc, oldFont);
 
             if ((draw->itemState & ODS_FOCUS) != 0 && !disabled) {
                 RECT focusRect = draw->rcItem;
                 InflateRect(&focusRect, -3, -3);
-                DrawFocusRect(draw->hDC, &focusRect);
+                DrawFocusRect(drawDc, &focusRect);
             }
+            if (buffered) {
+                SetViewportOrgEx(bufferDc, 0, 0, nullptr);
+                BitBlt(draw->hDC, draw->rcItem.left, draw->rcItem.top,
+                    drawWidth, drawHeight, bufferDc, 0, 0, SRCCOPY);
+                SelectObject(bufferDc, oldBitmap);
+            }
+            if (bufferBitmap) DeleteObject(bufferBitmap);
+            if (bufferDc) DeleteDC(bufferDc);
             return TRUE;
         }
         if (draw && draw->CtlID == ID_STATUS) {
