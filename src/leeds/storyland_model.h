@@ -152,6 +152,7 @@ public:
     bool isPmlcMdl() const;
     bool isPspNativeDff() const;
     bool isGtaSaDff() const;
+    bool isDesktopRwDff() const;
     bool saveToFile(const std::wstring& outputPath, std::string& errorMessage) const;
     bool exportMobileLcsDffLossless(const std::wstring& outputPath, std::string& errorMessage) const;
     void createEmptyDraft(const std::wstring& displayPath);
@@ -185,14 +186,14 @@ private:
     bool mobileLcsDff = false;
     bool pmlcMdl = false;
     bool pspNativeDff = false;
-    bool gtaSaDff = false;
+    bool desktopRwDff = false;
     bool emptyDraft = false;
 
     void parse();
     bool parseMobileLcsDff();
     bool parsePmlcMdl();
     bool parsePspStandardDff();
-    bool parseGtaSaDff();
+    bool parseDesktopRwDff();
     bool parsePspNativeDff();
     void collectRenderWare2dfxLights();
     void collectPreviewPoints();

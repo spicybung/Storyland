@@ -223,57 +223,56 @@ struct StorylandMasterResourceTableInfo {
 
 static bool locateMasterResourceTable(const std::vector<uint8_t>& bytes, StorylandMasterResourceTableInfo& outInfo) {
     outInfo = {};
-    if (bytes.size() < 0x150u || readU32(bytes, 0x00u) != WRLD_IDENT) return false;
-
+    if (bytes.size() < 0x28u || readU32(bytes, 0u) != WRLD_IDENT) return false;
     uint32_t dataEnd = readU32(bytes, 0x0Cu);
-    if (dataEnd < 0x150u || dataEnd > bytes.size()) dataEnd = uint32_t(bytes.size());
-
+    if (dataEnd < 0x28u || dataEnd > bytes.size()) dataEnd = uint32_t(bytes.size());
     const uint32_t table = readU32(bytes, 0x20u);
     if (table < 0x40u || table >= dataEnd || (table & 3u) != 0u) return false;
 
-    auto tableLooksValid = [&](uint32_t count) -> bool {
-        if (count == 0u || count > 65536u) return false;
-        if (uint64_t(table) + uint64_t(count) * 12ull > uint64_t(dataEnd)) return false;
-
-        const uint32_t sampleCount = std::min<uint32_t>(count, 256u);
-        uint32_t goodRows = 0u;
-        for (uint32_t i = 0; i < sampleCount; ++i) {
-            const size_t row = size_t(table) + size_t(i) * 12u;
-            const uint32_t pointer = readU32(bytes, row + 0u);
-            const uint32_t resourceId = readU32(bytes, row + 8u);
-            const bool idOk = resourceId == i || resourceId == 0xFFFFFFFFu;
-            const bool pointerOk = pointer == 0u || pointer == 0xFFFFFFFFu ||
-                (((pointer & 3u) == 0u) && pointer >= 0x40u && pointer < dataEnd);
-            if (idOk && pointerOk) ++goodRows;
-        }
-        return sampleCount != 0u && goodRows * 5u >= sampleCount * 4u;
-    };
-
-    // Retail VCS/LCS master WRLD stores Resource[] count at +0x14C.  This is
-    // separate from +0x14, which is the relocation-entry count.
-    uint32_t count = readU32(bytes, 0x14Cu);
-    if (!tableLooksValid(count)) {
-        // Conservative fallback for unusual builds: infer the contiguous 12-byte
-        // Resource[] rows from their stable {pointer, unknown, id} layout.
-        count = 0u;
-        for (uint32_t i = 0; i < 65536u; ++i) {
-            const uint64_t row64 = uint64_t(table) + uint64_t(i) * 12ull;
-            if (row64 + 12ull > dataEnd) break;
-            const size_t row = size_t(row64);
-            const uint32_t pointer = readU32(bytes, row + 0u);
-            const uint32_t resourceId = readU32(bytes, row + 8u);
-            const bool idOk = resourceId == i || resourceId == 0xFFFFFFFFu;
-            const bool pointerOk = pointer == 0u || pointer == 0xFFFFFFFFu ||
-                (((pointer & 3u) == 0u) && pointer >= 0x40u && pointer < dataEnd);
-            if (!idOk || !pointerOk) break;
-            count = i + 1u;
-        }
-        if (!tableLooksValid(count)) return false;
+    size_t directoryEnd = 0x24u;
+    uint32_t rowCount = 0u;
+    uint32_t tableEnd = dataEnd;
+    while (directoryEnd + 8u <= dataEnd && rowCount < 256u) {
+        const uint32_t header = readU32(bytes, directoryEnd);
+        if (header < 0x20u || uint64_t(header) + 0x20u > dataEnd || (header & 3u) != 0u) break;
+        const uint32_t tag = readU32(bytes, header);
+        if (tag != WRLD_IDENT && tag != TEX_IDENT && !isAreaIdent(tag)) break;
+        if (header > table) tableEnd = std::min(tableEnd, header);
+        ++rowCount;
+        directoryEnd += 8u;
     }
-
+    const uint32_t declaredCount = readU32(bytes, directoryEnd);
+    auto validTable = [&](uint32_t count, uint32_t stride) {
+        if (count == 0u || count > 65536u ||
+            uint64_t(table) + uint64_t(count) * stride > tableEnd) return false;
+        const uint32_t samples = std::min(count, 256u);
+        uint32_t good = 0u;
+        for (uint32_t index = 0; index < samples; ++index) {
+            const size_t row = size_t(table) + size_t(index) * stride;
+            const uint32_t pointer = readU32(bytes, row);
+            const bool pointerOk = pointer == 0u || pointer == 0xFFFFFFFFu ||
+                (pointer >= 0x40u && pointer < dataEnd && (pointer & 3u) == 0u);
+            const bool idOk = stride == 8u || readU32(bytes, row + 8u) == index ||
+                readU32(bytes, row + 8u) == 0xFFFFFFFFu;
+            if (pointerOk && idOk) ++good;
+        }
+        return good * 5u >= samples * 4u;
+    };
+    uint32_t stride = rowCount == 47u ? 8u : 12u;
+    uint32_t count = declaredCount;
+    if (!validTable(count, stride)) {
+        if (rowCount == 47u || rowCount == 37u) return false;
+        if (validTable(count, 8u)) stride = 8u;
+        else {
+            // Older WRLD variants without a complete directory retain indexed 12-byte rows.
+            count = readU32(bytes, 0x14Cu);
+            if (!validTable(count, 12u)) return false;
+            stride = 12u;
+        }
+    }
     outInfo.tableOffset = table;
     outInfo.count = count;
-    outInfo.stride = 12u;
+    outInfo.stride = stride;
     outInfo.dataEnd = dataEnd;
     return true;
 }
@@ -283,7 +282,7 @@ static bool masterResourceRow(const std::vector<uint8_t>& bytes, uint32_t resour
                               size_t& rowOffset, uint32_t& pointer) {
     if (!locateMasterResourceTable(bytes, tableInfo) || resourceId >= tableInfo.count) return false;
     rowOffset = size_t(tableInfo.tableOffset) + size_t(resourceId) * size_t(tableInfo.stride);
-    if (rowOffset + 12u > tableInfo.dataEnd) return false;
+    if (rowOffset + tableInfo.stride > tableInfo.dataEnd) return false;
     pointer = readU32(bytes, rowOffset + 0u);
     return true;
 }
@@ -294,7 +293,7 @@ static size_t masterResourcePayloadEnd(const std::vector<uint8_t>& bytes,
     size_t end = tableInfo.dataEnd;
     for (uint32_t i = 0; i < tableInfo.count; ++i) {
         const size_t row = size_t(tableInfo.tableOffset) + size_t(i) * size_t(tableInfo.stride);
-        if (row + 12u > tableInfo.dataEnd) break;
+        if (row + tableInfo.stride > tableInfo.dataEnd) break;
         const uint32_t candidate = readU32(bytes, row + 0u);
         if (candidate > pointer && candidate < end && candidate < tableInfo.dataEnd) end = candidate;
     }
@@ -353,7 +352,7 @@ static bool appendPayloadToMasterResourceSlot(
     // rows are {0, 0, 0xFFFFFFFF}; activation only changes the pointer/id.
     writeU32(data, rowOffset + 0u, payloadOffset);
     writeU32(data, rowOffset + 4u, 0u);
-    writeU32(data, rowOffset + 8u, resourceId);
+    if (tableInfo.stride == 12u) writeU32(data, rowOffset + 8u, resourceId);
 
     const uint32_t pointerFieldOffset = uint32_t(rowOffset);
     if (std::find(relocations.begin(), relocations.end(), pointerFieldOffset) == relocations.end()) {
@@ -854,13 +853,56 @@ static size_t alignDown4Size(size_t value) {
     return value & ~size_t(3u);
 }
 
-static size_t findUnpackNear(const std::vector<uint8_t>& bytes, size_t offset, size_t maxEnd, size_t window = 8) {
-    size_t start = offset > window ? offset - window : 0;
-    size_t stop = std::min(maxEnd, offset + window + 4);
-    for (size_t cursor = start; cursor + 4 <= stop; ++cursor) {
-        if ((cursor & 3u) == 0 && readU32(bytes, cursor) == 0x6C018000u) return cursor;
+static size_t findUnpackNear(
+    const std::vector<uint8_t>& bytes,
+    size_t offset,
+    size_t maxEnd,
+    size_t window = 0x90u,
+    bool allowBackward = true
+) {
+    const size_t n = std::min(maxEnd, bytes.size());
+    if (n < 4u) return SIZE_MAX;
+    const size_t requested = std::min(offset, n - 1u);
+
+    auto validUnpack = [&](size_t position) -> bool {
+        if (position + 4u > n || (position & 3u) != 0u) return false;
+        if (!allowBackward && position < requested) return false;
+        return readU32(bytes, position) == 0x6C018000u;
+    };
+
+    static const int preferredDeltas[] = {
+        0,
+        0x50, -0x50,
+        0x4C, 0x54, 0x48, 0x58, 0x44, 0x5C, 0x40, 0x60,
+        -12, 12, -16, 16, -8, 8, -4, 4,
+        -20, 20, -24, 24, -28, 28, -32, 32, -36, 36, -40, 40
+    };
+    for (int delta : preferredDeltas) {
+        if (!allowBackward && delta < 0) continue;
+        const int64_t candidate64 = int64_t(requested) + int64_t(delta);
+        if (candidate64 < 0) continue;
+        const size_t candidate = size_t(candidate64);
+        if (validUnpack(candidate)) return candidate;
     }
-    return SIZE_MAX;
+
+    const size_t searchWindow = std::max<size_t>(window, 0x90u);
+    const size_t start = allowBackward && requested > searchWindow ? requested - searchWindow : requested;
+    const size_t stop = std::min(n - 4u, requested + searchWindow);
+    size_t best = SIZE_MAX;
+    size_t bestDistance = (std::numeric_limits<size_t>::max)();
+    for (size_t cursor = alignDown4Size(start); cursor <= stop; cursor += 4u) {
+        if (!validUnpack(cursor)) {
+            if (stop - cursor < 4u) break;
+            continue;
+        }
+        const size_t distance = cursor > requested ? cursor - requested : requested - cursor;
+        if (distance < bestDistance || (distance == bestDistance && cursor < best)) {
+            best = cursor;
+            bestDistance = distance;
+        }
+        if (stop - cursor < 4u) break;
+    }
+    return best;
 }
 
 struct ParsedWorldMaterial {
@@ -887,7 +929,8 @@ static bool parseWorldMaterialList(
     const std::vector<uint8_t>& bytes,
     size_t base,
     size_t maxEnd,
-    ParsedWorldMaterialList& outList
+    ParsedWorldMaterialList& outList,
+    uint32_t preferredRowLength = 0u
 ) {
     outList = {};
     if (base + 4 > maxEnd || maxEnd > bytes.size()) return false;
@@ -898,10 +941,50 @@ static bool parseWorldMaterialList(
     if (sizeBytes < count * 22u || sizeBytes > 0x4000u) return false;
     if (base + 4u + sizeBytes > maxEnd) return false;
 
+    const uint32_t expected24 = ((4u + count * 24u + 15u) & ~15u) - 4u;
+    const uint32_t expected22 = ((4u + count * 22u + 15u) & ~15u) - 4u;
     uint32_t rowLength = 0;
-    if (sizeBytes >= count * 24u) rowLength = 24;
-    else if (sizeBytes >= count * 22u) rowLength = 22;
-    else return false;
+    if (sizeBytes == expected24 && sizeBytes != expected22) rowLength = 24u;
+    else if (sizeBytes == expected22 && sizeBytes != expected24) rowLength = 22u;
+    else if (sizeBytes == expected24 && sizeBytes == expected22) {
+        auto scoreRows = [&](uint32_t stride) -> int {
+            int score = 0;
+            const uint32_t testCount = std::min<uint32_t>(count, 8u);
+            for (uint32_t index = 0; index < testCount; ++index) {
+                const size_t row = base + 4u + size_t(index) * stride;
+                if (row + stride > maxEnd) return -100000;
+                uint32_t packetSize = 0;
+                float uScale = 1.0f;
+                float vScale = 1.0f;
+                if (stride == 24u) {
+                    packetSize = readU32(bytes, row) >> 1;
+                    uScale = halfToFloat(readU16(bytes, row + 6u));
+                    vScale = halfToFloat(readU16(bytes, row + 8u));
+                    score += packetSize > 0u && packetSize <= 0x40000u ? 12 : -10;
+                } else {
+                    packetSize = readU16(bytes, row + 2u) & 0x7FFFu;
+                    uScale = halfToFloat(readU16(bytes, row + 4u));
+                    vScale = halfToFloat(readU16(bytes, row + 6u));
+                    score += packetSize > 0u && packetSize <= 0x8000u ? 8 : -6;
+                }
+                score += std::isfinite(uScale) && std::isfinite(vScale) &&
+                         std::fabs(uScale) <= 256.0f && std::fabs(vScale) <= 256.0f ? 8 : -30;
+            }
+            return score;
+        };
+        rowLength = scoreRows(24u) >= scoreRows(22u) ? 24u : 22u;
+    } else {
+        if (sizeBytes >= count * 24u && sizeBytes - count * 24u < 16u) rowLength = 24u;
+        else if (sizeBytes >= count * 22u && sizeBytes - count * 22u < 16u) rowLength = 22u;
+        else return false;
+    }
+
+    if (preferredRowLength != 0u) {
+        if (preferredRowLength != 22u && preferredRowLength != 24u) return false;
+        const uint32_t expected = ((4u + count * preferredRowLength + 15u) & ~15u) - 4u;
+        if (sizeBytes != expected && sizeBytes != count * preferredRowLength) return false;
+        rowLength = preferredRowLength;
+    }
 
     size_t rowsBase = base + 4u;
     for (uint32_t index = 0; index < count; ++index) {
@@ -939,10 +1022,11 @@ static bool parseOneWorldVifStrip(
     const std::vector<uint8_t>& bytes,
     size_t requestedOffset,
     size_t maxEnd,
-    ParsedWorldStrip& outStrip
+    ParsedWorldStrip& outStrip,
+    bool allowBackward = true
 ) {
     outStrip = {};
-    size_t pos = findUnpackNear(bytes, alignDown4Size(requestedOffset), maxEnd);
+    size_t pos = findUnpackNear(bytes, alignDown4Size(requestedOffset), maxEnd, 0x90u, allowBackward);
     if (pos == SIZE_MAX || pos + 20 > maxEnd) return false;
 
     uint32_t vertexCount = readU32(bytes, pos + 16) & 0x7FFFu;
@@ -981,8 +1065,8 @@ static bool parseOneWorldVifStrip(
     if (cursor + uvBytes > maxEnd) return false;
     for (uint32_t vertexIndex = 0; vertexIndex < vertexCount; ++vertexIndex) {
         size_t uvOffset = cursor + size_t(vertexIndex) * 2u;
-        outStrip.vertices[vertexIndex].u = float(bytes[uvOffset + 0]) / 255.0f;
-        outStrip.vertices[vertexIndex].v = float(bytes[uvOffset + 1]) / 255.0f;
+        outStrip.vertices[vertexIndex].u = float(bytes[uvOffset + 0]) / 128.0f;
+        outStrip.vertices[vertexIndex].v = float(bytes[uvOffset + 1]) / 128.0f;
     }
     cursor = alignUp4Size(cursor + uvBytes);
 
@@ -1011,11 +1095,23 @@ static bool parseWorldOverlayMesh(
     size_t maxEnd,
     uint32_t sectorIndex,
     uint32_t resourceIndex,
-    StorylandWorldMesh& outMesh
+    StorylandWorldMesh& outMesh,
+    uint32_t preferredRowLength = 0u
 ) {
     outMesh = {};
+    if (maxEnd > bytes.size()) return false;
+    // Retail empty sBuildingGeometry records are 16 bytes including padding.
+    // They represent a deliberate absence of geometry, not a failed decode.
+    if (rawOffset + 16u <= maxEnd && readU16(bytes, rawOffset) == 0u &&
+        readU16(bytes, rawOffset + 2u) == 12u &&
+        std::all_of(bytes.begin() + rawOffset + 4u, bytes.begin() + rawOffset + 16u,
+                    [](uint8_t byte) { return byte == 0xAAu; })) {
+        outMesh.sectorIndex = sectorIndex; outMesh.resourceIndex = resourceIndex;
+        outMesh.rawOffset = rawOffset; outMesh.emptyGeometry = true;
+        return true;
+    }
     ParsedWorldMaterialList materialList;
-    if (!parseWorldMaterialList(bytes, rawOffset, maxEnd, materialList)) return false;
+    if (!parseWorldMaterialList(bytes, rawOffset, maxEnd, materialList, preferredRowLength)) return false;
 
     std::vector<ParsedWorldStrip> strips;
     size_t cursor = materialList.streamStart;
@@ -1044,10 +1140,11 @@ static bool parseWorldOverlayMesh(
     uint32_t totalVertices = 0;
 
     for (uint32_t groupIndex = 0; groupIndex < 512 && cursor < stripSearchLimit; ++groupIndex) {
-        size_t unpack = findUnpackNear(bytes, cursor, stripSearchLimit, 32);
+        const bool allowBackward = groupIndex == 0u;
+        size_t unpack = findUnpackNear(bytes, cursor, stripSearchLimit, 0x90u, allowBackward);
         if (unpack == SIZE_MAX) break;
         ParsedWorldStrip strip;
-        if (!parseOneWorldVifStrip(bytes, unpack, stripSearchLimit, strip)) break;
+        if (!parseOneWorldVifStrip(bytes, unpack, stripSearchLimit, strip, false)) break;
         if (strip.vertices.empty()) break;
         if (unpack + strip.streamBytes > stripSearchLimit) break;
         totalVertices += uint32_t(strip.vertices.size());
@@ -1119,13 +1216,14 @@ static bool parseWorldOverlayMeshNear(
     uint32_t sectorIndex,
     uint32_t resourceIndex,
     StorylandWorldMesh& outMesh,
-    size_t& descriptorOffset
+    size_t& descriptorOffset,
+    uint32_t preferredRowLength = 0u
 ) {
     descriptorOffset = rawOffset;
-    if (parseWorldOverlayMesh(bytes, rawOffset, maxEnd, sectorIndex, resourceIndex, outMesh)) return true;
+    if (parseWorldOverlayMesh(bytes, rawOffset, maxEnd, sectorIndex, resourceIndex, outMesh, preferredRowLength)) return true;
     size_t searchEnd = std::min(maxEnd, rawOffset + 0x180u);
     for (size_t offset = alignUp4Size(rawOffset + 4u); offset + 4u <= searchEnd; offset += 4u) {
-        if (!parseWorldOverlayMesh(bytes, offset, maxEnd, sectorIndex, resourceIndex, outMesh)) continue;
+        if (!parseWorldOverlayMesh(bytes, offset, maxEnd, sectorIndex, resourceIndex, outMesh, preferredRowLength)) continue;
         descriptorOffset = offset;
         return true;
     }
@@ -1156,7 +1254,7 @@ static void alignWorldPayload4(std::vector<uint8_t>& out) {
 static uint8_t clampByteFromUnit(float value) {
     if (!std::isfinite(value)) return 0;
     value = std::max(0.0f, std::min(1.0f, value));
-    return uint8_t(std::round(value * 255.0f));
+    return uint8_t(std::round(value * 128.0f));
 }
 
 static int16_t clampI16FromUnitSigned(float value) {
@@ -1373,7 +1471,7 @@ static bool collectLeedsStripsFromAnyChunk(const std::vector<uint8_t>& bytes, st
     size_t cursor = start;
     uint32_t totalVertices = 0;
 
-    while (cursor + 0x80 < maxEnd && strips.size() < 4096) {
+    while (cursor + 0x80 <= maxEnd && strips.size() < 4096) {
         size_t unpack = findUnpackNear(bytes, cursor, maxEnd, 16);
         if (unpack == SIZE_MAX) break;
 
@@ -1414,7 +1512,7 @@ static bool collectExactLeedsStripSpansFromAnyChunk(const std::vector<uint8_t>& 
     size_t cursor = start;
     uint32_t totalVertices = 0;
 
-    while (cursor + 0x80 < maxEnd && spans.size() < 4096) {
+    while (cursor + 0x80 <= maxEnd && spans.size() < 4096) {
         size_t unpack = findUnpackNear(bytes, cursor, maxEnd, 16);
         if (unpack == SIZE_MAX) break;
 
@@ -1443,7 +1541,8 @@ static bool collectExactLeedsStripSpansFromAnyChunk(const std::vector<uint8_t>& 
 static bool buildWorldSectorMeshPayloadFromExactLeedsStripBytes(
     const std::vector<uint8_t>& sourceBytes,
     uint32_t fallbackTextureId,
-    std::vector<uint8_t>& outPayload
+    std::vector<uint8_t>& outPayload,
+    uint16_t materialRowBytes = 24u
 ) {
     outPayload.clear();
 
@@ -1459,25 +1558,29 @@ static bool buildWorldSectorMeshPayloadFromExactLeedsStripBytes(
     }
 
     uint16_t materialCount = uint16_t(std::min<size_t>(spans.size(), 0xFFFFu));
-    uint16_t materialRowBytes = 24;
-    uint32_t materialSizeBytes = uint32_t(materialCount) * uint32_t(materialRowBytes);
+    uint32_t materialSizeBytes = ((4u + uint32_t(materialCount) * materialRowBytes + 15u) & ~15u) - 4u;
     if (materialSizeBytes > 0xFFFFu) return false;
 
     appendWorldPayloadU16(outPayload, materialCount);
     appendWorldPayloadU16(outPayload, uint16_t(materialSizeBytes));
 
     for (const LeedsExactStripSpan& span : spans) {
-        uint32_t packetRaw = uint32_t(span.size) << 1;
-        appendWorldPayloadU32(outPayload, packetRaw);
-        appendWorldPayloadU16(outPayload, uint16_t(fallbackTextureId == 0xFFFFFFFFu ? 0 : fallbackTextureId));
+        const uint16_t textureId = uint16_t(fallbackTextureId == 0xFFFFFFFFu ? 0 : fallbackTextureId);
+        if (materialRowBytes == 22u) {
+            appendWorldPayloadU16(outPayload, textureId);
+            appendWorldPayloadU16(outPayload, uint16_t(span.size));
+        } else {
+            appendWorldPayloadU32(outPayload, uint32_t(span.size) << 1u);
+            appendWorldPayloadU16(outPayload, textureId);
+        }
         appendWorldPayloadU16(outPayload, 0x3C00u);
         appendWorldPayloadU16(outPayload, 0x3C00u);
-        for (int i = 0; i < int(materialRowBytes) - 10; ++i) {
+        for (int i = 0; i < int(materialRowBytes) - (materialRowBytes == 22u ? 8 : 10); ++i) {
             outPayload.push_back(0);
         }
     }
 
-    alignWorldPayload4(outPayload);
+    outPayload.resize(4u + materialSizeBytes, 0xAAu);
 
     for (const LeedsExactStripSpan& span : spans) {
         outPayload.insert(outPayload.end(), sourceBytes.begin() + span.offset, sourceBytes.begin() + span.offset + span.size);
@@ -1485,7 +1588,7 @@ static bool buildWorldSectorMeshPayloadFromExactLeedsStripBytes(
     }
 
     StorylandWorldMesh testMesh;
-    return parseWorldOverlayMesh(outPayload, 0, outPayload.size(), 0, 0, testMesh) &&
+    return parseWorldOverlayMesh(outPayload, 0, outPayload.size(), 0, 0, testMesh, materialRowBytes) &&
            !testMesh.vertices.empty() &&
            !testMesh.triangles.empty();
 }
@@ -1493,14 +1596,15 @@ static bool buildWorldSectorMeshPayloadFromExactLeedsStripBytes(
 static bool buildWorldSectorMeshPayloadFromLeedsChunk(
     const std::vector<uint8_t>& sourceBytes,
     uint32_t fallbackTextureId,
-    std::vector<uint8_t>& outPayload
+    std::vector<uint8_t>& outPayload,
+    uint16_t materialRowBytes = 24u
 ) {
     outPayload.clear();
 
     // First choice: do not decode/re-encode the MDL VIF. Copy the exact Leeds
     // strip packets from the MDL into a sector-resource sBuildingGeometry-style
     // wrapper. Re-encoding was the TLB/VIF risk path.
-    if (buildWorldSectorMeshPayloadFromExactLeedsStripBytes(sourceBytes, fallbackTextureId, outPayload)) {
+    if (buildWorldSectorMeshPayloadFromExactLeedsStripBytes(sourceBytes, fallbackTextureId, outPayload, materialRowBytes)) {
         return true;
     }
 
@@ -1515,23 +1619,28 @@ static bool buildWorldSectorMeshPayloadFromLeedsChunk(
     }
     if (stream.empty()) return false;
 
-    uint16_t materialRowBytes = 24;
     appendWorldPayloadU16(outPayload, 1);
-    appendWorldPayloadU16(outPayload, materialRowBytes);
+    appendWorldPayloadU16(outPayload, 28u);
 
-    uint32_t packetRaw = uint32_t(std::min<size_t>(stream.size(), 0x7FFFFFFFu)) << 1;
-    appendWorldPayloadU32(outPayload, packetRaw);
-    appendWorldPayloadU16(outPayload, uint16_t(fallbackTextureId == 0xFFFFFFFFu ? 0 : fallbackTextureId));
+    const uint16_t textureId = uint16_t(fallbackTextureId == 0xFFFFFFFFu ? 0 : fallbackTextureId);
+    if (materialRowBytes == 22u) {
+        if (stream.size() > 0x7FFFu) return false;
+        appendWorldPayloadU16(outPayload, textureId);
+        appendWorldPayloadU16(outPayload, uint16_t(stream.size()));
+    } else {
+        appendWorldPayloadU32(outPayload, uint32_t(stream.size()) << 1u);
+        appendWorldPayloadU16(outPayload, textureId);
+    }
     appendWorldPayloadU16(outPayload, 0x3C00u);
     appendWorldPayloadU16(outPayload, 0x3C00u);
-    for (int i = 0; i < int(materialRowBytes) - 10; ++i) outPayload.push_back(0);
+    for (int i = 0; i < int(materialRowBytes) - (materialRowBytes == 22u ? 8 : 10); ++i) outPayload.push_back(0);
 
-    alignWorldPayload4(outPayload);
+    outPayload.resize(32u, 0xAAu);
     outPayload.insert(outPayload.end(), stream.begin(), stream.end());
     alignWorldPayload4(outPayload);
 
     StorylandWorldMesh testMesh;
-    return parseWorldOverlayMesh(outPayload, 0, outPayload.size(), 0, 0, testMesh);
+    return parseWorldOverlayMesh(outPayload, 0, outPayload.size(), 0, 0, testMesh, materialRowBytes);
 }
 
 
@@ -1681,6 +1790,7 @@ struct StorylandDirectTextureLayout {
     size_t dataStart = 0;
     size_t rasterBytes = 0;
     size_t paletteBytes = 0;
+    size_t paletteOffset = 0;
     int width = 0;
     int height = 0;
     int bpp = 0;
@@ -1725,7 +1835,6 @@ static bool directRasterLooksUseful(const std::vector<uint8_t>& bytes, size_t ra
         if (value != first) varied++;
     }
 
-    // Solid-colour textures are allowed, but pure padding is not.
     return nonPad > 0 || varied > 0;
 }
 
@@ -1734,21 +1843,25 @@ static bool resolveDirectTextureLayout(
     size_t addr,
     size_t baseStart,
     size_t baseEnd,
-    StorylandDirectTextureLayout& outLayout
+    StorylandDirectTextureLayout& outLayout,
+    bool omittedWorldHeader = false,
+    bool lcsHeader = false
 ) {
     if (baseEnd > bytes.size()) baseEnd = bytes.size();
-    if (addr < baseStart || addr + 16 > baseEnd || (addr & 3u) != 0) return false;
-    if (readU32(bytes, addr + 0) != 0xCCCCCCCCu) return false;
+    const size_t headerBytes = lcsHeader ? 8u : 16u;
+    if (addr < baseStart || addr + headerBytes > baseEnd || (addr & 3u) != 0) return false;
+    if (!lcsHeader && readU32(bytes, addr + 0) != 0xCCCCCCCCu) return false;
 
-    uint16_t widthHalf = readU16(bytes, addr + 4);
-    uint16_t formatFlags = readU16(bytes, addr + 6);
-    uint32_t dataPointer = readU32(bytes, addr + 8);
-    uint32_t rasterFlags = readU32(bytes, addr + 12);
+    uint16_t widthHalf = lcsHeader ? 0u : readU16(bytes, addr + 4);
+    uint16_t formatFlags = lcsHeader ? 0u : readU16(bytes, addr + 6);
+    uint32_t dataPointer = readU32(bytes, addr + (lcsHeader ? 0u : 8u));
+    uint32_t rasterFlags = readU32(bytes, addr + (lcsHeader ? 4u : 12u));
 
     uint16_t lowFlag = formatFlags & 0x00FFu;
     uint16_t highFlag = formatFlags & 0xFF00u;
-    if (lowFlag != 0x25u && lowFlag != 0x45u) return false;
-    if (highFlag != 0xC000u && highFlag != 0xCF00u) return false;
+    if (!lcsHeader && lowFlag != 0x25u && lowFlag != 0x45u) return false;
+    if (!lcsHeader && (highFlag & 0xC000u) != 0xC000u) return false;
+    if (lcsHeader && dataPointer == 0u) return false;
 
     int logw = int(rasterFlags & 0x3Fu);
     int logh = int((rasterFlags >> 6) & 0x3Fu);
@@ -1768,29 +1881,52 @@ static bool resolveDirectTextureLayout(
     size_t pixelCount = size_t(width) * size_t(height);
     size_t rasterBytes = depth == 4 ? (pixelCount + 1) / 2 : depth == 8 ? pixelCount : pixelCount * 4;
     size_t paletteBytes = depth == 4 ? 64 : depth == 8 ? 1024 : 0;
+    // PS2 stores all mip levels before the CLUT (both LCS and VCS).
+    // A zero mip count is retained for authored single-level resources.
+    size_t paletteOffset = 0u;
+    for (int level = 0; level < std::max(1, mipmaps); ++level) {
+        paletteOffset += size_t(width >> level) * size_t(height >> level) * size_t(depth) / 8u;
+    }
+    if (paletteOffset < rasterBytes) return false;
 
-    std::vector<size_t> candidates;
-    auto addCandidate = [&](size_t value) {
-        if (std::find(candidates.begin(), candidates.end(), value) == candidates.end()) candidates.push_back(value);
+    struct DirectTextureDataCandidate {
+        size_t offset = 0;
+        bool pointerBacked = false;
+    };
+    std::vector<DirectTextureDataCandidate> candidates;
+    auto addCandidate = [&](size_t value, bool pointerBacked) {
+        for (const DirectTextureDataCandidate& existing : candidates) {
+            if (existing.offset == value) return;
+        }
+        candidates.push_back({value, pointerBacked});
     };
 
     if (dataPointer != 0) {
         // AERA stores this pointer relative to the AERA chunk base.  Master LVZ
         // direct textures usually store an absolute decompressed-LVZ offset.
-        addCandidate(baseStart + size_t(dataPointer));
-        addCandidate(size_t(dataPointer));
+        // A pointer-backed raster is allowed to be a single palette index across
+        // the entire image.  Zero-filled indexed rasters are valid solid-colour
+        // textures; rejecting them made newly-added emissive/blank textures
+        // impossible to rediscover after insertion.
+        if (omittedWorldHeader) {
+            if (dataPointer >= 0x20u) addCandidate(baseStart + size_t(dataPointer) - 0x20u, true);
+        } else {
+            addCandidate(baseStart + size_t(dataPointer), true);
+        }
     }
-    addCandidate(addr + 16);
+    if (!lcsHeader) addCandidate(addr + headerBytes, false);
 
-    for (size_t dataStart : candidates) {
-        if (dataStart < addr + 16) continue;
-        if (dataStart < baseStart || dataStart + rasterBytes + paletteBytes > baseEnd) continue;
-        if (!directRasterLooksUseful(bytes, dataStart, rasterBytes)) continue;
-        if (!directPaletteLooksUseful(bytes, dataStart + rasterBytes, paletteBytes)) continue;
+    for (const DirectTextureDataCandidate& candidate : candidates) {
+        const size_t dataStart = candidate.offset;
+        if (!lcsHeader && dataStart < addr + headerBytes) continue;
+        if (dataStart < baseStart || dataStart + paletteOffset + paletteBytes > baseEnd) continue;
+        if (!candidate.pointerBacked && !directRasterLooksUseful(bytes, dataStart, rasterBytes)) continue;
+        if (!candidate.pointerBacked && !directPaletteLooksUseful(bytes, dataStart + paletteOffset, paletteBytes)) continue;
 
         outLayout.dataStart = dataStart;
         outLayout.rasterBytes = rasterBytes;
         outLayout.paletteBytes = paletteBytes;
+        outLayout.paletteOffset = paletteOffset;
         outLayout.width = width;
         outLayout.height = height;
         outLayout.bpp = depth;
@@ -1835,14 +1971,16 @@ static bool decodeDirectTexture(
     size_t addr,
     size_t baseStart,
     size_t baseEnd,
-    StorylandDirectTextureResource& outTexture
+    StorylandDirectTextureResource& outTexture,
+    bool omittedWorldHeader = false,
+    bool lcsHeader = false
 ) {
     StorylandDirectTextureLayout layout;
-    if (!resolveDirectTextureLayout(bytes, addr, baseStart, baseEnd, layout)) return false;
+    if (!resolveDirectTextureLayout(bytes, addr, baseStart, baseEnd, layout, omittedWorldHeader, lcsHeader)) return false;
 
-    uint16_t widthHalf = readU16(bytes, addr + 4);
-    uint16_t formatFlags = readU16(bytes, addr + 6);
-    uint32_t rasterFlags = readU32(bytes, addr + 12);
+    uint16_t widthHalf = lcsHeader ? 0u : readU16(bytes, addr + 4);
+    uint16_t formatFlags = lcsHeader ? 0u : readU16(bytes, addr + 6);
+    uint32_t rasterFlags = readU32(bytes, addr + (lcsHeader ? 4u : 12u));
 
     outTexture.headerOffset = uint32_t(addr);
     outTexture.dataOffset = uint32_t(layout.dataStart);
@@ -1858,7 +1996,7 @@ static bool decodeDirectTexture(
     size_t dataStart = layout.dataStart;
 
     if (layout.bpp == 4) {
-        size_t paletteStart = dataStart + layout.rasterBytes;
+        size_t paletteStart = dataStart + layout.paletteOffset;
         if (paletteStart + 64 > baseEnd) return false;
 
         std::vector<uint8_t> packed(bytes.begin() + dataStart, bytes.begin() + dataStart + layout.rasterBytes);
@@ -1885,7 +2023,7 @@ static bool decodeDirectTexture(
     }
 
     if (layout.bpp == 8) {
-        size_t paletteStart = dataStart + layout.rasterBytes;
+        size_t paletteStart = dataStart + layout.paletteOffset;
         if (paletteStart + 1024 > baseEnd) return false;
 
         std::vector<uint8_t> indices(bytes.begin() + dataStart, bytes.begin() + dataStart + layout.rasterBytes);
@@ -2381,8 +2519,12 @@ void StorylandArchiveBrowser::buildDirectTexturesFromLvz() {
     std::set<uint64_t> seenHeaders;
     std::set<std::pair<uint64_t, int32_t>> seenBindings;
     std::vector<std::pair<int32_t, uint32_t>> legacyTextureReferences;
+    std::vector<uint32_t> masterAllocationStarts;
+    size_t masterTextureDataEnd = currentLvzBytes.size();
 
-    auto appendTexture = [&](const std::vector<uint8_t>& bytes, size_t offset, size_t baseStart, size_t baseEnd, const char* prefix, int32_t materialId, const char* source) {
+    auto appendTexture = [&](const std::vector<uint8_t>& bytes, size_t offset, size_t baseStart, size_t baseEnd,
+                             const char* prefix, int32_t materialId, const char* source,
+                             int32_t scopeCellX = 0, int32_t scopeCellY = 0, bool hasScopeCell = false, bool omittedWorldHeader = false, bool lcsHeader = false) {
         uint64_t key = (uint64_t(baseStart & 0xFFFFFFFFu) << 32) | uint64_t(offset & 0xFFFFFFFFu);
         if (materialId >= 0) {
             if (seenBindings.find({key, materialId}) != seenBindings.end()) return;
@@ -2391,17 +2533,25 @@ void StorylandArchiveBrowser::buildDirectTexturesFromLvz() {
         }
 
         StorylandDirectTextureResource texture;
-        if (!decodeDirectTexture(bytes, offset, baseStart, baseEnd, texture)) return;
+        if (!decodeDirectTexture(bytes, offset, baseStart, baseEnd, texture, omittedWorldHeader, lcsHeader)) return;
 
         texture.index = uint32_t(directTextureCache.size());
         texture.materialId = materialId;
         texture.storedInImg = (&bytes == &currentImgBytes);
         texture.baseOffset = uint32_t(baseStart);
+        texture.scopeCellX = scopeCellX;
+        texture.scopeCellY = scopeCellY;
+        texture.hasScopeCell = hasScopeCell;
         const size_t pixelCount = size_t(texture.width) * size_t(texture.height);
         const size_t rasterBytes = texture.bpp == 4 ? (pixelCount + 1u) / 2u :
                                    texture.bpp == 8 ? pixelCount : pixelCount * 4u;
         const size_t paletteBytes = texture.bpp == 4 ? 64u : texture.bpp == 8 ? 1024u : 0u;
-        texture.storageBytes = uint32_t(std::min<size_t>(uint32_t(-1), rasterBytes + paletteBytes));
+        size_t mipBytes = 0u;
+        const uint32_t mipCount = std::max(1u, (texture.rasterFlags >> 20u) & 0xFu);
+        for (uint32_t level = 0u; level < mipCount; ++level) {
+            mipBytes += size_t(texture.width >> level) * size_t(texture.height >> level) * size_t(texture.bpp) / 8u;
+        }
+        texture.storageBytes = uint32_t(std::min<size_t>(uint32_t(-1), mipBytes + paletteBytes));
         texture.source = source != nullptr ? source : "scan";
         if (materialId >= 0) texture.name = "texture" + std::to_string(materialId) + standaloneTextureExtension;
         else texture.name = "texture" + std::to_string(texture.index) + standaloneTextureExtension;
@@ -2412,21 +2562,27 @@ void StorylandArchiveBrowser::buildDirectTexturesFromLvz() {
     };
 
     // Retail master WRLD Resource[] recovery.  The Resource[] count is stored
-    // at WRLD +0x14C; +0x14 is the relocation-entry count and must not be used
-    // as a resource count.
+    // after the game-specific sector directory; +0x14 is the relocation-entry
+    // count and must not be used as a resource count.
     StorylandMasterResourceTableInfo masterTableInfo;
     if (locateMasterResourceTable(currentLvzBytes, masterTableInfo)) {
         const uint32_t table = masterTableInfo.tableOffset;
         const uint32_t count = masterTableInfo.count;
         const uint32_t stride = masterTableInfo.stride;
+        masterTextureDataEnd = masterTableInfo.dataEnd;
 
         for (uint32_t i = 0; i < count; ++i) {
             const size_t row = size_t(table) + size_t(i) * stride;
             const uint32_t pointer = readU32(currentLvzBytes, row + 0u);
             if (pointer < 0x40u || uint64_t(pointer) + 16ull > masterTableInfo.dataEnd) continue;
 
+            masterAllocationStarts.push_back(pointer);
             appendTexture(currentLvzBytes, pointer, 0, masterTableInfo.dataEnd,
-                          "lvz_res_texture", int32_t(i), "master Resource[]");
+                          "lvz_res_texture", int32_t(i), "master Resource[]", 0, 0, false, false, textureGameRows == 47);
+
+            // LCS records already contain their raster pointer and flags.
+            // The raster pointer is not a TEX_REF to another texture header.
+            if (textureGameRows == 47) continue;
 
             // TEX_REF rows point at a shared texture record and retain the
             // referring Resource[] index as the material binding id.
@@ -2443,7 +2599,7 @@ void StorylandArchiveBrowser::buildDirectTexturesFromLvz() {
     }
 
     if (!legacyTextureReferences.empty()) {
-        std::vector<uint32_t> starts;
+        std::vector<uint32_t> starts = masterAllocationStarts;
         for (const auto& reference : legacyTextureReferences) starts.push_back(reference.second);
         std::sort(starts.begin(), starts.end());
         starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
@@ -2451,7 +2607,7 @@ void StorylandArchiveBrowser::buildDirectTexturesFromLvz() {
             uint32_t materialId = uint32_t(reference.first);
             uint32_t start = reference.second;
             auto next = std::upper_bound(starts.begin(), starts.end(), start);
-            size_t end = next == starts.end() ? currentLvzBytes.size() : size_t(*next);
+            size_t end = next == starts.end() ? masterTextureDataEnd : size_t(*next);
             StorylandDirectTextureResource texture;
             if (!decodeLegacyTextureReference(currentLvzBytes, start, end, texture)) continue;
             texture.index = uint32_t(directTextureCache.size());
@@ -2465,23 +2621,84 @@ void StorylandArchiveBrowser::buildDirectTexturesFromLvz() {
         }
     }
 
+    // Slave WRLD Resource[] bindings are independent of the master/AREA pools.
+    std::vector<StorylandWorldSector> textureContainers = worldSectors;
+    std::set<uint64_t> textureContainerStarts;
+    for (const auto& sector : worldSectors) textureContainerStarts.insert(sector.imgOffset);
+    for (size_t header = 0x20u; header + 0x20u <= currentLvzBytes.size(); header += 4u) {
+        if (readU32(currentLvzBytes, header) != WRLD_IDENT) continue;
+        const uint32_t size = readU32(currentLvzBytes, header + 8u);
+        const uint32_t dataEnd = readU32(currentLvzBytes, header + 12u);
+        const uint32_t reloc = readU32(currentLvzBytes, header + 16u);
+        const uint32_t relocCount = readU32(currentLvzBytes, header + 20u);
+        const uint64_t base = readU32(currentLvzBytes, header + 24u);
+        if (size < 0x28u || size > 0x04000000u || dataEnd < 0x20u || dataEnd > size ||
+            reloc < dataEnd || uint64_t(reloc) + uint64_t(relocCount) * 4u > size ||
+            base + size - 0x20u > currentImgBytes.size()) continue;
+        if (!textureContainerStarts.insert(base).second) continue;
+        StorylandWorldSector sector;
+        sector.sectorIndex = 0xB0000000u + uint32_t(header);
+        sector.imgOffset = base; sector.byteSize = dataEnd - 0x20u;
+        textureContainers.push_back(sector);
+    }
+    for (const auto& sector : textureContainers) {
+        const size_t base = size_t(sector.imgOffset);
+        const size_t end = size_t(std::min<uint64_t>(currentImgBytes.size(), sector.imgOffset + sector.byteSize));
+        if (base + 8u > end) continue;
+        const uint32_t pointer = readU32(currentImgBytes, base);
+        const uint32_t count = readU16(currentImgBytes, base + 4u);
+        const size_t stride = 8u; // OverlayResource is {id, pointer} in both games.
+        if (pointer < 0x20u || count == 0u || count > 4096u) continue;
+        const uint64_t table64 = uint64_t(base) + pointer - 0x20u;
+        if (table64 < base || table64 + uint64_t(count) * stride > end) continue;
+        const size_t table = size_t(table64);
+        std::vector<std::pair<int32_t, size_t>> bindings;
+        std::vector<size_t> starts;
+        for (uint32_t index = 0; index < count; ++index) {
+            const size_t row = table + size_t(index) * stride;
+            const int32_t id = readI32(currentImgBytes, row + (stride == 8u ? 0u : 8u));
+            const uint32_t resourcePointer = readU32(currentImgBytes, row + (stride == 8u ? 4u : 0u));
+            if (id < 0 || resourcePointer < 0x20u) continue;
+            const uint64_t offset = uint64_t(base) + resourcePointer - 0x20u;
+            if (offset < base || offset + 4u > end || (offset & 3u) != 0u) continue;
+            bindings.push_back({id, size_t(offset)});
+            starts.push_back(size_t(offset));
+        }
+        std::sort(starts.begin(), starts.end());
+        starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
+        for (const auto& binding : bindings) {
+            const auto next = std::upper_bound(starts.begin(), starts.end(), binding.second);
+            const size_t allocationEnd = next == starts.end() ? end : *next;
+            const size_t before = directTextureCache.size();
+            // Slave pointers include the 0x20-byte header omitted from IMG.
+            // Raster pointers use the same omitted-header coordinate system.
+            appendTexture(currentImgBytes, binding.second, base, allocationEnd,
+                          "sector_texture", binding.first, "sector Resource[]", 0, 0, false, true, textureGameRows == 47);
+            if (directTextureCache.size() > before) {
+                directTextureCache.back().scopeSectorIndex = sector.sectorIndex;
+            }
+        }
+    }
+
     // Bind direct textures stored in official AreaInfo[] -> AERA Resource[]
     // rows.  A raw AREA scan can decode their pixels, but only this table keeps
     // the RES id required by world-mesh materials.
-    std::vector<std::tuple<uint32_t, uint32_t, uint32_t>> bestTextureAreas;
+    std::vector<std::tuple<uint32_t, int16_t, int16_t, uint32_t, uint32_t>> bestTextureAreas;
     int bestTextureAreaScore = -1;
-    for (size_t pairOffset = 0x150; pairOffset + 8 <= std::min<size_t>(currentLvzBytes.size(), 0x508); pairOffset += 4) {
+    for (size_t pairOffset = 0x150; textureGameRows != 47 && pairOffset + 8 <= std::min<size_t>(currentLvzBytes.size(), 0x508); pairOffset += 4) {
         uint32_t count = readU32(currentLvzBytes, pairOffset);
         uint32_t table = readU32(currentLvzBytes, pairOffset + 4);
         if (count == 0 || count > 1024 || table < 0x20 || uint64_t(table) + uint64_t(count) * 16ull > currentLvzBytes.size()) continue;
-        std::vector<std::tuple<uint32_t, uint32_t, uint32_t>> areas;
+        std::vector<std::tuple<uint32_t, int16_t, int16_t, uint32_t, uint32_t>> areas;
         for (uint32_t i = 0; i < count; ++i) {
             size_t row = size_t(table) + size_t(i) * 16u;
+            int16_t cellX = readI16(currentLvzBytes, row + 0);
+            int16_t cellY = readI16(currentLvzBytes, row + 2);
             uint32_t base = readU32(currentLvzBytes, row + 4);
             uint32_t fileSize = readU32(currentLvzBytes, row + 8);
             if (fileSize < 0x28 || uint64_t(base) + fileSize > currentImgBytes.size()) continue;
             if (!isAreaIdent(readU32(currentImgBytes, base))) continue;
-            areas.emplace_back(i, base, fileSize);
+            areas.emplace_back(i, cellX, cellY, base, fileSize);
         }
         if (areas.size() < std::min<size_t>(count, 3u)) continue;
         int score = int(areas.size() * 1000u) - std::abs(int(count) - int(areas.size()));
@@ -2490,7 +2707,8 @@ void StorylandArchiveBrowser::buildDirectTexturesFromLvz() {
     }
     for (const auto& area : bestTextureAreas) {
         uint32_t areaIndex, base, fileSize;
-        std::tie(areaIndex, base, fileSize) = area;
+        int16_t cellX, cellY;
+        std::tie(areaIndex, cellX, cellY, base, fileSize) = area;
         int32_t resourceCount = readI32(currentImgBytes, size_t(base) + 0x20);
         uint32_t resourcePointer = readU32(currentImgBytes, size_t(base) + 0x24);
         if (resourceCount <= 0 || resourceCount > 4096) continue;
@@ -2499,16 +2717,64 @@ void StorylandArchiveBrowser::buildDirectTexturesFromLvz() {
         size_t dataEnd = size_t(base) + ((reloc >= 0x20 && reloc <= fileSize) ? reloc : fileSize);
         dataEnd = std::min(dataEnd, currentImgBytes.size());
         if (table + uint64_t(resourceCount) * 8ull > uint64_t(base) + fileSize) continue;
+
+        struct AreaResourcePointer {
+            int16_t resourceId = -1;
+            size_t rawOffset = 0;
+        };
+        std::vector<AreaResourcePointer> resourcePointers;
+        resourcePointers.reserve(size_t(resourceCount));
         for (int32_t rowIndex = 0; rowIndex < resourceCount; ++rowIndex) {
-            size_t row = size_t(table) + size_t(rowIndex) * 8u;
-            int16_t resourceId = readI16(currentImgBytes, row);
-            uint32_t pointer = readU32(currentImgBytes, row + 4);
+            const size_t row = size_t(table) + size_t(rowIndex) * 8u;
+            const int16_t resourceId = readI16(currentImgBytes, row);
+            const uint32_t pointer = readU32(currentImgBytes, row + 4);
             if (resourceId < 0 || pointer < 0x20) continue;
-            size_t rawOffset = size_t(base) + pointer;
-            if (rawOffset + 16 > dataEnd) continue;
+            const size_t rawOffset = size_t(base) + size_t(pointer);
+            if (rawOffset >= dataEnd) continue;
+            resourcePointers.push_back({resourceId, rawOffset});
+        }
+        std::sort(resourcePointers.begin(), resourcePointers.end(), [](const AreaResourcePointer& a, const AreaResourcePointer& b) {
+            if (a.rawOffset != b.rawOffset) return a.rawOffset < b.rawOffset;
+            return a.resourceId < b.resourceId;
+        });
+
+        for (size_t pointerIndex = 0; pointerIndex < resourcePointers.size(); ++pointerIndex) {
+            const int16_t resourceId = resourcePointers[pointerIndex].resourceId;
+            const size_t rawOffset = resourcePointers[pointerIndex].rawOffset;
+            const auto nextPointer = std::upper_bound(resourcePointers.begin(), resourcePointers.end(), rawOffset,
+                [](size_t value, const AreaResourcePointer& pointer) { return value < pointer.rawOffset; });
+            const size_t nextOffset = nextPointer == resourcePointers.end() ? dataEnd : nextPointer->rawOffset;
+            if (rawOffset + 16u > dataEnd || nextOffset <= rawOffset) continue;
+
+            const size_t before = directTextureCache.size();
             char prefix[64] = {};
             std::snprintf(prefix, sizeof(prefix), "aera_%04u_RES_%d_texture", areaIndex, int(resourceId));
-            appendTexture(currentImgBytes, rawOffset, base, dataEnd, prefix, resourceId, "official AERA Resource[]");
+            appendTexture(currentImgBytes, rawOffset, base, dataEnd, prefix, resourceId, "official AERA Resource[]",
+                          int32_t(cellX), int32_t(cellY), true);
+
+            // LCS PS2 AREA Resource[] tables can point directly at the indexed
+            // raster+CLUT allocation instead of the VCS-style 0xCCCCCCCC runtime
+            // header.  Recover that payload using the next Resource[] pointer as
+            // its exact allocation boundary.  Do this only when the normal direct
+            // texture decoder did not accept the resource, which keeps VCS on its
+            // established path and avoids turning ordinary model payloads into
+            // fake textures.
+            if (textureGameRows == 47 && directTextureCache.size() == before) {
+                StorylandDirectTextureResource texture;
+                if (decodeLegacyTextureReference(currentImgBytes, rawOffset, nextOffset, texture)) {
+                    texture.index = uint32_t(directTextureCache.size());
+                    texture.materialId = int32_t(resourceId);
+                    texture.storedInImg = true;
+                    texture.baseOffset = base;
+                    texture.scopeCellX = int32_t(cellX);
+                    texture.scopeCellY = int32_t(cellY);
+                    texture.hasScopeCell = true;
+                    texture.storageBytes = uint32_t(std::min<size_t>(uint32_t(-1), nextOffset - rawOffset));
+                    texture.source = "AERA indexed texture";
+                    texture.name = "texture" + std::to_string(resourceId) + standaloneTextureExtension;
+                    directTextureCache.push_back(std::move(texture));
+                }
+            }
         }
     }
 
@@ -2536,6 +2802,25 @@ void StorylandArchiveBrowser::buildDirectTexturesFromLvz() {
             if (directTextureCache.size() > 16384) break;
         }
     }
+    std::map<int32_t, std::vector<size_t>> texturesByMaterial;
+    for (size_t index = 0; index < directTextureCache.size(); ++index) {
+        if (directTextureCache[index].materialId >= 0) {
+            texturesByMaterial[directTextureCache[index].materialId].push_back(index);
+        }
+    }
+    for (const auto& binding : texturesByMaterial) {
+        const auto& first = directTextureCache[binding.second.front()];
+        bool identical = true;
+        for (size_t index : binding.second) {
+            const auto& texture = directTextureCache[index];
+            if (texture.width != first.width || texture.height != first.height || texture.rgba != first.rgba) {
+                identical = false;
+                break;
+            }
+        }
+        for (size_t index : binding.second) directTextureCache[index].unambiguousMaterialBinding = identical;
+    }
+
 }
 
 void StorylandArchiveBrowser::buildWorldSectorsAndPlacements() {
@@ -2629,6 +2914,7 @@ void StorylandArchiveBrowser::buildWorldSectorsAndPlacements() {
                 if (spanStop64 <= spanStart64) continue;
 
                 const char* passName = passNameForIndex(rowCount, size_t(passIndex));
+
 
                 uint64_t rowOffset64 = spanStart64;
                 while (rowOffset64 + 0x50ull <= spanStop64) {
@@ -2737,6 +3023,11 @@ void StorylandArchiveBrowser::buildWorldMeshes() {
     resourceResolutionCache.clear();
     if (currentImgBytes.empty() || currentLvzBytes.empty()) return;
 
+    std::vector<std::pair<uint32_t, uint32_t>> gameRows;
+    const bool hasGameRows = readSectorRowsFromLvz(currentLvzBytes, gameRows);
+    const uint32_t materialRowLength = hasGameRows && gameRows.size() == 47u ? 22u : 24u;
+    const uint32_t slaveStride = 8u; // OverlayResource {id, pointer} in LCS and VCS.
+
     std::set<uint64_t> neededKeys;
     for (const StorylandWorldPlacement& placement : worldPlacements) {
         uint64_t key = (uint64_t(placement.sectorIndex) << 32) | uint64_t(placement.resourceIndex);
@@ -2760,6 +3051,10 @@ void StorylandArchiveBrowser::buildWorldMeshes() {
         StorylandWorldMesh mesh;
         uint64_t payloadOffset = 0;
         std::string source;
+        uint64_t textureScopeOffset = uint64_t(-1);
+        int32_t scopeCellX = 0;
+        int32_t scopeCellY = 0;
+        bool hasScopeCell = false;
     };
     std::map<uint64_t, std::vector<CandidateMesh>> exactMeshes;
     std::map<uint32_t, std::vector<CandidateMesh>> meshesByResource;
@@ -2767,20 +3062,28 @@ void StorylandArchiveBrowser::buildWorldMeshes() {
     std::map<uint32_t, std::vector<CandidateMesh>> officialAreaMeshes;
     std::map<uint32_t, std::vector<CandidateMesh>> masterLvzMeshes;
     std::map<uint32_t, std::vector<CandidateMesh>> continuationMeshes;
-    std::set<std::pair<uint32_t, uint64_t>> parsedPayloads;
+    std::set<std::tuple<uint32_t, uint32_t, uint64_t>> parsedPayloads;
 
     auto rememberCandidate = [&](uint32_t sectorIndex, uint32_t sectorY, uint32_t resourceId,
                                  uint64_t rawOffset, uint64_t maxEnd, const std::string& source,
-                                 bool sameSector, StorylandImgResourceRow* record) {
+                                 bool sameSector, StorylandImgResourceRow* record,
+                                 uint64_t textureScopeOffset = uint64_t(-1),
+                                 int32_t scopeCellX = 0, int32_t scopeCellY = 0, bool hasScopeCell = false) {
         if (neededResourceIds.find(resourceId) == neededResourceIds.end()) return;
         if (rawOffset + 4 > currentImgBytes.size() || maxEnd <= rawOffset + 4) return;
-        if (!parsedPayloads.insert({resourceId, rawOffset}).second) return;
+        if (parsedPayloads.find({sectorIndex, resourceId, rawOffset}) != parsedPayloads.end()) return;
         StorylandWorldMesh mesh;
         size_t descriptorOffset = size_t(rawOffset);
-        if (!parseWorldOverlayMeshNear(currentImgBytes, size_t(rawOffset), size_t(maxEnd), sectorIndex, resourceId, mesh, descriptorOffset) ||
-            mesh.vertices.empty() || mesh.triangles.empty()) return;
+        if (!parseWorldOverlayMeshNear(currentImgBytes, size_t(rawOffset), size_t(maxEnd), sectorIndex, resourceId, mesh, descriptorOffset, materialRowLength) ||
+            !mesh.emptyGeometry && (mesh.vertices.empty() || mesh.triangles.empty())) return;
+        parsedPayloads.insert({sectorIndex, resourceId, rawOffset});
         mesh.rawOffset = descriptorOffset;
-        CandidateMesh candidate{std::move(mesh), uint64_t(descriptorOffset), source};
+        mesh.textureScopeOffset = textureScopeOffset;
+        mesh.textureScopeCellX = scopeCellX;
+        mesh.textureScopeCellY = scopeCellY;
+        mesh.hasTextureScopeCell = hasScopeCell;
+        CandidateMesh candidate{std::move(mesh), uint64_t(descriptorOffset), source,
+                                textureScopeOffset, scopeCellX, scopeCellY, hasScopeCell};
         if (record != nullptr) {
             record->decodedAsMesh = true;
             record->payloadOffset = descriptorOffset;
@@ -2802,7 +3105,7 @@ void StorylandArchiveBrowser::buildWorldMeshes() {
         uint64_t declaredEnd = std::min<uint64_t>(currentImgBytes.size(), sector.imgOffset + sector.byteSize);
         auto nextContainer = std::upper_bound(containerStarts.begin(), containerStarts.end(), cont);
         uint64_t hardEnd = nextContainer == containerStarts.end() ? currentImgBytes.size() : *nextContainer;
-        uint64_t end = std::max<uint64_t>(declaredEnd, std::min<uint64_t>(currentImgBytes.size(), hardEnd));
+        uint64_t end = std::min<uint64_t>(declaredEnd, hardEnd);
         if (cont + 8 > end) continue;
 
         uint32_t resourcesPointer = readU32(currentImgBytes, size_t(cont) + 0x00);
@@ -2811,6 +3114,18 @@ void StorylandArchiveBrowser::buildWorldMeshes() {
 
         uint64_t listStart = cont + uint64_t(resourcesPointer) - 0x20ull;
         if (listStart < cont || listStart + 8ull > end) continue;
+
+        std::vector<uint64_t> resourceStarts;
+        if (listStart + uint64_t(resourceCount) * slaveStride > end) continue;
+        for (uint32_t index = 0; index < resourceCount; ++index) {
+            const size_t row = size_t(listStart) + size_t(index) * slaveStride;
+            const uint32_t pointer = readU32(currentImgBytes, row + (slaveStride == 8u ? 4u : 0u));
+            if (pointer < 0x20u) continue;
+            const uint64_t offset = cont + uint64_t(pointer) - 0x20u;
+            if (offset >= cont && offset < end && (offset & 3u) == 0u) resourceStarts.push_back(offset);
+        }
+        std::sort(resourceStarts.begin(), resourceStarts.end());
+        resourceStarts.erase(std::unique(resourceStarts.begin(), resourceStarts.end()), resourceStarts.end());
 
         auto processRow = [&](uint32_t rowIndex, uint32_t resourceId, uint32_t rawPointer,
                               uint64_t rowOffset, const char* layout) {
@@ -2824,9 +3139,7 @@ void StorylandArchiveBrowser::buildWorldMeshes() {
                 if (std::find(offsets.begin(), offsets.end(), offset) == offsets.end()) offsets.push_back(offset);
             };
             pushOffset(int64_t(cont) + int64_t(rawPointer) - 0x20ll);
-            pushOffset(int64_t(cont) + int64_t(rawPointer));
-            pushOffset(int64_t(rawPointer));
-            pushOffset(int64_t(rawPointer) - 0x20ll);
+
 
             StorylandImgResourceRow record;
             record.sectorIndex = sector.sectorIndex;
@@ -2841,17 +3154,20 @@ void StorylandArchiveBrowser::buildWorldMeshes() {
             record.payloadSize = end > record.payloadOffset ? end - record.payloadOffset : 0;
 
             for (uint64_t offset : offsets) {
-                uint64_t parseEnd = (offset >= cont && offset < end) ? end : currentImgBytes.size();
+                if (offset < cont || offset >= end) continue;
+                const auto nextResource = std::upper_bound(resourceStarts.begin(), resourceStarts.end(), offset);
+                const uint64_t parseEnd = nextResource == resourceStarts.end() ? end : *nextResource;
+                record.payloadSize = parseEnd - offset;
                 size_t before = meshesByResource[resourceId].size();
                 rememberCandidate(sector.sectorIndex, sector.sectorY, resourceId, offset, parseEnd,
-                                  std::string("sector ") + layout, true, &record);
+                                  std::string("sector ") + layout, true, &record, cont);
                 if (meshesByResource[resourceId].size() > before) break;
             }
             imgResourceRowCache.push_back(std::move(record));
         };
 
-        // LCS layout: s32 RES, u32 pointer.
-        if (listStart + uint64_t(resourceCount) * 8ull <= end) {
+        // OverlayResource layout in both games: s32 RES, u32 pointer.
+        if (slaveStride == 8u && listStart + uint64_t(resourceCount) * 8ull <= end) {
             for (uint32_t rowIndex = 0; rowIndex < resourceCount; ++rowIndex) {
                 uint64_t row = listStart + uint64_t(rowIndex) * 8ull;
                 int32_t id = readI32(currentImgBytes, size_t(row));
@@ -2860,21 +3176,11 @@ void StorylandArchiveBrowser::buildWorldMeshes() {
             }
         }
 
-        // VCS layout: u32 pointer, u32 flags/unused, u32 RES.
-        if (listStart + uint64_t(resourceCount) * 12ull <= end) {
-            for (uint32_t rowIndex = 0; rowIndex < resourceCount; ++rowIndex) {
-                uint64_t row = listStart + uint64_t(rowIndex) * 12ull;
-                uint32_t a = readU32(currentImgBytes, size_t(row));
-                uint32_t b = readU32(currentImgBytes, size_t(row) + 4);
-                uint32_t c = readU32(currentImgBytes, size_t(row) + 8);
-                processRow(rowIndex, c, a, row, "ptr_unused_id/12");
-            }
-        }
     }
 
     // Master WRLD Resource[] contains normal model payloads.  Parse the IDs
     // required by placements plus any resources added during this editing
-    // session.  The table is the retail 12-byte {pointer, unknown, id} form.
+    // session. LCS uses 8-byte rows and VCS 12-byte rows.
     StorylandMasterResourceTableInfo masterTableInfo;
     if (locateMasterResourceTable(currentLvzBytes, masterTableInfo)) {
         std::vector<uint32_t> starts;
@@ -2904,7 +3210,7 @@ void StorylandArchiveBrowser::buildWorldMeshes() {
             bool isMesh = false;
             for (size_t candidate = pointer; candidate + 4u <= searchEnd; candidate += 4u) {
                 ParsedWorldMaterialList materialList;
-                if (!parseWorldMaterialList(currentLvzBytes, candidate, payloadEnd, materialList)) continue;
+                if (!parseWorldMaterialList(currentLvzBytes, candidate, payloadEnd, materialList, materialRowLength)) continue;
                 const size_t unpack = findUnpackNear(currentLvzBytes, materialList.streamStart, payloadEnd, 32u);
                 if (unpack == SIZE_MAX) continue;
                 ParsedWorldStrip firstStrip;
@@ -2927,127 +3233,27 @@ void StorylandArchiveBrowser::buildWorldMeshes() {
 
             StorylandWorldMesh mesh;
             size_t descriptorOffset = pointer;
-            if (!parseWorldOverlayMeshNear(currentLvzBytes, pointer, payloadEnd, 0xFFFFFFFFu, i, mesh, descriptorOffset) ||
-                mesh.vertices.empty() || mesh.triangles.empty()) continue;
+            if (!parseWorldOverlayMeshNear(currentLvzBytes, pointer, payloadEnd, 0xFFFFFFFFu, i, mesh, descriptorOffset, materialRowLength) ||
+                !mesh.emptyGeometry && (mesh.vertices.empty() || mesh.triangles.empty())) continue;
 
             mesh.rawOffset = descriptorOffset;
-            CandidateMesh candidate{std::move(mesh), uint64_t(descriptorOffset), "master LVZ"};
+            mesh.textureScopeOffset = 0u;
+            mesh.textureScopeInImg = false;
+            CandidateMesh candidate{std::move(mesh), uint64_t(descriptorOffset), "master LVZ", 0u, 0, 0, false};
             masterLvzMeshes[i].push_back(candidate);
             meshesByResource[i].push_back(candidate);
         }
     }
 
-    // Triggered/AREA and nested child WRLD headers reference additional IMG
-    // containers which are not part of the 623 static sector grid.  They are
-    // model sources only.  Scan proven relocatable headers and feed their exact
-    // Resource[] rows into the same RES candidate pool used for placement fit.
-    std::set<uint32_t> sectorHeaderOffsets;
     std::set<uint64_t> sectorContainerOffsets;
-    for (const auto& sector : worldSectors) {
-        sectorHeaderOffsets.insert(sector.headerOffset);
-        sectorContainerOffsets.insert(sector.imgOffset);
-    }
-    std::set<std::pair<uint32_t, uint64_t>> seenExtraContainers;
-    uint32_t extraContainerIndex = 0;
-    std::vector<uint32_t> extraHeaderCandidates;
-    size_t groupCursor = 0x24;
-    while (groupCursor + 8 <= currentLvzBytes.size()) {
-        uint32_t groupHeader = readU32(currentLvzBytes, groupCursor);
-        if (groupHeader == 0 || (groupHeader & 3u) != 0 || uint64_t(groupHeader) + 0x20ull > currentLvzBytes.size()) break;
-        uint32_t groupTag = readU32(currentLvzBytes, groupHeader);
-        if (groupTag != WRLD_IDENT && groupTag != TEX_IDENT) break;
-        uint32_t childCount = readU32(currentLvzBytes, size_t(groupHeader) + 0x14);
-        if (childCount == 0 || childCount > 65536) childCount = 1;
-        for (uint32_t child = 0; child < childCount; ++child) {
-            uint64_t childHeader = uint64_t(groupHeader) + uint64_t(child) * 0x20ull;
-            if (childHeader + 0x20ull > currentLvzBytes.size()) break;
-            uint32_t childTag = readU32(currentLvzBytes, size_t(childHeader));
-            if (childTag != WRLD_IDENT && childTag != TEX_IDENT) break;
-            extraHeaderCandidates.push_back(uint32_t(childHeader));
-        }
-        groupCursor += 8;
-    }
-    std::sort(extraHeaderCandidates.begin(), extraHeaderCandidates.end());
-    extraHeaderCandidates.erase(std::unique(extraHeaderCandidates.begin(), extraHeaderCandidates.end()), extraHeaderCandidates.end());
-
-    for (uint32_t header : extraHeaderCandidates) {
-        uint32_t tag = readU32(currentLvzBytes, header);
-        if (tag != WRLD_IDENT && tag != TEX_IDENT) continue;
-        if (sectorHeaderOffsets.find(uint32_t(header)) != sectorHeaderOffsets.end()) continue;
-        uint32_t total = readU32(currentLvzBytes, header + 0x08);
-        uint32_t cont32 = readU32(currentLvzBytes, header + 0x18);
-        if (total < 0x20 || total > 0x04000000u || cont32 >= currentImgBytes.size()) continue;
-        uint64_t cont = cont32;
-        if (sectorContainerOffsets.find(cont) != sectorContainerOffsets.end()) continue;
-        uint64_t end = std::min<uint64_t>(currentImgBytes.size(), cont + uint64_t(total - 0x20u));
-        if (end <= cont + 8 || !seenExtraContainers.insert({uint32_t(header), cont}).second) continue;
-        uint32_t resourcesPointer = readU32(currentImgBytes, size_t(cont));
-        uint32_t resourceCount = readU16(currentImgBytes, size_t(cont) + 4);
-        if (resourceCount == 0 || resourceCount > 4096 || resourcesPointer < 0x20) continue;
-        uint64_t listStart = cont + resourcesPointer - 0x20ull;
-        if (listStart < cont || listStart + 8 > end) continue;
-        uint32_t syntheticSector = 0x90000000u + extraContainerIndex++;
-
-        auto processExtraRow = [&](uint32_t rowIndex, uint32_t resourceId, uint32_t rawPointer,
-                                   uint64_t rowOffset, const char* layout) {
-            if (neededResourceIds.find(resourceId) == neededResourceIds.end()) return;
-            std::vector<uint64_t> offsets;
-            auto push = [&](int64_t value) {
-                if (value < 0 || uint64_t(value) + 4 > currentImgBytes.size()) return;
-                uint64_t offset = uint64_t(value);
-                if ((offset & 3ull) == 0 && std::find(offsets.begin(), offsets.end(), offset) == offsets.end()) offsets.push_back(offset);
-            };
-            push(int64_t(cont) + int64_t(rawPointer) - 0x20ll);
-            push(int64_t(cont) + int64_t(rawPointer));
-            push(int64_t(rawPointer));
-            push(int64_t(rawPointer) - 0x20ll);
-
-            StorylandImgResourceRow record;
-            record.sectorIndex = syntheticSector;
-            record.rowIndex = rowIndex;
-            record.resourceId = resourceId;
-            record.tableOffset = rowOffset;
-            record.layout = std::string("extra IMG ") + layout;
-            record.usedByPlacement = true;
-            if (!offsets.empty()) record.payloadOffset = offsets.front();
-            record.payloadSize = end > record.payloadOffset ? end - record.payloadOffset : 0;
-            for (uint64_t offset : offsets) {
-                uint64_t parseEnd = offset >= cont && offset < end ? end : currentImgBytes.size();
-                size_t before = meshesByResource[resourceId].size();
-                rememberCandidate(syntheticSector, 0xFFFFFFFFu, resourceId, offset, parseEnd,
-                                  std::string("extra IMG ") + layout, false, &record);
-                if (meshesByResource[resourceId].size() > before) break;
-            }
-            imgResourceRowCache.push_back(std::move(record));
-        };
-
-        if (listStart + uint64_t(resourceCount) * 8ull <= end) {
-            for (uint32_t rowIndex = 0; rowIndex < resourceCount; ++rowIndex) {
-                uint64_t row = listStart + uint64_t(rowIndex) * 8ull;
-                int32_t id = readI32(currentImgBytes, size_t(row));
-                if (id >= 0) processExtraRow(rowIndex, uint32_t(id), readU32(currentImgBytes, size_t(row) + 4), row, "id_ptr/8");
-            }
-        }
-        if (listStart + uint64_t(resourceCount) * 12ull <= end) {
-            for (uint32_t rowIndex = 0; rowIndex < resourceCount; ++rowIndex) {
-                uint64_t row = listStart + uint64_t(rowIndex) * 12ull;
-                uint32_t a = readU32(currentImgBytes, size_t(row));
-                uint32_t b = readU32(currentImgBytes, size_t(row) + 4);
-                uint32_t c = readU32(currentImgBytes, size_t(row) + 8);
-                processExtraRow(rowIndex, c, a, row, "ptr_unused_id/12");
-                processExtraRow(rowIndex, b, a, row, "ptr_id_unused/12");
-                processExtraRow(rowIndex, a, c, row, "id_unused_ptr/12");
-                processExtraRow(rowIndex, a, b, row, "id_ptr_unused/12");
-            }
-        }
-    }
+    for (const auto& sector : worldSectors) sectorContainerOffsets.insert(sector.imgOffset);
 
     // Authoritative VCS AreaInfo[] -> AERA AreaResource[] path.  These rows are
     // s16 RES, s16 CBaseModelInfo id, u32 chunk-relative pointer and account for
     // many high-number streamed models absent from sector-local tables.
     std::vector<std::tuple<uint32_t, int16_t, int16_t, uint32_t, uint32_t, uint32_t>> bestAreas;
     int bestAreaScore = -1;
-    for (size_t pairOffset = 0x150; pairOffset + 8 <= std::min<size_t>(currentLvzBytes.size(), 0x508); pairOffset += 4) {
+    for (size_t pairOffset = 0x150; masterTableInfo.stride != 8u && pairOffset + 8 <= std::min<size_t>(currentLvzBytes.size(), 0x508); pairOffset += 4) {
         uint32_t count = readU32(currentLvzBytes, pairOffset);
         uint32_t table = readU32(currentLvzBytes, pairOffset + 4);
         if (count == 0 || count > 1024 || table < 0x20 || uint64_t(table) + uint64_t(count) * 16ull > currentLvzBytes.size()) continue;
@@ -3085,6 +3291,15 @@ void StorylandArchiveBrowser::buildWorldMeshes() {
         dataEnd = std::min<uint64_t>(dataEnd, currentImgBytes.size());
         if (table < uint64_t(base) + 0x20ull || table + uint64_t(resourceCount) * 8ull > uint64_t(base) + fileSize) continue;
 
+        std::vector<uint64_t> allocationStarts;
+        for (int32_t rowIndex = 0; rowIndex < resourceCount; ++rowIndex) {
+            const uint32_t pointer = readU32(currentImgBytes, size_t(table) + size_t(rowIndex) * 8u + 4u);
+            const uint64_t offset = uint64_t(base) + pointer;
+            if (pointer >= 0x20u && offset < dataEnd) allocationStarts.push_back(offset);
+        }
+        std::sort(allocationStarts.begin(), allocationStarts.end());
+        allocationStarts.erase(std::unique(allocationStarts.begin(), allocationStarts.end()), allocationStarts.end());
+
         for (int32_t rowIndex = 0; rowIndex < resourceCount; ++rowIndex) {
             uint64_t row = table + uint64_t(rowIndex) * 8ull;
             int16_t resourceId = readI16(currentImgBytes, size_t(row));
@@ -3103,13 +3318,15 @@ void StorylandArchiveBrowser::buildWorldMeshes() {
             record.secondaryId = secondaryId;
             record.tableOffset = row;
             record.payloadOffset = rawOffset;
-            record.payloadSize = dataEnd - rawOffset;
+            const auto nextAllocation = std::upper_bound(allocationStarts.begin(), allocationStarts.end(), rawOffset);
+            const uint64_t payloadEnd = nextAllocation == allocationStarts.end() ? dataEnd : *nextAllocation;
+            record.payloadSize = payloadEnd - rawOffset;
             record.layout = "AERA s16_RES/s16_modelInfo/u32_ptr";
             record.usedByPlacement = true;
 
             size_t before = meshesByResource[uint32_t(resourceId)].size();
-            rememberCandidate(record.sectorIndex, uint32_t(int32_t(cellY)), uint32_t(resourceId), rawOffset, dataEnd,
-                              "official AERA", false, &record);
+            rememberCandidate(record.sectorIndex, uint32_t(int32_t(cellY)), uint32_t(resourceId), rawOffset, payloadEnd,
+                              "official AERA", false, &record, uint64_t(base), int32_t(cellX), int32_t(cellY), true);
             if (meshesByResource[uint32_t(resourceId)].size() > before) {
                 officialAreaMeshes[uint32_t(resourceId)].push_back(meshesByResource[uint32_t(resourceId)].back());
             }
@@ -3117,143 +3334,51 @@ void StorylandArchiveBrowser::buildWorldMeshes() {
         }
     }
 
-    // Some retail VCS Resource[] tables live in linked/nested DLRW/xet
-    // containers rather than the sector container that owns the placement row.
-    // Scan every validated LVZ container header for still-unresolved exact RES
-    // ids.  This is exact-id recovery only: no IPL/neighbor substitution.
-    std::set<uint32_t> linkedWanted;
-    for (uint32_t resourceId : neededResourceIds) {
-        auto found = meshesByResource.find(resourceId);
-        if (found == meshesByResource.end() || found->second.empty()) linkedWanted.insert(resourceId);
-    }
-    if (!linkedWanted.empty()) {
-        std::set<std::tuple<uint64_t, uint32_t, uint64_t>> linkedSeen;
-        for (size_t headerOffset = 0; headerOffset + 0x20u <= currentLvzBytes.size(); headerOffset += 4u) {
-            const uint32_t ident = readU32(currentLvzBytes, headerOffset + 0x00u);
-            if (!isWorldLikeIdent(ident) && ident != TEX_IDENT) continue;
-            const uint32_t fileSize = readU32(currentLvzBytes, headerOffset + 0x08u);
-            const uint32_t cont = readU32(currentLvzBytes, headerOffset + 0x18u);
-            if (fileSize < 0x28u || fileSize > 0x04000000u) continue;
-            if (cont >= currentImgBytes.size()) continue;
-            const uint64_t end = std::min<uint64_t>(currentImgBytes.size(), uint64_t(cont) + uint64_t(fileSize - 0x20u));
-            if (uint64_t(cont) + 8ull > end) continue;
-
-            const uint32_t resourcesPointer = readU32(currentImgBytes, size_t(cont) + 0x00u);
-            const uint32_t resourceCount = readU16(currentImgBytes, size_t(cont) + 0x04u);
-            if (resourceCount == 0u || resourceCount > 4096u) continue;
-            const uint64_t listStart = uint64_t(cont) + uint64_t(resourcesPointer) - 0x20ull;
-            if (listStart < cont || listStart + 8ull > end) continue;
-
-            auto tryLinked = [&](uint32_t resourceId, uint32_t rawPointer) {
-                if (linkedWanted.find(resourceId) == linkedWanted.end()) return;
-                std::array<int64_t, 4> rawOffsets = {
-                    int64_t(cont) + int64_t(rawPointer) - 0x20ll,
-                    int64_t(cont) + int64_t(rawPointer),
-                    int64_t(rawPointer),
-                    int64_t(rawPointer) - 0x20ll
-                };
-                for (int64_t raw : rawOffsets) {
-                    if (raw < 0 || uint64_t(raw) + 4ull > currentImgBytes.size()) continue;
-                    const uint64_t rawOffset = uint64_t(raw);
-                    if ((rawOffset & 3ull) != 0ull) continue;
-                    if (!linkedSeen.insert({uint64_t(cont), resourceId, rawOffset}).second) continue;
-                    const uint64_t parseEnd = (rawOffset >= cont && rawOffset < end) ? end : currentImgBytes.size();
-                    rememberCandidate(0xB0000000u + uint32_t(headerOffset & 0x0FFFFFFFu), 0xFFFFFFFFu,
-                                      resourceId, rawOffset, parseEnd, "linked LVZ container", false, nullptr);
-                }
-            };
-
-            if (listStart + uint64_t(resourceCount) * 8ull <= end) {
-                for (uint32_t rowIndex = 0; rowIndex < resourceCount; ++rowIndex) {
-                    const uint64_t row = listStart + uint64_t(rowIndex) * 8ull;
-                    const int32_t resourceId = readI32(currentImgBytes, size_t(row));
-                    if (resourceId < 0) continue;
-                    tryLinked(uint32_t(resourceId), readU32(currentImgBytes, size_t(row) + 4u));
-                }
-            }
-            if (listStart + uint64_t(resourceCount) * 12ull <= end) {
-                for (uint32_t rowIndex = 0; rowIndex < resourceCount; ++rowIndex) {
-                    const uint64_t row = listStart + uint64_t(rowIndex) * 12ull;
-                    const uint32_t a = readU32(currentImgBytes, size_t(row) + 0u);
-                    const uint32_t b = readU32(currentImgBytes, size_t(row) + 4u);
-                    const uint32_t c = readU32(currentImgBytes, size_t(row) + 8u);
-                    tryLinked(c, a);
-                    tryLinked(b, a);
-                    tryLinked(a, c);
-                    tryLinked(a, b);
-                }
-            }
+    // Additional WRLD headers (including interior and linked stream chunks)
+    // need the same OverlayResource rules as the sector directory. Never treat
+    // the master header as an IMG chunk, and never try absolute pointer forms.
+    std::set<uint64_t> linkedContainers = sectorContainerOffsets;
+    for (size_t header = 0x20u; header + 0x20u <= currentLvzBytes.size(); header += 4u) {
+        if (readU32(currentLvzBytes, header) != WRLD_IDENT) continue;
+        const uint32_t size = readU32(currentLvzBytes, header + 8u);
+        const uint32_t dataEnd = readU32(currentLvzBytes, header + 12u);
+        const uint32_t reloc = readU32(currentLvzBytes, header + 16u);
+        const uint32_t relocCount = readU32(currentLvzBytes, header + 20u);
+        const uint64_t base = readU32(currentLvzBytes, header + 24u);
+        if (size < 0x28u || size > 0x04000000u || dataEnd < 0x20u || dataEnd > size ||
+            reloc < dataEnd || uint64_t(reloc) + uint64_t(relocCount) * 4u > size ||
+            base + size - 0x20u > currentImgBytes.size()) continue;
+        if (!linkedContainers.insert(base).second) continue;
+        const uint64_t end = base + dataEnd - 0x20u;
+        if (base + 8u > end) continue;
+        const uint32_t tablePointer = readU32(currentImgBytes, size_t(base));
+        const uint32_t count = readU16(currentImgBytes, size_t(base) + 4u);
+        if (tablePointer < 0x20u || count == 0u || count > 4096u) continue;
+        const uint64_t table = base + tablePointer - 0x20u;
+        if (table < base || table + uint64_t(count) * 8u > end) continue;
+        std::vector<std::pair<uint32_t, uint64_t>> rows;
+        std::vector<uint64_t> starts;
+        for (uint32_t index = 0u; index < count; ++index) {
+            const uint32_t id = readU32(currentImgBytes, size_t(table) + size_t(index) * 8u);
+            const uint32_t pointer = readU32(currentImgBytes, size_t(table) + size_t(index) * 8u + 4u);
+            if (pointer < 0x20u) continue;
+            const uint64_t offset = base + pointer - 0x20u;
+            if (offset < base || offset + 4u > end || (offset & 3u)) continue;
+            rows.emplace_back(id, offset); starts.push_back(offset);
+        }
+        std::sort(starts.begin(), starts.end());
+        starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
+        for (const auto& row : rows) {
+            const auto next = std::upper_bound(starts.begin(), starts.end(), row.second);
+            const uint64_t allocationEnd = next == starts.end() ? end : *next;
+            rememberCandidate(0xB0000000u + uint32_t(header), 0xFFFFFFFFu, row.first, row.second,
+                              allocationEnd, "linked WRLD OverlayResource", false, nullptr, base);
         }
     }
+    // Material IDs identify textures, never the containing model. Headerless
+    // strips without a Resource[] binding remain unresolved instead of being
+    // assigned to RES or RES-1 by resemblance.
 
-    // EMPTY master resources can continue as headerless material+VIF streams
-    // in the IMG.  Probe only strict aligned descriptor tables and only for RES
-    // ids that still have no structured candidate.  Material ids RES/RES+1 are
-    // the Leeds proof; placement bounds make the final selection authoritative.
-    std::set<uint32_t> continuationWanted;
-    for (uint32_t resourceId : neededResourceIds) {
-        auto found = meshesByResource.find(resourceId);
-        if (found == meshesByResource.end() || found->second.empty()) continuationWanted.insert(resourceId);
-    }
-    if (!continuationWanted.empty()) {
-        for (size_t offset = 0x40; offset + 0x20 <= currentImgBytes.size(); offset += 0x10) {
-            uint32_t count = readU16(currentImgBytes, offset);
-            uint32_t sizeBytes = readU16(currentImgBytes, offset + 2);
-            if (count == 0 || count > 256 || sizeBytes > 0x8000) continue;
-            // Equivalent to ((4 + count*row + 15) & ~15) - 4.
-            uint32_t expected24 = ((4u + count * 24u + 15u) & ~15u) - 4u;
-            uint32_t expected22 = ((4u + count * 22u + 15u) & ~15u) - 4u;
-            uint32_t rowLength = sizeBytes == expected24 ? 24u : sizeBytes == expected22 ? 22u : 0u;
-            if (rowLength == 0 || offset + 4u + sizeBytes > currentImgBytes.size()) continue;
-
-            size_t stream = offset + 4u + sizeBytes;
-            size_t padding = 0;
-            while (stream < currentImgBytes.size() && currentImgBytes[stream] == 0xAA && padding < 0x400) { stream++; padding++; }
-            stream = alignUp4Size(stream);
-            if (stream + 4 > currentImgBytes.size() || readU32(currentImgBytes, stream) != 0x6C018000u) continue;
-
-            uint64_t packetTotal = 0;
-            std::set<uint32_t> textureIds;
-            bool valid = true;
-            size_t row = offset + 4;
-            for (uint32_t i = 0; i < count; ++i, row += rowLength) {
-                uint32_t packetSize = 0;
-                uint32_t textureId = 0;
-                if (rowLength == 24) {
-                    packetSize = readU32(currentImgBytes, row) >> 1;
-                    textureId = readU16(currentImgBytes, row + 4);
-                } else {
-                    textureId = readU16(currentImgBytes, row);
-                    packetSize = readU16(currentImgBytes, row + 2) & 0x7FFFu;
-                }
-                if (packetSize == 0 || packetSize > 0x40000u) { valid = false; break; }
-                packetTotal += packetSize;
-                if (packetTotal > 0x2000000ull) { valid = false; break; }
-                textureIds.insert(textureId);
-            }
-            size_t packetEnd = stream + size_t(packetTotal);
-            if (!valid || packetEnd > currentImgBytes.size()) continue;
-
-            std::set<uint32_t> targets;
-            for (uint32_t textureId : textureIds) {
-                if (continuationWanted.find(textureId) != continuationWanted.end()) targets.insert(textureId);
-                if (textureId > 0 && continuationWanted.find(textureId - 1u) != continuationWanted.end()) targets.insert(textureId - 1u);
-            }
-            for (uint32_t target : targets) {
-                StorylandWorldMesh mesh;
-                size_t descriptorOffset = offset;
-                if (!parseWorldOverlayMeshNear(currentImgBytes, offset, packetEnd, 0xA0000000u, target, mesh, descriptorOffset) ||
-                    mesh.vertices.empty() || mesh.triangles.empty()) continue;
-                mesh.rawOffset = descriptorOffset;
-                CandidateMesh candidate{std::move(mesh), uint64_t(descriptorOffset), "IMG continuation"};
-                continuationMeshes[target].push_back(candidate);
-                if (continuationMeshes[target].size() > 6) continuationMeshes[target].erase(continuationMeshes[target].begin() + 6, continuationMeshes[target].end());
-            }
-        }
-    }
-
-    // Resolve each used (sector, RES) key exactly.  A unique linked-sector
-    // payload is safe to reuse; ambiguous same-RES payloads remain conflicts.
     for (const auto& count : placementCounts) {
         uint32_t sectorIndex = uint32_t(count.first >> 32);
         uint32_t resourceId = uint32_t(count.first & 0xFFFFFFFFu);
@@ -3348,6 +3473,12 @@ void StorylandArchiveBrowser::buildWorldMeshes() {
             return score <= 2.65;
         };
 
+        auto scopeMatchesPlacement = [&](const CandidateMesh& candidate) {
+            if (!candidate.hasScopeCell) return true;
+            return candidate.scopeCellX == int32_t(resolution.sectorX / 3u) &&
+                   candidate.scopeCellY == int32_t(resolution.sectorY / 3u);
+        };
+
         auto chooseByPlacement = [&](const std::vector<CandidateMesh>& candidates) -> const CandidateMesh* {
             if (candidates.empty()) return nullptr;
             auto placementIt = firstPlacementByKey.find(count.first);
@@ -3356,11 +3487,44 @@ void StorylandArchiveBrowser::buildWorldMeshes() {
             const CandidateMesh* best = nullptr;
             double bestScore = std::numeric_limits<double>::infinity();
             for (const CandidateMesh& candidate : candidates) {
+                if (!scopeMatchesPlacement(candidate)) continue;
+                if (candidate.mesh.emptyGeometry) return &candidate;
                 double score = std::numeric_limits<double>::infinity();
                 if (!candidateFitsPlacement(candidate, placement, &score)) continue;
                 if (score < bestScore) {
                     bestScore = score;
                     best = &candidate;
+                }
+            }
+            return best;
+        };
+
+        auto chooseAreaLocalCandidate = [&](const std::vector<CandidateMesh>& candidates) -> const CandidateMesh* {
+            if (candidates.empty()) return nullptr;
+            auto placementIt = firstPlacementByKey.find(count.first);
+            if (placementIt == firstPlacementByKey.end() || placementIt->second == nullptr) return nullptr;
+            const StorylandWorldPlacement& placement = *placementIt->second;
+            const int32_t expectedCellX = int32_t(placement.sectorX / 3u);
+            const int32_t expectedCellY = int32_t(placement.sectorY / 3u);
+
+            const CandidateMesh* best = nullptr;
+            int bestCellDistance = (std::numeric_limits<int>::max)();
+            double bestGeometryScore = std::numeric_limits<double>::infinity();
+            for (const CandidateMesh& candidate : candidates) {
+                if (!scopeMatchesPlacement(candidate)) continue;
+                if (!candidate.hasScopeCell) continue;
+                const int cellDistance = std::abs(candidate.scopeCellX - expectedCellX) +
+                                         std::abs(candidate.scopeCellY - expectedCellY);
+                if (cellDistance != 0) continue;
+                double geometryScore = std::numeric_limits<double>::infinity();
+                double radiusRatio = 0.0;
+                double centerError = 0.0;
+                geometryScore = placementFitScore(candidate, placement, radiusRatio, centerError);
+                if (cellDistance < bestCellDistance ||
+                    (cellDistance == bestCellDistance && geometryScore < bestGeometryScore)) {
+                    best = &candidate;
+                    bestCellDistance = cellDistance;
+                    bestGeometryScore = geometryScore;
                 }
             }
             return best;
@@ -3374,30 +3538,19 @@ void StorylandArchiveBrowser::buildWorldMeshes() {
             const CandidateMesh* best = nullptr;
             double bestScore = std::numeric_limits<double>::infinity();
             for (const CandidateMesh& candidate : candidates) {
+                if (!scopeMatchesPlacement(candidate)) continue;
                 double radiusRatio = 0.0;
                 double centerError = 0.0;
                 const double score = placementFitScore(candidate, placement, radiusRatio, centerError);
                 if (!std::isfinite(score)) continue;
                 if (score < bestScore) { bestScore = score; best = &candidate; }
             }
-            return best != nullptr ? best : &candidates.front();
+            return best;
         };
 
-        const CandidateMesh* officialChoice = official == officialAreaMeshes.end() ? nullptr : chooseByPlacement(official->second);
-        if (officialChoice == nullptr && official != officialAreaMeshes.end() && official->second.size() == 1u) {
-            // AreaInfo[] -> AERA is an authoritative streamed-resource mapping.
-            // A single valid AERA payload is deterministic even when the retail
-            // placement sphere is conservative or uses a different LOD bound.
-            officialChoice = &official->second.front();
-        }
-        if (officialChoice != nullptr) {
-            resolution.source = "official AERA";
-            resolution.candidateCount = uint32_t(official->second.size());
-            resolution.payloadOffset = officialChoice->payloadOffset;
-            StorylandWorldMesh linked = officialChoice->mesh;
-            linked.sectorIndex = sectorIndex;
-            worldMeshCache.push_back(std::move(linked));
-        } else if (exact != exactMeshes.end() && !exact->second.empty()) {
+        const CandidateMesh* officialChoice = official == officialAreaMeshes.end() ? nullptr : chooseAreaLocalCandidate(official->second);
+
+        if (exact != exactMeshes.end() && !exact->second.empty()) {
             // Several structurally-valid parses can exist for the same exact
             // (sector, RES) pair because retail tables are probed through more
             // than one row layout.  Choose the best geometric fit instead of
@@ -3410,10 +3563,17 @@ void StorylandArchiveBrowser::buildWorldMeshes() {
             StorylandWorldMesh linked = choice->mesh;
             linked.sectorIndex = sectorIndex;
             worldMeshCache.push_back(std::move(linked));
+        } else if (officialChoice != nullptr) {
+            resolution.source = "official AERA";
+            resolution.candidateCount = uint32_t(official->second.size());
+            resolution.payloadOffset = officialChoice->payloadOffset;
+            StorylandWorldMesh linked = officialChoice->mesh;
+            linked.sectorIndex = sectorIndex;
+            worldMeshCache.push_back(std::move(linked));
         } else if (rowCandidates != meshesByRowResource.end() && !rowCandidates->second.empty()) {
             resolution.candidateCount = uint32_t(rowCandidates->second.size());
             const CandidateMesh* choice = chooseByPlacement(rowCandidates->second);
-            if (choice == nullptr && rowCandidates->second.size() == 1u) {
+            if (choice == nullptr && rowCandidates->second.size() == 1u && scopeMatchesPlacement(rowCandidates->second.front())) {
                 // A single same-row candidate is deterministic.  Do not manufacture
                 // a Missing/Conflict state merely because its retail placement sphere
                 // is a poor geometric fit for Storyland's decoded bounds.
@@ -3497,7 +3657,7 @@ void StorylandArchiveBrowser::buildWorldMeshes() {
                 resolution.source = hasLocalRow ? "local unsupported" : "external reference";
             } else {
                 const CandidateMesh* choice = chooseByPlacement(candidates->second);
-                if (choice == nullptr && candidates->second.size() == 1u) {
+                if (choice == nullptr && candidates->second.size() == 1u && scopeMatchesPlacement(candidates->second.front())) {
                     // One structurally valid payload for a used RES is deterministic.
                     // Keep placement-fit scoring for genuine duplicate-ID cases only.
                     choice = &candidates->second.front();
@@ -3528,6 +3688,10 @@ void StorylandArchiveBrowser::buildWorldMeshes() {
                     }
                 }
             }
+        }
+        if (!worldMeshCache.empty() && worldMeshCache.back().sectorIndex == sectorIndex &&
+            worldMeshCache.back().resourceIndex == resourceId && worldMeshCache.back().emptyGeometry) {
+            resolution.source = "empty geometry";
         }
         resourceResolutionCache.push_back(std::move(resolution));
     }
@@ -4176,8 +4340,8 @@ bool StorylandArchiveBrowser::loadLvzWithCompanionImg(const std::wstring& lvzPat
     currentImgSize = currentImgBytes.size();
 
     if (!buildEntriesFromLvzAndImg(errorMessage)) return false;
-    buildDirectTexturesFromLvz();
     buildWorldSectorsAndPlacements();
+    buildDirectTexturesFromLvz();
     buildWorldMeshes();
     return true;
 }
@@ -4342,8 +4506,8 @@ bool StorylandArchiveBrowser::extractEntryBytes(size_t index, std::vector<uint8_
 bool StorylandArchiveBrowser::rebuildParsedCaches(std::string& errorMessage) {
     if (currentLvzBytes.empty()) return buildEntriesFromMobileLcsImg(errorMessage);
     if (!buildEntriesFromLvzAndImg(errorMessage)) return false;
-    buildDirectTexturesFromLvz();
     buildWorldSectorsAndPlacements();
+    buildDirectTexturesFromLvz();
     buildWorldMeshes();
     currentImgSize = currentImgBytes.size();
     return true;
@@ -4729,6 +4893,8 @@ bool StorylandArchiveBrowser::replaceWorldMeshResourceBytes(uint32_t resourceId,
         return false;
     }
 
+    StorylandMasterResourceTableInfo targetMasterTable;
+    const uint16_t targetMaterialRowBytes = locateMasterResourceTable(currentLvzBytes, targetMasterTable) && targetMasterTable.stride == 8u ? 22u : 24u;
     bool replacementWasConvertedFromMdl = false;
     std::vector<uint8_t> replacementPayload = normalizeWorldMeshReplacementPayload(replacementBytes);
     if (replacementPayload.empty()) {
@@ -4776,7 +4942,7 @@ bool StorylandArchiveBrowser::replaceWorldMeshResourceBytes(uint32_t resourceId,
         }
 
         std::vector<uint8_t> convertedPayload;
-        if (!buildWorldSectorMeshPayloadFromLeedsChunk(replacementBytes, fallbackTextureId, convertedPayload)) {
+        if (!buildWorldSectorMeshPayloadFromLeedsChunk(replacementBytes, fallbackTextureId, convertedPayload, targetMaterialRowBytes)) {
             errorMessage =
                 "Storyland could not convert the selected file into a WRLD sector mesh resource payload. "
                 "The file must contain parseable Leeds/MDL strip geometry or already be a raw WRLD sector mesh resource payload.";
@@ -5172,9 +5338,15 @@ bool StorylandArchiveBrowser::replaceDirectTextureFromArchive(
         errorMessage = "The selected texture raster allocation is outside the loaded LVZ/IMG buffer.";
         return false;
     }
+    if (!target.legacyRaw4bpp && ((target.rasterFlags >> 20u) & 0xFu) > 1u) {
+        errorMessage = "This texture has multiple mip levels. In-place replacement needs an encoder that preserves every mip level and its palette.";
+        return false;
+    }
     const bool directRuntimeTexture =
         uint64_t(target.headerOffset) + 16ull <= destination.size() &&
-        readU32(destination, target.headerOffset) == 0xCCCCCCCCu;
+        (readU32(destination, target.headerOffset) == 0xCCCCCCCCu ||
+         (uint64_t(target.headerOffset) + 8u <= destination.size() &&
+          readU32(destination, target.headerOffset + 4u) == target.rasterFlags));
     if (!directRuntimeTexture && !target.legacyRaw4bpp) {
         errorMessage = "Storyland can preview this texture, but its writable raster layout is not proven yet.";
         return false;
@@ -5627,19 +5799,14 @@ bool StorylandArchiveBrowser::addWorldPlacement(
     }
 
     std::ostringstream message;
-    message << "Placed model resource\r\n"
-            << "Resource: " << resourceDisplayName(resourceId) << "\r\n"
-            << "Resource id: " << resourceId << "\r\n"
-            << "IPL id: " << newIplId << "\r\n"
+    message << "Placement created\r\n\r\n"
+            << "Model: " << resourceDisplayName(resourceId) << "\r\n"
+            << "Resource ID: " << resourceId << "\r\n"
+            << "IPL ID: " << newIplId << "\r\n"
             << "Position: " << x << ", " << y << ", " << z << "\r\n"
             << "Sector: " << verified->sectorIndex << " [" << verified->sectorX << "," << verified->sectorY << "]\r\n"
-            << "Pass: NORMAL\r\n"
-            << "Inserted IMG bytes: " << (growNormalPass ? insertionBytes : 0u)
-            << (growNormalPass ? " (NORMAL pass capacity expanded; sector alignment preserved)\r\n"
-                               : " (reused free NORMAL-pass placement slot)\r\n")
-            << "Later IMG offsets updated: " << (growNormalPass ? "yes" : "not needed") << "\r\n"
-            << "Test LVZ/IMG Pair: PASS\r\n\r\n"
-            << "Run Place Resource again to create another instance of the same model, then Save LVZ + IMG to rebuild the pair on disk.";
+            << "Archive check: Passed\r\n\r\n"
+            << "Drag the X, Y or Z gizmo in the viewport to move it.";
     report = message.str();
     errorMessage.clear();
     return true;
@@ -5775,13 +5942,11 @@ bool StorylandArchiveBrowser::moveWorldPlacement(
     }
 
     std::ostringstream message;
-    message << "Moved placement\r\n"
+    message << "Placement moved\r\n\r\n"
             << "Model: " << resourceDisplayName(source.resourceIndex) << "\r\n"
             << "Position: " << x << ", " << y << ", " << z << "\r\n"
-            << "Previous sector: " << source.sectorIndex << "\r\n"
-            << "Target sector: " << targetSector->sectorIndex << "\r\n"
-            << "Sector migration: " << (targetSector->sectorIndex == source.sectorIndex ? "not needed" : "yes") << "\r\n"
-            << "Check Archive: PASS";
+            << "Sector: " << targetSector->sectorIndex << "\r\n"
+            << "Archive check: Passed";
     report = message.str();
     return true;
 }
@@ -5895,11 +6060,11 @@ bool StorylandArchiveBrowser::bindWorldMeshTextureResource(
     }
 
     std::ostringstream message;
-    message << "Bound model texture\r\n"
-            << "Model: " << resourceDisplayName(modelResourceId) << " (" << modelResourceId << ")\r\n"
-            << "Texture: texture" << textureResourceId << " (" << textureResourceId << ")\r\n"
-            << "Material rows updated: " << materialList.materials.size() << "\r\n"
-            << "Check Archive: PASS";
+    message << "Texture linked to model\r\n\r\n"
+            << "Model: " << resourceDisplayName(modelResourceId) << "\r\n"
+            << "Texture: texture" << textureResourceId << "\r\n"
+            << "Materials updated: " << materialList.materials.size() << "\r\n"
+            << "Archive check: Passed";
     report = message.str();
     return true;
 }
@@ -5952,8 +6117,8 @@ bool StorylandArchiveBrowser::validateLvzImgPair(std::string& report, std::strin
             const size_t row = size_t(masterInfo.tableOffset) + size_t(i) * masterInfo.stride;
             const uint32_t pointer = readU32(reparsed.currentLvzBytes, row + 0u);
             const uint32_t unknown = readU32(reparsed.currentLvzBytes, row + 4u);
-            const uint32_t resourceId = readU32(reparsed.currentLvzBytes, row + 8u);
-            if (pointer == 0u && resourceId == 0xFFFFFFFFu) continue;
+            const uint32_t resourceId = masterInfo.stride == 8u ? i : readU32(reparsed.currentLvzBytes, row + 8u);
+            if ((pointer == 0u || pointer == 0xFFFFFFFFu) && (masterInfo.stride == 8u || resourceId == 0xFFFFFFFFu)) continue;
             ++masterActiveRows;
             if (resourceId != i) {
                 ++fatal;
@@ -6238,7 +6403,8 @@ bool StorylandArchiveBrowser::addResourceBytes(
     const std::vector<uint8_t>& resourceBytes,
     std::string& report,
     std::string& errorMessage,
-    uint32_t* addedResourceId
+    uint32_t* addedResourceId,
+    const std::string& preferredTextureName
 ) {
     report.clear();
     errorMessage.clear();
@@ -6289,16 +6455,96 @@ bool StorylandArchiveBrowser::addResourceBytes(
             return false;
         }
 
+        auto normalizeTextureName = [](std::string value) {
+            std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+                return char(std::tolower(ch));
+            });
+            const size_t slash = value.find_last_of("/\\");
+            if (slash != std::string::npos) value.erase(0, slash + 1u);
+            const size_t dot = value.find_last_of('.');
+            if (dot != std::string::npos) value.resize(dot);
+            std::string compact;
+            compact.reserve(value.size());
+            for (unsigned char ch : value) {
+                if (std::isalnum(ch)) compact.push_back(char(ch));
+            }
+            return compact;
+        };
+
+        const std::string preferredKey = normalizeTextureName(preferredTextureName);
+        size_t chosenTextureIndex = SIZE_MAX;
+        long long chosenScore = (std::numeric_limits<long long>::min)();
         RgbaImage image;
-        if (!sourceTextureArchive.decodeTexture(0u, image, textureError)) {
-            errorMessage = "The first texture could not be decoded: " + textureError;
+
+        for (size_t textureIndex = 0; textureIndex < sourceTextureArchive.textures().size(); ++textureIndex) {
+            RgbaImage candidateImage;
+            std::string candidateError;
+            if (!sourceTextureArchive.decodeTexture(textureIndex, candidateImage, candidateError)) continue;
+            if (candidateImage.width <= 0 || candidateImage.height <= 0 ||
+                candidateImage.rgba.size() != size_t(candidateImage.width) * size_t(candidateImage.height) * 4u) continue;
+
+            const LeedsTextureEntry& candidateEntry = sourceTextureArchive.textures()[textureIndex];
+            const std::string candidateKey = normalizeTextureName(candidateEntry.name);
+            std::string candidateNameLower = candidateEntry.name;
+            std::transform(candidateNameLower.begin(), candidateNameLower.end(), candidateNameLower.begin(), [](unsigned char ch) {
+                return char(std::tolower(ch));
+            });
+
+            long long score = 0;
+            if (!preferredKey.empty()) {
+                if (candidateKey == preferredKey) score += 1000000000000LL;
+                else if (!candidateKey.empty() &&
+                         (candidateKey.find(preferredKey) != std::string::npos || preferredKey.find(candidateKey) != std::string::npos)) {
+                    score += 500000000000LL;
+                }
+            }
+            if (candidateNameLower.find("basecolor") != std::string::npos ||
+                candidateNameLower.find("base_color") != std::string::npos ||
+                candidateNameLower.find("diffuse") != std::string::npos ||
+                candidateNameLower.find("albedo") != std::string::npos) {
+                score += 1000000000LL;
+            }
+            if (candidateNameLower.find("emissive") != std::string::npos ||
+                candidateNameLower.find("normal") != std::string::npos ||
+                candidateNameLower.find("rough") != std::string::npos ||
+                candidateNameLower.find("metal") != std::string::npos ||
+                candidateNameLower.find("specular") != std::string::npos ||
+                candidateNameLower.find("mask") != std::string::npos) {
+                score -= 100000000LL;
+            }
+
+            const size_t pixelCount = candidateImage.rgba.size() / 4u;
+            const size_t sampleStep = std::max<size_t>(1u, pixelCount / 4096u);
+            uint8_t firstR = candidateImage.rgba[0];
+            uint8_t firstG = candidateImage.rgba[1];
+            uint8_t firstB = candidateImage.rgba[2];
+            uint8_t firstA = candidateImage.rgba[3];
+            size_t variedPixels = 0u;
+            size_t visiblePixels = 0u;
+            for (size_t pixel = 0; pixel < pixelCount; pixel += sampleStep) {
+                const size_t base = pixel * 4u;
+                const uint8_t r = candidateImage.rgba[base + 0u];
+                const uint8_t g = candidateImage.rgba[base + 1u];
+                const uint8_t b = candidateImage.rgba[base + 2u];
+                const uint8_t a = candidateImage.rgba[base + 3u];
+                if (r != firstR || g != firstG || b != firstB || a != firstA) ++variedPixels;
+                if (a > 8u) ++visiblePixels;
+            }
+            score += static_cast<long long>(variedPixels) * 1000LL + static_cast<long long>(visiblePixels);
+            score += static_cast<long long>(candidateImage.width) * static_cast<long long>(candidateImage.height) / 1024LL;
+
+            if (chosenTextureIndex == SIZE_MAX || score > chosenScore) {
+                chosenTextureIndex = textureIndex;
+                chosenScore = score;
+                image = std::move(candidateImage);
+            }
+        }
+
+        if (chosenTextureIndex == SIZE_MAX) {
+            errorMessage = "None of the textures in the selected archive could be decoded.";
             return false;
         }
-        if (image.width <= 0 || image.height <= 0 ||
-            image.rgba.size() != size_t(image.width) * size_t(image.height) * 4u) {
-            errorMessage = "The selected texture decoded to an invalid RGBA image.";
-            return false;
-        }
+        const LeedsTextureEntry& sourceEntry = sourceTextureArchive.textures()[chosenTextureIndex];
 
         auto isPowerOfTwo = [](int value) {
             return value > 0 && (value & (value - 1)) == 0;
@@ -6313,7 +6559,6 @@ bool StorylandArchiveBrowser::addResourceBytes(
             return false;
         }
 
-        const LeedsTextureEntry& sourceEntry = sourceTextureArchive.textures().front();
         const uint8_t targetBpp = sourceEntry.bpp == 4u ? 4u : 8u;
         std::vector<uint8_t> raster;
         std::vector<uint8_t> palette;
@@ -6367,7 +6612,7 @@ bool StorylandArchiveBrowser::addResourceBytes(
             if (candidate <= 1u || globallyUsedResourceIds.find(candidate) != globallyUsedResourceIds.end()) continue;
             const size_t row = size_t(masterInfo.tableOffset) + size_t(candidate) * masterInfo.stride;
             const uint32_t pointer = readU32(currentLvzBytes, row + 0u);
-            const uint32_t id = readU32(currentLvzBytes, row + 8u);
+            const uint32_t id = masterInfo.stride == 8u ? 0xFFFFFFFFu : readU32(currentLvzBytes, row + 8u);
             if (pointer == 0u && id == 0xFFFFFFFFu) {
                 resourceId = candidate;
                 break;
@@ -6378,20 +6623,22 @@ bool StorylandArchiveBrowser::addResourceBytes(
             return false;
         }
 
-        std::vector<uint8_t> runtimePayload(16u, 0u);
-        writeU32(runtimePayload, 0x00u, 0xCCCCCCCCu);
+        const bool lcsRuntime = masterInfo.stride == 8u;
+        const uint32_t rasterPointerField = lcsRuntime ? 0u : 8u;
+        std::vector<uint8_t> runtimePayload(lcsRuntime ? 8u : 16u, 0u);
+        if (!lcsRuntime) writeU32(runtimePayload, 0x00u, 0xCCCCCCCCu);
         const uint16_t runtimeWidth = uint16_t(targetBpp == 4u ? std::max(1, image.width / 2) : image.width);
-        writeU16(runtimePayload, 0x04u, runtimeWidth);
-        writeU16(runtimePayload, 0x06u, targetBpp == 4u ? uint16_t(0xC045u) : uint16_t(0xC025u));
+        if (!lcsRuntime) writeU16(runtimePayload, 0x04u, runtimeWidth);
+        if (!lcsRuntime) writeU16(runtimePayload, 0x06u, targetBpp == 4u ? uint16_t(0xC045u) : uint16_t(0xC025u));
         // Payload-local pointer; appendPayloadToMasterResourceSlot converts this
         // to the absolute decompressed-LVZ address and adds the relocation.
-        writeU32(runtimePayload, 0x08u, 16u);
+        writeU32(runtimePayload, rasterPointerField, uint32_t(runtimePayload.size()));
         const uint32_t runtimeFlags =
             (integerLog2(image.width) & 0x3Fu) |
             ((integerLog2(image.height) & 0x3Fu) << 6u) |
             ((uint32_t(targetBpp) & 0x3Fu) << 12u) |
             (1u << 20u);
-        writeU32(runtimePayload, 0x0Cu, runtimeFlags);
+        writeU32(runtimePayload, lcsRuntime ? 4u : 12u, runtimeFlags);
         runtimePayload.insert(runtimePayload.end(), raster.begin(), raster.end());
         runtimePayload.insert(runtimePayload.end(), palette.begin(), palette.end());
         while ((runtimePayload.size() & 0x0Fu) != 0u) runtimePayload.push_back(0u);
@@ -6406,7 +6653,7 @@ bool StorylandArchiveBrowser::addResourceBytes(
         };
 
         uint32_t payloadOffset = 0u;
-        if (!appendPayloadToMasterResourceSlot(currentLvzBytes, resourceId, runtimePayload, payloadOffset, errorMessage, {8u})) {
+        if (!appendPayloadToMasterResourceSlot(currentLvzBytes, resourceId, runtimePayload, payloadOffset, errorMessage, {rasterPointerField})) {
             rollback();
             return false;
         }
@@ -6447,14 +6694,13 @@ bool StorylandArchiveBrowser::addResourceBytes(
 
         if (addedResourceId != nullptr) *addedResourceId = resourceId;
         std::ostringstream message;
-        message << "Added WRLD texture resource\r\n"
+        message << "Texture added\r\n\r\n"
                 << "Name: " << canonicalName << "\r\n"
-                << "Resource id: " << resourceId << "\r\n"
-                << "Size: " << image.width << "x" << image.height << "\r\n"
-                << "BPP: " << int(targetBpp) << "\r\n"
-                << "LVZ runtime payload: 0x" << std::hex << std::uppercase << payloadOffset << std::dec << "\r\n"
-                << "Texture pointer relocation added: yes\r\n"
-                << "Check Archive: PASS";
+                << "Resource ID: " << resourceId << "\r\n"
+                << "Source texture: " << sourceEntry.name << "\r\n"
+                << "Size: " << image.width << " x " << image.height << "\r\n"
+                << "Format: " << int(targetBpp) << "bpp\r\n"
+                << "Archive check: Passed";
         report = message.str();
         return true;
     }
@@ -6540,7 +6786,7 @@ bool StorylandArchiveBrowser::addResourceBytes(
             if (globallyUsedResourceIds.find(candidate) != globallyUsedResourceIds.end()) continue;
             const size_t row = size_t(masterInfo.tableOffset) + size_t(candidate) * masterInfo.stride;
             const uint32_t pointer = readU32(currentLvzBytes, row + 0u);
-            const uint32_t id = readU32(currentLvzBytes, row + 8u);
+            const uint32_t id = masterInfo.stride == 8u ? 0xFFFFFFFFu : readU32(currentLvzBytes, row + 8u);
             if (pointer == 0u && id == 0xFFFFFFFFu) {
                 resourceId = candidate;
                 break;
@@ -6558,7 +6804,7 @@ bool StorylandArchiveBrowser::addResourceBytes(
         // resource/binding is explicitly supplied; do not copy file-local MDL
         // material pointers into the WRLD payload.
         std::vector<uint8_t> convertedPayload;
-        if (!buildWorldSectorMeshPayloadFromLeedsChunk(resourceBytes, 0u, convertedPayload)) {
+        if (!buildWorldSectorMeshPayloadFromLeedsChunk(resourceBytes, 0u, convertedPayload, masterInfo.stride == 8u ? 22u : 24u)) {
             errorMessage =
                 "Storyland parsed the SimpleModel but could not convert its Leeds strip data into the retail WRLD Resource[] mesh payload.";
             return false;
@@ -6635,23 +6881,15 @@ bool StorylandArchiveBrowser::addResourceBytes(
 
         if (addedResourceId != nullptr) *addedResourceId = resourceId;
         std::ostringstream message;
-        message << "Added WRLD model resource\r\n"
+        message << "Model added\r\n\r\n"
                 << "Name: model" << resourceId << ".mdl\r\n"
-                << "Resource id: " << resourceId << "\r\n"
-                << "Master Resource[] row: 0x" << std::hex << std::uppercase << rebuiltRow << std::dec << "\r\n"
-                << "LVZ geometry payload: 0x" << std::hex << std::uppercase << payloadOffset << std::dec << "\r\n"
-                << "Converted payload bytes: " << convertedPayload.size() << "\r\n"
+                << "Resource ID: " << resourceId << "\r\n"
                 << "Vertices: " << verificationMesh.vertices.size() << "\r\n"
                 << "Triangles: " << verificationMesh.triangles.size() << "\r\n"
-                << "Standalone MDL header copied: no\r\n"
-                << "Standalone relocation table copied: no\r\n"
-                << "Standalone sector padding copied: no\r\n"
-                << "Resource[] relocation entry added: yes\r\n"
-                << "IMG bytes changed: no; this is a master WRLD-resident model resource\r\n"
-                << "World placement created: no\r\n"
-                << "Test LVZ/IMG Pair: PASS\r\n\r\n"
-                << "The resource exists independently of a WRLD placement. A placement can reference resource id "
-                << resourceId << " later.";
+                << "Texture: not assigned yet\r\n"
+                << "Placement: not placed yet\r\n"
+                << "Archive check: Passed\r\n\r\n"
+                << "Use Place Resource to put the model in the world.";
         report = message.str();
         return true;
     }

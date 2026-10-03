@@ -1,3 +1,4 @@
+#include "storyland_renderware.h"
 #include "leeds_texture.h"
 #include "storyland_atomic_io.h"
 
@@ -729,10 +730,8 @@ static bool parseCtwStandaloneTex(const std::vector<uint8_t>& data, LeedsTexture
     return false;
 }
 
-static bool rwBuildStampSupported(uint32_t version) {
-    return version == 0x00000310u ||
-           version == 0x1003FFFFu ||
-           version == 0x1803FFFFu;
+static bool rwBuildStampSupported(uint32_t stamp) {
+    return storylandRwGame(stamp) != StorylandRwGame::Unknown;
 }
 
 static bool rwChunkHeaderValid(const std::vector<uint8_t>& data, size_t offset, size_t limit, uint32_t expectedType) {
@@ -928,7 +927,7 @@ static bool parseLcsBetaRwTxd(
 }
 
 
-static bool parseGtaSaRwTxd(
+static bool parseDesktopRwTxd(
     const std::vector<uint8_t>& data,
     std::vector<LeedsTextureEntry>& entriesOut,
     std::string& errorMessage
@@ -936,31 +935,33 @@ static bool parseGtaSaRwTxd(
     entriesOut.clear();
     if (data.size() < 32u ||
         readU32(data, 0u) != 0x16u ||
-        readU32(data, 8u) != 0x1803FFFFu) {
+        storylandRwGame(readU32(data, 8u)) == StorylandRwGame::Unknown) {
         return false;
     }
 
-    const size_t rootEnd =
-        std::min<size_t>(
-            data.size(),
-            12u + size_t(readU32(data, 4u)));
+    const uint64_t rootEnd64 = 12ull + readU32(data, 4u);
+    if (rootEnd64 > data.size()) {
+        errorMessage = "PC RenderWare TXD root is truncated.";
+        return false;
+    }
+    const size_t rootEnd = size_t(rootEnd64);
     size_t cursor = 12u;
 
     if (!rwChunkHeaderValid(data, cursor, rootEnd, 0x01u)) {
-        errorMessage = "GTA SA TXD has an invalid dictionary header.";
+        errorMessage = "PC RenderWare TXD has an invalid dictionary header.";
         return false;
     }
 
     const uint32_t dictionaryStructSize = readU32(data, cursor + 4u);
     if (dictionaryStructSize < 4u ||
         cursor + 12u + dictionaryStructSize > rootEnd) {
-        errorMessage = "GTA SA TXD dictionary header is truncated.";
+        errorMessage = "PC RenderWare TXD dictionary header is truncated.";
         return false;
     }
 
     const uint32_t textureCount = readU16(data, cursor + 12u);
     if (textureCount > 4096u) {
-        errorMessage = "GTA SA TXD texture count is unreasonable.";
+        errorMessage = "PC RenderWare TXD texture count is unreasonable.";
         return false;
     }
 
@@ -971,7 +972,7 @@ static bool parseGtaSaRwTxd(
          textureIndex < textureCount;
          ++textureIndex) {
         if (!rwChunkHeaderValid(data, cursor, rootEnd, 0x15u)) {
-            errorMessage = "GTA SA TXD ended before all textures were read.";
+            errorMessage = "PC RenderWare TXD ended before all textures were read.";
             entriesOut.clear();
             return false;
         }
@@ -982,7 +983,7 @@ static bool parseGtaSaRwTxd(
         size_t child = cursor + 12u;
 
         if (!rwChunkHeaderValid(data, child, nativeEnd, 0x01u)) {
-            errorMessage = "GTA SA texture has an invalid data block.";
+            errorMessage = "PC RenderWare texture has an invalid data block.";
             entriesOut.clear();
             return false;
         }
@@ -991,30 +992,43 @@ static bool parseGtaSaRwTxd(
         const size_t payload = child + 12u;
         if (structSize < 88u ||
             payload + size_t(structSize) > nativeEnd) {
-            errorMessage = "GTA SA texture header is truncated.";
+            errorMessage = "PC RenderWare texture header is truncated.";
             entriesOut.clear();
             return false;
         }
 
         const uint32_t platformId = readU32(data, payload + 0u);
-        if (platformId != 9u) {
-            errorMessage = "GTA SA TXD contains a non-PC texture.";
+        if (platformId != 8u && platformId != 9u) {
+            errorMessage = "PC RenderWare TXD contains a non-PC texture.";
             entriesOut.clear();
             return false;
         }
 
         const uint32_t rasterFormat = readU32(data, payload + 72u);
-        const uint32_t d3dFormat = readU32(data, payload + 76u);
+        uint32_t d3dFormat = readU32(data, payload + 76u);
         const uint16_t width = readU16(data, payload + 80u);
         const uint16_t height = readU16(data, payload + 82u);
         const uint8_t depth = data[payload + 84u];
         const uint8_t mipCount = data[payload + 85u];
         const uint8_t rasterType = data[payload + 86u];
         const uint8_t flags = data[payload + 87u];
+        if (platformId == 8u) {
+            // D3D8 stores hasAlpha at +76 and compression 0..5 at +87.
+            // D3D9 stores D3DFORMAT at +76 and raster flags at +87.
+            if (flags > 5u) {
+                errorMessage = "Invalid D3D8 texture compression.";
+                entriesOut.clear();
+                return false;
+            }
+            if (flags == 1u) d3dFormat = LeedsDxt1;
+            else if (flags == 2u || flags == 3u) d3dFormat = LeedsDxt3;
+            else if (flags == 4u || flags == 5u) d3dFormat = LeedsDxt5;
+            else d3dFormat = 0u;
+        }
 
         if (!dimensionsReasonable(int(width), int(height)) ||
             mipCount == 0u || mipCount > 16u) {
-            errorMessage = "GTA SA texture dimensions or mip count are invalid.";
+            errorMessage = "PC RenderWare texture dimensions or mip count are invalid.";
             entriesOut.clear();
             return false;
         }
@@ -1026,7 +1040,7 @@ static bool parseGtaSaRwTxd(
         const bool pal4 = (rasterFormat & 0x4000u) != 0u;
         if (pal8) {
             if (rasterCursor + 256u * 4u > payload + structSize) {
-                errorMessage = "GTA SA texture palette is truncated.";
+                errorMessage = "PC RenderWare texture palette is truncated.";
                 entriesOut.clear();
                 return false;
             }
@@ -1035,7 +1049,7 @@ static bool parseGtaSaRwTxd(
             // GTA SA PC PAL4 data is uncommon. Reserve the conventional
             // 32-entry PC palette so unsupported PAL4 files fail safely later.
             if (rasterCursor + 32u * 4u > payload + structSize) {
-                errorMessage = "GTA SA texture palette is truncated.";
+                errorMessage = "PC RenderWare texture palette is truncated.";
                 entriesOut.clear();
                 return false;
             }
@@ -1043,7 +1057,7 @@ static bool parseGtaSaRwTxd(
         }
 
         if (rasterCursor + 4u > payload + structSize) {
-            errorMessage = "GTA SA texture has no raster payload.";
+            errorMessage = "PC RenderWare texture has no raster payload.";
             entriesOut.clear();
             return false;
         }
@@ -1052,9 +1066,25 @@ static bool parseGtaSaRwTxd(
         rasterCursor += 4u;
         if (uint64_t(rasterCursor) + uint64_t(rasterBytes) >
             uint64_t(payload) + uint64_t(structSize)) {
-            errorMessage = "GTA SA texture raster payload is truncated.";
+            errorMessage = "PC RenderWare texture raster payload is truncated.";
             entriesOut.clear();
             return false;
+        }
+
+        // Validate every declared mip, including levels not displayed.
+        size_t mipCursor = rasterCursor + rasterBytes;
+        for (uint32_t mip = 1u; mip < mipCount; ++mip) {
+            if (mipCursor + 4u > payload + structSize) {
+                errorMessage = "PC RenderWare texture mip header is truncated.";
+                entriesOut.clear(); return false;
+            }
+            const uint32_t size = readU32(data, mipCursor);
+            mipCursor += 4u;
+            if (uint64_t(mipCursor) + size > uint64_t(payload) + structSize) {
+                errorMessage = "PC RenderWare texture mip data is truncated.";
+                entriesOut.clear(); return false;
+            }
+            mipCursor += size;
         }
 
         LeedsTextureEntry entry;
@@ -2770,14 +2800,27 @@ bool LeedsTextureArchive::parse(LeedsPlatform platform, std::string& errorMessag
 
     if (dataBytes.size() >= 12u && readU32(dataBytes, 0u) == 0x16u) {
         const uint32_t rwVersion = readU32(dataBytes, 8u);
-        if (rwVersion == 0x1003FFFFu) {
+        // LCS beta reuses platform 8 with a PSP raster payload. Preserve its
+        // verified decoder rather than identifying it from that number alone.
+        if (rwVersion == 0x1003FFFFu && storylandRwPathGame(path) == StorylandRwGame::Unknown)
             return parseLcsBetaRwTxd(dataBytes, entries, errorMessage);
+        // The first native texture's platform identifies PC dictionaries even
+        // when their build stamp is also used by LCS PSP beta containers.
+        if (dataBytes.size() >= 28u && readU32(dataBytes, 12u) == 1u) {
+            const uint64_t firstNative = 24ull + readU32(dataBytes, 16u);
+            if (firstNative + 28u <= dataBytes.size() &&
+                readU32(dataBytes, size_t(firstNative)) == 0x15u &&
+                readU32(dataBytes, size_t(firstNative) + 12u) == 1u) {
+                const uint32_t platformId = readU32(dataBytes, size_t(firstNative) + 24u);
+                if (platformId == 8u || platformId == 9u)
+                    return parseDesktopRwTxd(dataBytes, entries, errorMessage);
+            }
         }
         if (rwVersion == 0x00000310u) {
             return parseMobileLcsRwTxd(dataBytes, entries, errorMessage);
         }
-        if (rwVersion == 0x1803FFFFu) {
-            return parseGtaSaRwTxd(dataBytes, entries, errorMessage);
+        if (storylandRwGame(rwVersion) != StorylandRwGame::Unknown) {
+            return parseDesktopRwTxd(dataBytes, entries, errorMessage);
         }
     }
 
@@ -2902,7 +2945,7 @@ bool LeedsTextureArchive::parse(LeedsPlatform platform, std::string& errorMessag
 }
 
 
-static bool decodeGtaSaPcTexture(
+static bool decodeDesktopPcTexture(
     const std::vector<uint8_t>& data,
     const LeedsTextureEntry& entry,
     RgbaImage& image,
@@ -2911,9 +2954,12 @@ static bool decodeGtaSaPcTexture(
     const uint32_t d3dFormat = entry.flags;
     const uint32_t rasterFormat = entry.reserved0;
     const uint8_t depth = uint8_t(entry.reserved1 & 0xFFu);
+    if (!checkedTextureRange(entry.rasterOffset, entry.blockSize, data.size())) {
+        errorMessage = "PC RenderWare raster allocation is truncated."; return false;
+    }
 
     if (entry.width <= 0 || entry.height <= 0) {
-        errorMessage = "GTA SA texture has invalid dimensions.";
+        errorMessage = "PC RenderWare texture has invalid dimensions.";
         return false;
     }
 
@@ -2926,6 +2972,11 @@ static bool decodeGtaSaPcTexture(
         dds.flags = d3dFormat;
         dds.reserved0 = 0x4u; // DDS-style FOURCC marker for shared decoder.
         dds.reserved1 = 0u;
+        const size_t required = ((size_t(entry.width) + 3u) / 4u) *
+            ((size_t(entry.height) + 3u) / 4u) * (d3dFormat == LeedsDxt1 ? 8u : 16u);
+        if (entry.blockSize < required) {
+            errorMessage = "PC RenderWare compressed mip is truncated."; return false;
+        }
         return decodeDdsTexture(data, dds, image, errorMessage);
     }
 
@@ -2937,29 +2988,32 @@ static bool decodeGtaSaPcTexture(
 
     const uint32_t baseFormat = rasterFormat & 0x0F00u;
     const bool pal8 = (rasterFormat & 0x2000u) != 0u;
+    const bool pal4 = (rasterFormat & 0x4000u) != 0u;
 
-    if (pal8) {
+    if (pal8 || pal4) {
         const size_t paletteStart =
             size_t(entry.textureHeaderOffset) + 88u;
         if (!checkedTextureRange(
                 paletteStart,
-                256u * 4u,
+                (pal8 ? 256u : 32u) * 4u,
                 data.size()) ||
             !checkedTextureRange(
                 entry.rasterOffset,
-                pixelCount,
-                data.size())) {
-            errorMessage = "GTA SA paletted texture data is truncated.";
+                (pal8 ? pixelCount : (pixelCount + 1u) / 2u),
+                data.size()) ||
+            entry.blockSize < (pal8 ? pixelCount : (pixelCount + 1u) / 2u)) {
+            errorMessage = "PC RenderWare paletted texture data is truncated.";
             return false;
         }
 
         for (size_t i = 0u; i < pixelCount; ++i) {
-            const uint8_t index = data[entry.rasterOffset + i];
+            const uint8_t packed = data[entry.rasterOffset + (pal8 ? i : i / 2u)];
+            const uint8_t index = pal8 ? packed : ((packed >> ((i % 2u) * 4u)) & 15u);
             const size_t p = paletteStart + size_t(index) * 4u;
             const size_t d = i * 4u;
-            image.rgba[d + 0u] = data[p + 2u];
+            image.rgba[d + 0u] = data[p + 0u];
             image.rgba[d + 1u] = data[p + 1u];
-            image.rgba[d + 2u] = data[p + 0u];
+            image.rgba[d + 2u] = data[p + 2u];
             image.rgba[d + 3u] = data[p + 3u];
         }
         return finishDecodedTexture(image);
@@ -2971,11 +3025,11 @@ static bool decodeGtaSaPcTexture(
          d3dFormat == 21u || // D3DFMT_A8R8G8B8
          d3dFormat == 22u)) { // D3DFMT_X8R8G8B8
         const size_t need = pixelCount * 4u;
-        if (!checkedTextureRange(
+        if (entry.blockSize < need || !checkedTextureRange(
                 entry.rasterOffset,
                 need,
                 data.size())) {
-            errorMessage = "GTA SA 32-bit texture data is truncated.";
+            errorMessage = "PC RenderWare 32-bit texture data is truncated.";
             return false;
         }
 
@@ -2994,8 +3048,48 @@ static bool decodeGtaSaPcTexture(
         return finishDecodedTexture(image);
     }
 
+    if ((depth == 16u && (baseFormat == 0x0100u || baseFormat == 0x0200u ||
+                         baseFormat == 0x0300u || baseFormat == 0x0A00u)) ||
+        (depth == 24u && baseFormat == 0x0600u) ||
+        (depth == 8u && baseFormat == 0x0400u)) {
+        const size_t stride = depth / 8u;
+        if (entry.blockSize < pixelCount * stride) {
+            errorMessage = "PC RenderWare mip pixel data is truncated."; return false;
+        }
+        auto expand = [](uint32_t value, uint32_t maximum) {
+            return uint8_t((value * 255u + maximum / 2u) / maximum);
+        };
+        for (size_t i = 0; i < pixelCount; ++i) {
+            const size_t offset = entry.rasterOffset + i * stride;
+            uint8_t* pixel = image.rgba.data() + i * 4u;
+            if (depth == 24u) {
+                pixel[0] = data[offset + 2u]; pixel[1] = data[offset + 1u]; pixel[2] = data[offset];
+            } else if (depth == 8u) {
+                pixel[0] = pixel[1] = pixel[2] = data[offset];
+            } else {
+                const uint16_t value = readU16(data, offset);
+                if (baseFormat == 0x0200u) {
+                    pixel[0] = expand((value >> 11u) & 31u, 31u);
+                    pixel[1] = expand((value >> 5u) & 63u, 63u);
+                    pixel[2] = expand(value & 31u, 31u);
+                } else if (baseFormat == 0x0300u) {
+                    pixel[0] = expand((value >> 8u) & 15u, 15u);
+                    pixel[1] = expand((value >> 4u) & 15u, 15u);
+                    pixel[2] = expand(value & 15u, 15u);
+                    pixel[3] = expand((value >> 12u) & 15u, 15u);
+                } else {
+                    pixel[0] = expand((value >> 10u) & 31u, 31u);
+                    pixel[1] = expand((value >> 5u) & 31u, 31u);
+                    pixel[2] = expand(value & 31u, 31u);
+                    pixel[3] = baseFormat == 0x0A00u || (value & 0x8000u) ? 255u : 0u;
+                }
+            }
+        }
+        return finishDecodedTexture(image);
+    }
+
     errorMessage =
-        "This GTA SA PC texture format is not supported yet.";
+        "This PC RenderWare texture format is not supported yet.";
     return false;
 }
 
@@ -3020,7 +3114,7 @@ bool LeedsTextureArchive::decodeTexture(size_t textureIndex, RgbaImage& image, s
     }
 
     if (entry.kind == TextureKind::RwPc) {
-        return decodeGtaSaPcTexture(dataBytes, entry, image, errorMessage);
+        return decodeDesktopPcTexture(dataBytes, entry, image, errorMessage);
     }
 
     if (entry.width <= 0 || entry.height <= 0 ||
@@ -4817,4 +4911,3 @@ bool LeedsTextureArchive::renameTexture(size_t textureIndex, const std::string& 
 
     return true;
 }
-

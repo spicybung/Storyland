@@ -1,0 +1,10 @@
+
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.wav -text
+*.mp3 -text
+*.gif -text
+*.png -text
+*.ico -text
+*.dat -text

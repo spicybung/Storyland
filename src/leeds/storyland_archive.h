@@ -61,6 +61,12 @@ struct StorylandWorldMesh {
     uint32_t sectorIndex = 0;
     uint32_t resourceIndex = 0;
     uint64_t rawOffset = 0;
+    uint64_t textureScopeOffset = uint64_t(-1);
+    bool textureScopeInImg = true;
+    int32_t textureScopeCellX = 0;
+    int32_t textureScopeCellY = 0;
+    bool hasTextureScopeCell = false;
+    bool emptyGeometry = false;
     uint32_t materialCount = 0;
     std::vector<StorylandWorldMeshVertex> vertices;
     std::vector<StorylandWorldMeshTriangle> triangles;
@@ -77,8 +83,13 @@ struct StorylandDirectTextureResource {
     int height = 0;
     int bpp = 0;
     int32_t materialId = -1;
+    bool unambiguousMaterialBinding = false;
     bool storedInImg = false;
     uint32_t baseOffset = 0;
+    uint32_t scopeSectorIndex = 0xFFFFFFFFu;
+    int32_t scopeCellX = 0;
+    int32_t scopeCellY = 0;
+    bool hasScopeCell = false;
     uint32_t storageBytes = 0;
     bool legacyRaw4bpp = false;
     std::string source;
@@ -164,7 +175,7 @@ public:
 
     bool extractEntryBytes(size_t index, std::vector<uint8_t>& outBytes, std::string& errorMessage) const;
     bool replaceEntryBytes(size_t index, const std::vector<uint8_t>& replacementBytes, std::string& report, std::string& errorMessage);
-    bool addResourceBytes(const std::string& resourceName, const std::vector<uint8_t>& resourceBytes, std::string& report, std::string& errorMessage, uint32_t* addedResourceId = nullptr);
+    bool addResourceBytes(const std::string& resourceName, const std::vector<uint8_t>& resourceBytes, std::string& report, std::string& errorMessage, uint32_t* addedResourceId = nullptr, const std::string& preferredTextureName = std::string());
     bool extractWorldMeshResourceBytes(uint32_t resourceId, std::vector<uint8_t>& outBytes, std::string& errorMessage) const;
     bool replaceWorldMeshResourceBytes(uint32_t resourceId, const std::vector<uint8_t>& replacementBytes, std::string& report, std::string& errorMessage);
     bool addWorldPlacement(uint32_t resourceId, float x, float y, float z, std::string& report, std::string& errorMessage);

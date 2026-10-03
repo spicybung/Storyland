@@ -1,3 +1,4 @@
+#include "storyland_renderware.h"
 #include "storyland_model.h"
 #include "storyland_atomic_io.h"
 
@@ -3473,9 +3474,11 @@ void StorylandModelFile::collectArmatureBones() {
 
             std::function<StorylandModelMatrix(uint32_t)> composeLocalMatrixForBone = [&](uint32_t boneIndex) -> StorylandModelMatrix {
                 if (boneIndex >= bones.size()) return identityModelMatrix();
-                if (composedSolved[boneIndex]) return composedMatrices[boneIndex];
+                if (composedSolved[boneIndex] == 2u) return composedMatrices[boneIndex];
+                if (composedSolved[boneIndex] == 1u) return identityModelMatrix();
+                composedSolved[boneIndex] = 1u;
 
-                const StorylandModelBone& bone = bones[boneIndex];
+                StorylandModelBone& bone = bones[boneIndex];
                 StorylandModelMatrix local = identityModelMatrix();
                 auto nodeIt = offsetToNode.find(bone.offset);
                 if (nodeIt != offsetToNode.end() && nodes[nodeIt->second].localMatrix.valid) {
@@ -3484,11 +3487,17 @@ void StorylandModelFile::collectArmatureBones() {
 
                 StorylandModelMatrix composed = local;
                 if (bone.parentIndex != 0xFFFFFFFFu && bone.parentIndex < bones.size() && bone.parentIndex != boneIndex) {
-                    composed = multiplyModelMatrix(composeLocalMatrixForBone(bone.parentIndex), local);
+                    if (composedSolved[bone.parentIndex] == 1u) {
+                        // A recovered node hierarchy can contain a cycle. Cut
+                        // this back edge instead of recursing until stack overflow.
+                        bone.parentIndex = 0xFFFFFFFFu;
+                    } else {
+                        composed = multiplyModelMatrix(composeLocalMatrixForBone(bone.parentIndex), local);
+                    }
                 }
 
                 composedMatrices[boneIndex] = composed;
-                composedSolved[boneIndex] = 1u;
+                composedSolved[boneIndex] = 2u;
                 return composed;
             };
 
@@ -4560,27 +4569,41 @@ static std::vector<StorylandRwChunkView> storylandRwChildren(const std::vector<u
 }
 
 static std::vector<std::string> storylandRwGeometryMaterials(const std::vector<uint8_t>& bytes, const StorylandRwChunkView& geometry) {
-    std::vector<std::string> materials;
-    for (const StorylandRwChunkView& child : storylandRwChildren(bytes, geometry)) {
-        if (child.type != 8u) continue;
-        for (const StorylandRwChunkView& material : storylandRwChildren(bytes, child)) {
-            if (material.type != 7u) continue;
+    for (const auto& list : storylandRwChildren(bytes, geometry)) {
+        if (list.type != 8u) continue;
+        const auto children = storylandRwChildren(bytes, list);
+        if (children.empty() || children.front().type != 1u || children.front().size < 4u) continue;
+        const auto& st = children.front();
+        const uint32_t count = modelReadU32(bytes, st.payload);
+        if (count > 65536u || !modelRangeFits(st.payload + 4u, size_t(count) * 4u, st.end)) continue;
+        std::vector<std::string> materials;
+        size_t nextChild = 1u;
+        for (uint32_t index = 0; index < count; ++index) {
+            const int32_t reference = int32_t(modelReadU32(bytes, st.payload + 4u + size_t(index) * 4u));
+            if (reference >= 0 && uint32_t(reference) < index) {
+                materials.push_back(materials[size_t(reference)]);
+                continue;
+            }
             std::string textureName;
-            for (const StorylandRwChunkView& materialChild : storylandRwChildren(bytes, material)) {
-                if (materialChild.type != 6u) continue;
-                for (const StorylandRwChunkView& textureChild : storylandRwChildren(bytes, materialChild)) {
-                    if (textureChild.type == 2u) {
-                        textureName = modelLowerAscii(modelReadBoundedAscii(bytes, textureChild.payload, textureChild.size));
-                        break;
+            while (nextChild < children.size() && children[nextChild].type != 7u) ++nextChild;
+            if (reference == -1 && nextChild < children.size()) {
+                const auto& material = children[nextChild++];
+                for (const auto& child : storylandRwChildren(bytes, material)) {
+                    if (child.type != 6u) continue;
+                    for (const auto& textureChild : storylandRwChildren(bytes, child)) {
+                        if (textureChild.type == 2u) {
+                            textureName = modelLowerAscii(modelReadBoundedAscii(bytes, textureChild.payload, textureChild.size));
+                            break;
+                        }
                     }
+                    if (!textureName.empty()) break;
                 }
-                if (!textureName.empty()) break;
             }
             materials.push_back(textureName.empty() ? "<material>" : textureName);
         }
+        if (!materials.empty()) return materials;
     }
-    if (materials.empty()) materials.push_back("<material>");
-    return materials;
+    return {"<material>"};
 }
 
 struct StorylandPspSplitHeader {
@@ -4834,7 +4857,8 @@ static bool storylandDecodeRwFrameHierarchy(
     std::vector<StorylandModelBone>& bonesOut,
     uint32_t& hanimFrameCountOut,
     uint32_t& namedFrameCountOut,
-    uint32_t& hierarchyNodeCountOut
+    uint32_t& hierarchyNodeCountOut,
+    std::vector<StorylandModelMatrix>* worldMatricesOut = nullptr
 ) {
     bonesOut.clear();
     hanimFrameCountOut = 0u;
@@ -4981,6 +5005,7 @@ static bool storylandDecodeRwFrameHierarchy(
         ++extensionIndex;
     }
 
+    if (worldMatricesOut) *worldMatricesOut = std::move(worldMatrices);
     return !bonesOut.empty();
 }
 
@@ -5114,7 +5139,7 @@ static void storylandResolveRwSkinBoneIndices(
     }
 }
 
-static bool storylandDecodePspStandardGeometry(
+static bool storylandDecodeStandardRwGeometry(
     const std::vector<uint8_t>& bytes,
     const StorylandRwChunkView& geometry,
     uint32_t materialBase,
@@ -5143,6 +5168,10 @@ static bool storylandDecodePspStandardGeometry(
     }
 
     size_t cursor = geometryStruct.payload + 16u;
+    if (storylandRwVersion(geometryStruct.version) < 0x34000u) {
+        if (!modelRangeFits(cursor, 12u, geometryStruct.end)) return false;
+        cursor += 12u; // Older Geometry Structs store ambient/specular/diffuse here.
+    }
 
     // RenderWare 3.x Geometry flags.
     constexpr uint32_t kRwGeometryTextured  = 0x00000004u;
@@ -5270,6 +5299,7 @@ bool StorylandModelFile::parsePspStandardDff() {
     // PSP/LCS retail DFFs supplied for this pipeline use Rockstar's 0x1003FFFF
     // RenderWare build stamp and ordinary non-native Geometry Struct payloads.
     if (root.version != 0x1003FFFFu) return false;
+    if (storylandRwPathGame(path) != StorylandRwGame::Unknown) return false;
 
     std::vector<StorylandModelPoint> decodedPoints;
     std::vector<StorylandModelTriangle> decodedTriangles;
@@ -5315,7 +5345,7 @@ bool StorylandModelFile::parsePspStandardDff() {
                 modelReadU32(data, geometryChildren.front().payload + 8u);
             const uint32_t baseVertex = uint32_t(decodedPoints.size());
 
-            if (storylandDecodePspStandardGeometry(
+            if (storylandDecodeStandardRwGeometry(
                     data, geometry, materialBase,
                     decodedPoints, decodedTriangles, decodedTexcoords, decodedSkinWeights,
                     decodedTrianglesCount, decodedVerticesCount)) {
@@ -5485,7 +5515,7 @@ bool StorylandModelFile::parsePspNativeDff() {
 }
 
 
-bool StorylandModelFile::parseGtaSaDff() {
+bool StorylandModelFile::parseDesktopRwDff() {
     if (data.size() < 24u || modelReadU32(data, 0u) != 0x10u) return false;
 
     StorylandRwChunkView root;
@@ -5493,10 +5523,9 @@ bool StorylandModelFile::parseGtaSaDff() {
         return false;
     }
 
-    // GTA San Andreas PC DFFs use the RenderWare 3.6 build stamp commonly
-    // serialized as 0x1803FFFF. Keep this path separate from the LCS PSP
-    // 0x1003FFFF parser so SA files are never mistaken for Stories assets.
-    if (root.version != 0x1803FFFFu) return false;
+    // Standard desktop Geometry is shared across III, VC and SA. Decode its
+    // actual library version rather than restricting it to one SA build stamp.
+    if (storylandRwGame(root.version) == StorylandRwGame::Unknown) return false;
 
     std::vector<StorylandModelPoint> decodedPoints;
     std::vector<StorylandModelTriangle> decodedTriangles;
@@ -5513,6 +5542,22 @@ bool StorylandModelFile::parseGtaSaDff() {
     uint32_t skinWeightedVertices = 0u;
     bool hasSkinPlugin = false;
 
+    std::vector<StorylandModelMatrix> frameMatrices;
+    uint32_t frameHanim = 0, frameNames = 0, frameNodes = 0;
+    storylandDecodeRwFrameHierarchy(data, root, bones, frameHanim, frameNames, frameNodes, &frameMatrices);
+    std::map<uint32_t, std::vector<uint32_t>> atomicFrames;
+    for (const auto& atomic : storylandRwChildren(data, root)) {
+        if (atomic.type != 0x14u) continue;
+        for (const auto& st : storylandRwChildren(data, atomic)) {
+            if (st.type != 1u || st.size < 16u) continue;
+            const uint32_t frame = modelReadU32(data, st.payload);
+            const uint32_t geometry = modelReadU32(data, st.payload + 4u);
+            if (frame < frameMatrices.size()) atomicFrames[geometry].push_back(frame);
+        }
+    }
+    std::vector<StorylandModelPrelight> decodedPrelights;
+    uint32_t geometryIndex = 0;
+
     for (const StorylandRwChunkView& child : storylandRwChildren(data, root)) {
         if (child.type != 0x1Au) continue; // Geometry List
 
@@ -5526,74 +5571,102 @@ bool StorylandModelFile::parseGtaSaDff() {
                 continue;
             }
 
-            const uint32_t geometryFlags =
-                modelReadU32(data, geometryChildren.front().payload + 0u);
+            auto frames = atomicFrames[geometryIndex++];
+            if (frames.empty()) frames.push_back(0xFFFFFFFFu);
+            for (const uint32_t frame : frames) {
 
-            // SA PC DFF geometry is ordinary RenderWare geometry, not the PSP
-            // native 0x510 stream handled by the Stories parser.
-            if ((geometryFlags & 0x01000000u) != 0u) continue;
+                const uint32_t geometryFlags =
+                    modelReadU32(data, geometryChildren.front().payload + 0u);
 
-            const std::vector<std::string> localMaterials =
-                storylandRwGeometryMaterials(data, geometry);
-            const uint32_t materialBase =
-                uint32_t(decodedMaterials.size());
-            decodedMaterials.insert(
-                decodedMaterials.end(),
-                localMaterials.begin(),
-                localMaterials.end());
+                // Desktop DFF geometry is ordinary RenderWare geometry, not the PSP
+                // native 0x510 stream handled by the Stories parser.
+                if ((geometryFlags & 0x01000000u) != 0u) continue;
 
-            for (const StorylandRwChunkView& geometryChild : geometryChildren) {
-                if (geometryChild.type != 3u) continue;
-                for (const StorylandRwChunkView& plugin :
-                     storylandRwChildren(data, geometryChild)) {
-                    if (plugin.type == 0x116u) hasSkinPlugin = true;
+                const std::vector<std::string> localMaterials =
+                    storylandRwGeometryMaterials(data, geometry);
+                const uint32_t materialBase =
+                    uint32_t(decodedMaterials.size());
+                decodedMaterials.insert(
+                    decodedMaterials.end(),
+                    localMaterials.begin(),
+                    localMaterials.end());
+
+                for (const StorylandRwChunkView& geometryChild : geometryChildren) {
+                    if (geometryChild.type != 3u) continue;
+                    for (const StorylandRwChunkView& plugin :
+                         storylandRwChildren(data, geometryChild)) {
+                        if (plugin.type == 0x116u) hasSkinPlugin = true;
+                    }
                 }
-            }
 
-            const uint32_t geometryVertexCount =
-                modelReadU32(
-                    data,
-                    geometryChildren.front().payload + 8u);
-            const uint32_t baseVertex =
-                uint32_t(decodedPoints.size());
+                const uint32_t geometryVertexCount =
+                    modelReadU32(
+                        data,
+                        geometryChildren.front().payload + 8u);
+                const uint32_t baseVertex =
+                    uint32_t(decodedPoints.size());
 
-            if (!storylandDecodePspStandardGeometry(
-                    data,
-                    geometry,
-                    materialBase,
-                    decodedPoints,
-                    decodedTriangles,
-                    decodedTexcoords,
-                    decodedSkinWeights,
-                    decodedTrianglesCount,
-                    decodedVerticesCount)) {
-                continue;
-            }
+                if (!storylandDecodeStandardRwGeometry(
+                        data,
+                        geometry,
+                        materialBase,
+                        decodedPoints,
+                        decodedTriangles,
+                        decodedTexcoords,
+                        decodedSkinWeights,
+                        decodedTrianglesCount,
+                        decodedVerticesCount)) {
+                    continue;
+                }
 
-            ++decodedGeometries;
+                bool geometrySkinned = false;
+                for (const auto& extension : geometryChildren) {
+                    if (extension.type != 3u) continue;
+                    for (const auto& plugin : storylandRwChildren(data, extension))
+                        if (plugin.type == 0x116u) geometrySkinned = true;
+                }
+                if (!geometrySkinned && frame < frameMatrices.size()) {
+                    for (size_t index = baseVertex; index < decodedPoints.size(); ++index)
+                        decodedPoints[index] = transformModelPoint(frameMatrices[frame], decodedPoints[index]);
+                }
+                const auto& st = geometryChildren.front();
+                const size_t colors = st.payload + 16u + (storylandRwVersion(st.version) < 0x34000u ? 12u : 0u);
+                for (uint32_t index = 0; index < geometryVertexCount; ++index) {
+                    StorylandModelPrelight color;
+                    if ((geometryFlags & 8u) && modelRangeFits(colors + size_t(index) * 4u, 4u, st.end)) {
+                        const size_t offset = colors + size_t(index) * 4u;
+                        color.red = data[offset]; color.green = data[offset+1u];
+                        color.blue = data[offset+2u]; color.alpha = data[offset+3u];
+                        color.fileOffset = uint32_t(offset); color.encoding = StorylandPrelightEncoding::Rgba8888; color.valid = true;
+                    }
+                    decodedPrelights.push_back(color);
+                }
 
-            uint32_t geometrySkinBones = 0u;
-            uint32_t geometryUsedBones = 0u;
-            uint32_t geometryMaxWeights = 0u;
-            uint32_t geometryWeightedVertices = 0u;
-            if (storylandDecodeRwSkinWeights(
-                    data,
-                    geometry,
-                    geometryVertexCount,
-                    baseVertex,
-                    decodedSkinWeights,
-                    geometrySkinBones,
-                    geometryUsedBones,
-                    geometryMaxWeights,
-                    geometryWeightedVertices)) {
-                skinBoneCount =
-                    std::max(skinBoneCount, geometrySkinBones);
-                skinUsedBoneCount =
-                    std::max(skinUsedBoneCount, geometryUsedBones);
-                skinMaxWeights =
-                    std::max(skinMaxWeights, geometryMaxWeights);
-                skinWeightedVertices += geometryWeightedVertices;
-            }
+                ++decodedGeometries;
+
+                uint32_t geometrySkinBones = 0u;
+                uint32_t geometryUsedBones = 0u;
+                uint32_t geometryMaxWeights = 0u;
+                uint32_t geometryWeightedVertices = 0u;
+                if (storylandDecodeRwSkinWeights(
+                        data,
+                        geometry,
+                        geometryVertexCount,
+                        baseVertex,
+                        decodedSkinWeights,
+                        geometrySkinBones,
+                        geometryUsedBones,
+                        geometryMaxWeights,
+                        geometryWeightedVertices)) {
+                    skinBoneCount =
+                        std::max(skinBoneCount, geometrySkinBones);
+                    skinUsedBoneCount =
+                        std::max(skinUsedBoneCount, geometryUsedBones);
+                    skinMaxWeights =
+                        std::max(skinMaxWeights, geometryMaxWeights);
+                    skinWeightedVertices += geometryWeightedVertices;
+                }
+            } // Atomic instances of this geometry.
         }
     }
 
@@ -5603,6 +5676,7 @@ bool StorylandModelFile::parseGtaSaDff() {
         return false;
     }
 
+    prelights = std::move(decodedPrelights);
     points = std::move(decodedPoints);
     triangles = std::move(decodedTriangles);
     texcoords = std::move(decodedTexcoords);
@@ -5627,11 +5701,11 @@ bool StorylandModelFile::parseGtaSaDff() {
     kind = hasSkinPlugin
         ? StorylandModelKind::PedModel
         : StorylandModelKind::SimpleModel;
-    gtaSaDff = true;
+    desktopRwDff = true;
     collectTextureNameHints();
 
-    outputLines.push_back({"Format: GTA San Andreas RenderWare DFF."});
-    outputLines.push_back({"RenderWare build: 0x1803FFFF."});
+    outputLines.push_back({"Format: Desktop RenderWare DFF (GTA III / Vice City / San Andreas)."});
+    outputLines.push_back({"RenderWare build: " + modelHexOffset(root.version) + "."});
     outputLines.push_back({"Geometry: " +
                            std::to_string(decodedVerticesCount) +
                            " vertices, " +
@@ -5668,6 +5742,7 @@ static uint8_t expand5To8(uint32_t value) {
 }
 
 void StorylandModelFile::collectPreviewPrelights() {
+    if (desktopRwDff && prelights.size() == points.size()) return;
     prelights.clear();
     if (points.empty()) return;
 
@@ -5696,7 +5771,8 @@ void StorylandModelFile::collectPreviewPrelights() {
                         appendWhite(vertexCount);
                         continue;
                     }
-                    const size_t colors = st.payload + 16u;
+                    const size_t colors = st.payload + 16u +
+                        (storylandRwVersion(st.version) < 0x34000u ? 12u : 0u);
                     if (!modelRangeFits(colors, size_t(vertexCount) * 4u, st.end)) {
                         appendWhite(vertexCount);
                         continue;
@@ -5815,13 +5891,13 @@ void StorylandModelFile::parse() {
     mobileLcsDff = false;
     pmlcMdl = false;
     pspNativeDff = false;
-    gtaSaDff = false;
+    desktopRwDff = false;
     lights2dfx.clear();
     if (parsePmlcMdl()) { collectPreviewPrelights(); return; }
     if (parseMobileLcsDff()) { collectPreviewPrelights(); return; }
     if (parsePspStandardDff()) { collectPreviewPrelights(); return; }
     if (parsePspNativeDff()) { collectPreviewPrelights(); return; }
-    if (parseGtaSaDff()) { collectPreviewPrelights(); return; }
+    if (parseDesktopRwDff()) { collectPreviewPrelights(); return; }
     collectRenderWare2dfxLights();
     detectModelKind();
     collectTextureNameHints();
@@ -6331,7 +6407,7 @@ void StorylandModelFile::createEmptyDraft(
     mobileLcsDff = false;
     pmlcMdl = false;
     pspNativeDff = false;
-    gtaSaDff = false;
+    desktopRwDff = false;
     emptyDraft = true;
 
     const std::string platform = pspTarget ? "PSP" : "PS2";
@@ -6420,7 +6496,7 @@ void StorylandModelFile::createEmptyDffDraft(
     mobileLcsDff = true;
     pmlcMdl = false;
     pspNativeDff = false;
-    gtaSaDff = false;
+    desktopRwDff = false;
     emptyDraft = false;
     parse();
     if (desiredKind != StorylandModelKind::Unknown) {
@@ -6479,7 +6555,10 @@ const std::vector<uint8_t>& StorylandModelFile::rawBytes() const { return data; 
 bool StorylandModelFile::isMobileLcsDff() const { return mobileLcsDff; }
 bool StorylandModelFile::isPmlcMdl() const { return pmlcMdl; }
 bool StorylandModelFile::isPspNativeDff() const { return pspNativeDff; }
-bool StorylandModelFile::isGtaSaDff() const { return gtaSaDff; }
+bool StorylandModelFile::isDesktopRwDff() const { return desktopRwDff; }
+bool StorylandModelFile::isGtaSaDff() const {
+    return desktopRwDff && storylandRwGame(storylandRwStamp(data)) == StorylandRwGame::SanAndreas;
+}
 bool StorylandModelFile::saveToFile(const std::wstring& outputPath, std::string& errorMessage) const {
     if (outputPath.empty()) { errorMessage = "Output path is empty."; return false; }
     if (emptyDraft || data.empty()) { errorMessage = "The new MDL is still empty. Right-click and import valid MDL data before exporting."; return false; }
