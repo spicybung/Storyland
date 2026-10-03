@@ -2473,6 +2473,74 @@ static std::vector<uint8_t> paletteForReplacementMatching(const std::vector<uint
     return palette;
 }
 
+bool leedsEncodeCanonicalPs2TextureBlock(
+    const RgbaImage& image,
+    uint8_t bpp,
+    bool swizzled,
+    std::vector<uint8_t>& rasterOut,
+    std::vector<uint8_t>& paletteOut,
+    std::string& errorMessage
+) {
+    rasterOut.clear();
+    paletteOut.clear();
+
+    if (bpp != 4u && bpp != 8u) {
+        errorMessage = "PS2 Stories direct textures support 4bpp or 8bpp replacement.";
+        return false;
+    }
+    if (!isPowerOfTwoInt(image.width) || !isPowerOfTwoInt(image.height) ||
+        image.width < 4 || image.height < 4 || image.width > 4096 || image.height > 4096) {
+        errorMessage = "Replacement texture dimensions must be powers of two between 4 and 4096.";
+        return false;
+    }
+    const size_t pixelCount = size_t(image.width) * size_t(image.height);
+    if (image.rgba.size() != pixelCount * 4u) {
+        errorMessage = "Replacement texture RGBA buffer is invalid.";
+        return false;
+    }
+
+    const int paletteEntries = bpp == 4u ? 16 : 256;
+    paletteOut = buildPaletteFromReplacementImage(image, paletteEntries, true);
+    if (paletteOut.size() != size_t(paletteEntries) * 4u) {
+        errorMessage = "PS2 texture palette encoder produced an invalid palette size.";
+        rasterOut.clear();
+        paletteOut.clear();
+        return false;
+    }
+
+    const std::vector<uint8_t> matchingPalette = paletteForReplacementMatching(paletteOut, true);
+    std::vector<uint8_t> indices(pixelCount, 0u);
+    for (size_t i = 0; i < pixelCount; ++i) {
+        indices[i] = uint8_t(nearestPaletteIndex(
+            matchingPalette,
+            paletteEntries,
+            image.rgba[i * 4u + 0u],
+            image.rgba[i * 4u + 1u],
+            image.rgba[i * 4u + 2u],
+            image.rgba[i * 4u + 3u]));
+    }
+
+    if (bpp == 8u) {
+        indices = inverseConvertClutPs2(std::move(indices));
+        if (swizzled) indices = swizzlePs2Indices(indices, image.width, image.height);
+        rasterOut = std::move(indices);
+    } else {
+        if (swizzled) indices = swizzlePs2Indices(indices, image.width, image.height);
+        rasterOut = packNibblesLoFirst(indices);
+    }
+
+    const size_t expectedRaster = bpp == 4u ? (pixelCount + 1u) / 2u : pixelCount;
+    if (rasterOut.size() != expectedRaster) {
+        errorMessage = "PS2 direct texture encoder produced an invalid raster size.";
+        rasterOut.clear();
+        paletteOut.clear();
+        return false;
+    }
+
+    errorMessage.clear();
+    return true;
+}
+
 const std::vector<LeedsTextureEntry>& LeedsTextureArchive::textures() const {
     return entries;
 }

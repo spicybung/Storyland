@@ -9,6 +9,16 @@ struct RgbaImage {
     std::vector<uint8_t> rgba;
 };
 
+// Encode one PS2 Stories indexed texture block using the same palette, CLUT,
+// nibble packing and swizzle rules as the normal CHK/XTX writer.
+bool leedsEncodeCanonicalPs2TextureBlock(
+    const RgbaImage& image,
+    uint8_t bpp,
+    bool swizzled,
+    std::vector<uint8_t>& rasterOut,
+    std::vector<uint8_t>& paletteOut,
+    std::string& errorMessage);
+
 enum class LeedsPlatform {
     Auto,
     Psp,

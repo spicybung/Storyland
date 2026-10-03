@@ -77,6 +77,10 @@ struct StorylandDirectTextureResource {
     int height = 0;
     int bpp = 0;
     int32_t materialId = -1;
+    bool storedInImg = false;
+    uint32_t baseOffset = 0;
+    uint32_t storageBytes = 0;
+    bool legacyRaw4bpp = false;
     std::string source;
     std::string name;
     std::vector<uint8_t> rgba;
@@ -163,6 +167,10 @@ public:
     bool addResourceBytes(const std::string& resourceName, const std::vector<uint8_t>& resourceBytes, std::string& report, std::string& errorMessage, uint32_t* addedResourceId = nullptr);
     bool extractWorldMeshResourceBytes(uint32_t resourceId, std::vector<uint8_t>& outBytes, std::string& errorMessage) const;
     bool replaceWorldMeshResourceBytes(uint32_t resourceId, const std::vector<uint8_t>& replacementBytes, std::string& report, std::string& errorMessage);
+    bool addWorldPlacement(uint32_t resourceId, float x, float y, float z, std::string& report, std::string& errorMessage);
+    bool exportDirectTextureAsXtx(size_t textureIndex, std::vector<uint8_t>& outBytes, std::string& errorMessage) const;
+    bool replaceDirectTextureFromArchive(size_t textureIndex, const std::vector<uint8_t>& replacementBytes, std::string& report, std::string& errorMessage);
+    std::string resourceDisplayName(uint32_t resourceId) const;
     bool changeWorldMeshResourceId(uint32_t oldResourceId, uint32_t newResourceId, std::string& report, std::string& errorMessage);
     bool saveLvzImgPair(const std::wstring& lvzPath, const std::wstring& imgPath, bool compressLvz, std::string& errorMessage) const;
     bool overwriteCurrentLvzImgPair(bool compressLvz, std::string& errorMessage) const;
