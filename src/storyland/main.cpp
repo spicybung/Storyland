@@ -18883,8 +18883,8 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 ? (disabled ? RGB(119, 123, 132) : RGB(238, 239, 243))
                 : (disabled ? RGB(130, 150, 170) : RGB(24, 57, 91));
 
-            const int drawWidth = std::max(1, draw->rcItem.right - draw->rcItem.left);
-            const int drawHeight = std::max(1, draw->rcItem.bottom - draw->rcItem.top);
+            const int drawWidth = std::max(1, static_cast<int>(draw->rcItem.right - draw->rcItem.left));
+            const int drawHeight = std::max(1, static_cast<int>(draw->rcItem.bottom - draw->rcItem.top));
             HDC paintDc = draw->hDC;
             HDC memoryDc = CreateCompatibleDC(draw->hDC);
             HBITMAP memoryBitmap = memoryDc ? CreateCompatibleBitmap(draw->hDC, drawWidth, drawHeight) : nullptr;
