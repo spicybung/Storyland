@@ -5382,6 +5382,7 @@ static void rebuildArchiveResourceScrollLists() {
             if (triangle.textureId != 0xFFFFFFFFu) textureIds.insert(triangle.textureId);
         }
     }
+    for (uint32_t id : gArchiveBrowser.masterMeshResourceIds()) meshIds.insert(id);
 
     for (uint32_t id : meshIds) gArchiveMeshResourceIds.push_back(id);
     for (uint32_t id : textureIds) gArchiveTextureIds.push_back(id);
@@ -6037,18 +6038,19 @@ static void selectArchiveMeshResource(int listIndex) {
     sectorCount = uint32_t(sectorsUsed.size());
 
     std::wstringstream ss;
-    ss << L"LVZ + IMG placed mesh resource\r\n\r\n"
+    ss << (instanceCount == 0 ? L"LVZ model resource\r\n\r\n" : L"LVZ + IMG placed model resource\r\n\r\n")
        << L"Resource id: " << resourceId << L"\r\n"
        << L"Parsed mesh variants: " << meshCount << L"\r\n"
        << L"Placed instances: " << instanceCount << L"\r\n"
        << L"Sectors used: " << sectorCount << L"\r\n"
-       << L"Triangles in parsed resource meshes: " << triangleCount << L"\r\n\r\n"
-       << L"The OpenGL viewport remains on the full map. Every placed instance of this resource is highlighted red without opening or isolating its WRLD sector.\r\n"
-       << L"Right-click this mesh resource > Replace Selected LVZ+IMG Resource From File to replace this mesh resource in-place. If the selected file is a normal .mdl/.wrld Leeds chunk, Storyland converts its Leeds strip geometry into the existing runtime-safe sector payload slot, preserves this resource id, and does not redirect the Resource[] row.\r\n"
-       << L"Right-click this mesh resource > Clone Selected Mesh Resource From Resource ID to clone another already parsed sector mesh resource, like resource 376, into this one while keeping this resource id.\r\n"
-       << L"Right-click this mesh resource > Change Selected Mesh Resource ID only when you explicitly want to change the id afterwards.\r\n"
-       << L"Storyland preserves the selected resource id, Resource[] pointer wrapper, WRLD sector size, and later LVZ IMG offsets for runtime-safe mesh replacement.\r\n"
-       << L"This is the useful scroll-through list for LVZ/IMG world meshes, because many Stories level resources are not standalone .mdl files.\r\n";
+       << L"Triangles in parsed resource meshes: " << triangleCount << L"\r\n\r\n";
+    if (instanceCount == 0) {
+        ss << L"This model exists in the master WRLD Resource[] table but currently has no world placement. It is still a valid resource and can be referenced later by its resource id.\r\n";
+    } else {
+        ss << L"Every placed instance of this resource is highlighted in the viewport.\r\n";
+    }
+    ss << L"Replacing this resource with a standalone SimpleModel .mdl converts the MDL into the runtime WRLD model-resource representation. Storyland does not copy the standalone MDL header, relocation table, or sector padding into Resource[].\r\n"
+       << L"The resource id is preserved during replacement. Master WRLD resources are redirected to the converted LVZ payload; sector resources are replaced inside their proven runtime allocation.\r\n";
     setDetails(ss.str());
     InvalidateRect(gPreview, nullptr, TRUE);
 }
@@ -12218,24 +12220,35 @@ static void addResourceToCurrentArchive() {
     std::string resourceName = narrow(std::filesystem::path(sourcePath).filename().wstring());
     std::string report;
     std::string error;
-    if (!gArchiveBrowser.addResourceBytes(resourceName, bytes, report, error)) {
+    uint32_t addedResourceId = 0xFFFFFFFFu;
+    if (!gArchiveBrowser.addResourceBytes(resourceName, bytes, report, error, &addedResourceId)) {
         MessageBoxW(gMainWindow, widen(error).c_str(), L"Add Resource failed", MB_ICONERROR);
         return;
     }
 
     populateArchiveList();
-    const auto& entries = gArchiveBrowser.entries();
-    int addedIndex = -1;
-    for (size_t i = 0; i < entries.size(); ++i) {
-        if (_stricmp(entries[i].name.c_str(), resourceName.c_str()) == 0) {
-            addedIndex = int(i);
+    rebuildArchiveResourceScrollLists();
+
+    if (addedResourceId != 0xFFFFFFFFu) {
+        for (size_t i = 0; i < gArchiveMeshResourceIds.size(); ++i) {
+            if (gArchiveMeshResourceIds[i] != addedResourceId) continue;
+            selectArchiveMeshResource(int(i));
             break;
         }
-    }
-    if (addedIndex >= 0) {
-        selectTreePayloadItem(StorylandTreeKind::ArchiveEntry, addedIndex);
-        gSelectedKind = StorylandTreeKind::ArchiveEntry;
-        gSelectedIndex = addedIndex;
+    } else {
+        const auto& entries = gArchiveBrowser.entries();
+        int addedIndex = -1;
+        for (size_t i = 0; i < entries.size(); ++i) {
+            if (_stricmp(entries[i].name.c_str(), resourceName.c_str()) == 0) {
+                addedIndex = int(i);
+                break;
+            }
+        }
+        if (addedIndex >= 0) {
+            selectTreePayloadItem(StorylandTreeKind::ArchiveEntry, addedIndex);
+            gSelectedKind = StorylandTreeKind::ArchiveEntry;
+            gSelectedIndex = addedIndex;
+        }
     }
 
     setDetails(widen(report));

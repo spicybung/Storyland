@@ -143,6 +143,7 @@ public:
     const std::vector<StorylandWorldPlacement>& placements() const;
     const std::vector<StorylandWorldSector>& sectors() const;
     const std::vector<StorylandWorldMesh>& worldMeshes() const;
+    const std::vector<uint32_t>& masterMeshResourceIds() const;
     const std::vector<StorylandDirectTextureResource>& directTextures() const;
     const std::vector<StorylandImgResourceRow>& imgResourceRows() const;
     const std::vector<StorylandResourceResolution>& resourceResolutions() const;
@@ -159,7 +160,7 @@ public:
 
     bool extractEntryBytes(size_t index, std::vector<uint8_t>& outBytes, std::string& errorMessage) const;
     bool replaceEntryBytes(size_t index, const std::vector<uint8_t>& replacementBytes, std::string& report, std::string& errorMessage);
-    bool addResourceBytes(const std::string& resourceName, const std::vector<uint8_t>& resourceBytes, std::string& report, std::string& errorMessage);
+    bool addResourceBytes(const std::string& resourceName, const std::vector<uint8_t>& resourceBytes, std::string& report, std::string& errorMessage, uint32_t* addedResourceId = nullptr);
     bool extractWorldMeshResourceBytes(uint32_t resourceId, std::vector<uint8_t>& outBytes, std::string& errorMessage) const;
     bool replaceWorldMeshResourceBytes(uint32_t resourceId, const std::vector<uint8_t>& replacementBytes, std::string& report, std::string& errorMessage);
     bool changeWorldMeshResourceId(uint32_t oldResourceId, uint32_t newResourceId, std::string& report, std::string& errorMessage);
@@ -181,10 +182,12 @@ private:
     std::vector<StorylandWorldPlacement> worldPlacements;
     std::vector<StorylandWorldSector> worldSectors;
     std::vector<StorylandWorldMesh> worldMeshCache;
+    std::vector<uint32_t> masterMeshResourceIdCache;
     std::vector<StorylandDirectTextureResource> directTextureCache;
     std::vector<StorylandImgResourceRow> imgResourceRowCache;
     std::vector<StorylandResourceResolution> resourceResolutionCache;
     std::map<uint64_t, std::string> archiveNameOverrides;
+    std::map<uint32_t, std::string> masterResourceNameOverrides;
 
     bool autoFindCompanionImgForLvz(const std::wstring& lvzPath, std::wstring& outImgPath) const;
     bool autoFindCompanionLvzForImg(const std::wstring& imgPath, std::wstring& outLvzPath) const;
