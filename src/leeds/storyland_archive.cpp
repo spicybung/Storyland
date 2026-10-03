@@ -1919,6 +1919,7 @@ static bool decodeLegacyTextureReference(
     outTexture.width = chosenW;
     outTexture.height = chosenH;
     outTexture.bpp = 4;
+    outTexture.legacyRaw4bpp = true;
     outTexture.rgba.assign(size_t(chosenW) * size_t(chosenH) * 4u, 255);
     size_t palette = end - 64u;
     for (int y = 0; y < chosenH; ++y) {
@@ -3252,6 +3253,12 @@ void StorylandArchiveBrowser::buildWorldMeshes() {
         };
 
         const CandidateMesh* officialChoice = official == officialAreaMeshes.end() ? nullptr : chooseByPlacement(official->second);
+        if (officialChoice == nullptr && official != officialAreaMeshes.end() && official->second.size() == 1u) {
+            // AreaInfo[] -> AERA is an authoritative streamed-resource mapping.
+            // A single valid AERA payload is deterministic even when the retail
+            // placement sphere is conservative or uses a different LOD bound.
+            officialChoice = &official->second.front();
+        }
         if (officialChoice != nullptr) {
             resolution.source = "official AERA";
             resolution.candidateCount = uint32_t(official->second.size());
@@ -3327,7 +3334,18 @@ void StorylandArchiveBrowser::buildWorldMeshes() {
             auto candidates = meshesByResource.find(resourceId);
             resolution.candidateCount = candidates == meshesByResource.end() ? 0u : uint32_t(candidates->second.size());
             if (candidates == meshesByResource.end() || candidates->second.empty()) {
-                resolution.source = "missing";
+                // A WRLD placement does not imply that its model payload must live
+                // in this LVZ/IMG pair. VCS legitimately references models from
+                // other streamed archives and the global model pool. Calling those
+                // references "missing" made healthy retail data look corrupt.
+                bool hasLocalRow = false;
+                for (const StorylandImgResourceRow& row : imgResourceRowCache) {
+                    if (row.resourceId == resourceId) {
+                        hasLocalRow = true;
+                        break;
+                    }
+                }
+                resolution.source = hasLocalRow ? "local unsupported" : "external reference";
             } else {
                 const CandidateMesh* choice = chooseByPlacement(candidates->second);
                 if (choice == nullptr && candidates->second.size() == 1u) {
@@ -4123,7 +4141,7 @@ bool StorylandArchiveBrowser::hasClassicDirContext() const { return currentImgKi
 std::string StorylandArchiveBrowser::resourceDisplayName(uint32_t resourceId) const {
     auto found = masterResourceNameOverrides.find(resourceId);
     if (found != masterResourceNameOverrides.end() && !found->second.empty()) return found->second;
-    return "resource" + std::to_string(resourceId) + ".mdl";
+    return "model" + std::to_string(resourceId) + ".mdl";
 }
 
 bool StorylandArchiveBrowser::extractEntryBytes(size_t index, std::vector<uint8_t>& outBytes, std::string& errorMessage) const {
@@ -5000,9 +5018,11 @@ bool StorylandArchiveBrowser::replaceDirectTextureFromArchive(
         errorMessage = "The selected texture raster allocation is outside the loaded LVZ/IMG buffer.";
         return false;
     }
-    if (uint64_t(target.headerOffset) + 16ull > destination.size() ||
-        readU32(destination, target.headerOffset) != 0xCCCCCCCCu) {
-        errorMessage = "This texture was recovered through a legacy/reference-only path and does not have a proven writable runtime texture header.";
+    const bool directRuntimeTexture =
+        uint64_t(target.headerOffset) + 16ull <= destination.size() &&
+        readU32(destination, target.headerOffset) == 0xCCCCCCCCu;
+    if (!directRuntimeTexture && !target.legacyRaw4bpp) {
+        errorMessage = "Storyland can preview this texture, but its writable raster layout is not proven yet.";
         return false;
     }
 
@@ -5032,7 +5052,7 @@ bool StorylandArchiveBrowser::replaceDirectTextureFromArchive(
         return false;
     }
 
-    const bool swizzled = ((target.rasterFlags >> 24u) & 0xFFu) != 0u;
+    const bool swizzled = target.legacyRaw4bpp ? true : (((target.rasterFlags >> 24u) & 0xFFu) != 0u);
     std::vector<uint8_t> raster;
     std::vector<uint8_t> palette;
     if (!leedsEncodeCanonicalPs2TextureBlock(image, uint8_t(target.bpp), swizzled, raster, palette, errorMessage)) {
@@ -5070,6 +5090,7 @@ bool StorylandArchiveBrowser::replaceDirectTextureFromArchive(
     for (const StorylandDirectTextureResource& texture : directTextureCache) {
         if (texture.storedInImg != target.storedInImg) continue;
         if (texture.headerOffset != target.headerOffset) continue;
+        if (texture.legacyRaw4bpp != target.legacyRaw4bpp) continue;
         verified = &texture;
         break;
     }
@@ -5092,7 +5113,8 @@ bool StorylandArchiveBrowser::replaceDirectTextureFromArchive(
             << "Texture: " << target.name << "\r\n"
             << "Size: " << target.width << "x" << target.height << "\r\n"
             << "BPP preserved: " << target.bpp << "\r\n"
-            << "Runtime header offset: 0x" << std::hex << std::uppercase << target.headerOffset << std::dec << "\r\n"
+            << (target.legacyRaw4bpp ? "Raster offset: 0x" : "Runtime header offset: 0x")
+            << std::hex << std::uppercase << target.headerOffset << std::dec << "\r\n"
             << "Raster allocation preserved: " << target.storageBytes << " bytes\r\n"
             << "Stored in: " << (target.storedInImg ? "IMG" : "LVZ") << "\r\n"
             << "Pointers shifted: no\r\n"
@@ -5427,7 +5449,8 @@ bool StorylandArchiveBrowser::validateLvzImgPair(std::string& report, std::strin
     uint32_t dmaSafeMeshes = 0;
     uint32_t vifBackedMeshes = 0;
     uint32_t placementLinks = 0;
-    uint32_t missingPlacementLinks = 0;
+    uint32_t externalPlacementLinks = 0;
+    uint32_t localUnsupportedPlacementLinks = 0;
     uint32_t masterRowsChecked = 0;
     uint32_t masterActiveRows = 0;
     uint32_t masterModelRows = uint32_t(reparsed.masterMeshResourceIdCache.size());
@@ -5476,6 +5499,7 @@ bool StorylandArchiveBrowser::validateLvzImgPair(std::string& report, std::strin
     }
 
     uint64_t previousEntryEnd = 0;
+    const StorylandArchiveEntry* previousEntry = nullptr;
     std::vector<const StorylandArchiveEntry*> sortedEntries;
     for (const auto& entry : reparsed.archiveEntries) sortedEntries.push_back(&entry);
     std::sort(sortedEntries.begin(), sortedEntries.end(), [](const auto* a, const auto* b) {
@@ -5490,10 +5514,21 @@ bool StorylandArchiveBrowser::validateLvzImgPair(std::string& report, std::strin
             details << "FATAL archive entry outside IMG: " << entry->name << " offset=" << entry->byteOffset << " size=" << entry->byteSize << "\r\n";
         }
         if (entry->byteOffset < previousEntryEnd) {
-            ++warnings;
-            details << "WARN overlapping/reused archive allocation: " << entry->name << " starts=" << entry->byteOffset << " previous_end=" << previousEntryEnd << "\r\n";
+            const bool entryIsWorldContainer = entry->chunkIdent == WRLD_IDENT || isAreaIdent(entry->chunkIdent);
+            const bool previousIsWorldContainer = previousEntry != nullptr &&
+                (previousEntry->chunkIdent == WRLD_IDENT || isAreaIdent(previousEntry->chunkIdent));
+            // Retail LVZ metadata contains nested WRLD/AERA headers whose IMG
+            // spans deliberately overlap their parent world allocation. This is
+            // containment metadata, not two files colliding on disk.
+            if (!(entryIsWorldContainer && previousIsWorldContainer)) {
+                ++warnings;
+                details << "WARN overlapping/reused archive allocation: " << entry->name << " starts=" << entry->byteOffset << " previous_end=" << previousEntryEnd << "\r\n";
+            }
         }
-        previousEntryEnd = std::max(previousEntryEnd, entry->byteOffset + entry->byteSize);
+        if (entry->byteOffset + entry->byteSize >= previousEntryEnd) {
+            previousEntryEnd = entry->byteOffset + entry->byteSize;
+            previousEntry = entry;
+        }
     }
 
     std::set<uint32_t> resourceIds;
@@ -5529,10 +5564,27 @@ bool StorylandArchiveBrowser::validateLvzImgPair(std::string& report, std::strin
             details << "FATAL non-finite WRLD placement: RES=" << placement.resourceIndex << " sector=" << placement.sectorIndex << "\r\n";
             continue;
         }
-        if (resourceIds.count(placement.resourceIndex)) ++placementLinks;
-        else {
-            ++missingPlacementLinks;
-            ++warnings;
+        if (resourceIds.count(placement.resourceIndex)) {
+            ++placementLinks;
+        } else {
+            const StorylandResourceResolution* resolution = nullptr;
+            for (const auto& candidate : reparsed.resourceResolutionCache) {
+                if (candidate.sectorIndex == placement.sectorIndex && candidate.resourceId == placement.resourceIndex) {
+                    resolution = &candidate;
+                    break;
+                }
+            }
+            if (resolution != nullptr && resolution->source == "external reference") {
+                // Retail VCS WRLD sectors are allowed to reference models owned by
+                // another streamed archive/global pool. Absence from this pair is
+                // therefore not a broken LVZ->IMG link.
+                ++externalPlacementLinks;
+            } else {
+                ++localUnsupportedPlacementLinks;
+                ++warnings;
+                details << "WARN local placement resource is present but not decoded as a mesh: RES="
+                        << placement.resourceIndex << " sector=" << placement.sectorIndex << "\r\n";
+            }
         }
     }
 
@@ -5586,8 +5638,9 @@ bool StorylandArchiveBrowser::validateLvzImgPair(std::string& report, std::strin
         "Parsed mesh variants checked: " + std::to_string(checkedMeshes) + "\r\n"
         "PCSX2-semantics DMA/VIF/GIF/GS-safe resource checks: " + std::to_string(dmaSafeMeshes) + "\r\n"
         "VIF/VU1-consumption-backed resource checks: " + std::to_string(vifBackedMeshes) + "\r\n"
-        "Placement->Resource links: " + std::to_string(placementLinks) + "\r\n"
-        "Missing placement links: " + std::to_string(missingPlacementLinks) + "\r\n"
+        "Placement->local Resource links: " + std::to_string(placementLinks) + "\r\n"
+        "External streamed placement refs: " + std::to_string(externalPlacementLinks) + "\r\n"
+        "Local non-mesh/unsupported refs: " + std::to_string(localUnsupportedPlacementLinks) + "\r\n"
         "Warnings: " + std::to_string(warnings) + "\r\n"
         "Fatals: " + std::to_string(fatal) + "\r\n\r\n" + details.str();
 

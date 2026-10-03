@@ -5634,17 +5634,15 @@ static void selectWblPayload(const StorylandTreePayload& payload) {
     else if (payload.kind == StorylandTreeKind::WblBox) selectWblBox(payload.index);
 }
 
+static std::wstring archiveTreeLabel(const StorylandArchiveEntry& entry, size_t entryIndex) {
+    const std::string ext = archiveEntryExtensionLower(entry.name);
+    if (ext == ".area") return L"Area " + std::to_wstring(entryIndex + 1u);
+    if (ext == ".wrld") return L"World " + std::to_wstring(entryIndex + 1u);
+    return archiveDisplayName(entry, entryIndex);
+}
+
 static void addArchiveEntryTreeItem(HTREEITEM parent, const StorylandArchiveEntry& entry, size_t entryIndex) {
-    std::wstringstream line;
-    line << archiveDisplayName(entry, entryIndex)
-         << L" | start=" << entry.startSector
-         << L" count=" << entry.sectorCount
-         << L" bytes=" << entry.byteSize
-         << L" offset=" << entry.byteOffset;
-    if (entry.usesLvzChunkHeader) {
-        line << L" header=" << hexWide(entry.lvzHeaderOffset, 6);
-    }
-    addTreeItem(parent, line.str(), StorylandTreeKind::ArchiveEntry, int(entryIndex));
+    addTreeItem(parent, archiveTreeLabel(entry, entryIndex), StorylandTreeKind::ArchiveEntry, int(entryIndex));
 }
 
 static void populateArchiveList() {
@@ -5773,8 +5771,9 @@ static void populateArchiveList() {
     HTREEITEM resolutionRoot = addTreeItem(root, L"Links");
     HTREEITEM resolvedRoot = addTreeItem(resolutionRoot, L"Exact");
     HTREEITEM linkedRoot = addTreeItem(resolutionRoot, L"Linked");
-    HTREEITEM conflictRoot = addTreeItem(resolutionRoot, L"Conflicts");
-    HTREEITEM missingRoot = addTreeItem(resolutionRoot, L"Missing");
+    HTREEITEM conflictRoot = addTreeItem(resolutionRoot, L"Ambiguous");
+    HTREEITEM externalRoot = addTreeItem(resolutionRoot, L"External");
+    HTREEITEM unsupportedRoot = addTreeItem(resolutionRoot, L"Other local");
     HTREEITEM sectorRoot = addTreeItem(root, L"Sectors");
     HTREEITEM meshResourceRoot = addTreeItem(root, L"Models");
     HTREEITEM materialRoot = addTreeItem(root, L"Textures");
@@ -5851,14 +5850,14 @@ static void populateArchiveList() {
 
     std::map<uint32_t, size_t> meshListIndex;
     for (size_t i = 0; i < gArchiveMeshResourceIds.size(); ++i) meshListIndex[gArchiveMeshResourceIds[i]] = i;
-    uint32_t sameSectorCount = 0, linkedCount = 0, conflictCount = 0, missingCount = 0;
+    uint32_t sameSectorCount = 0, linkedCount = 0, conflictCount = 0, externalCount = 0, unsupportedCount = 0;
     for (const auto& resolution : resolutions) {
         std::wstringstream line;
         line << L"Sector " << resolution.sectorIndex
              << L" [" << resolution.sectorX << L"," << resolution.sectorY << L"]  "
              << widen(gArchiveBrowser.resourceDisplayName(resolution.resourceId));
         if (resolution.placementCount != 0u) line << L"  (" << resolution.placementCount << L" placed)";
-        HTREEITEM parent = missingRoot;
+        HTREEITEM parent = externalRoot;
         if (resolution.source == "same-sector" || resolution.source == "same-sector verified") {
             parent = resolvedRoot;
             sameSectorCount++;
@@ -5876,9 +5875,10 @@ static void populateArchiveList() {
             linkedCount++;
         }
         else if (resolution.source == "conflict") { parent = conflictRoot; conflictCount++; }
-        else missingCount++;
+        else if (resolution.source == "local unsupported") { parent = unsupportedRoot; unsupportedCount++; }
+        else { parent = externalRoot; externalCount++; }
         auto listIndex = meshListIndex.find(resolution.resourceId);
-        if (listIndex != meshListIndex.end() && parent != conflictRoot && parent != missingRoot) {
+        if (listIndex != meshListIndex.end() && parent != conflictRoot && parent != externalRoot && parent != unsupportedRoot) {
             addTreeItem(parent, line.str(), StorylandTreeKind::ArchiveMeshResource, int(listIndex->second));
         } else {
             addTreeItem(parent, line.str());
@@ -12526,7 +12526,7 @@ static void exportSelectedArchiveDirectTexture() {
     }
 
     const std::wstring outputPath = saveFileDialogWithInitial(
-        L"GTA Stories texture archive\0*.xtx;*.chk\0XTX\0*.xtx\0CHK\0*.chk\0All files\0*.*\0",
+        L"GTA Stories texture archive\0*.xtx;*.chk;*.tex\0XTX\0*.xtx\0CHK\0*.chk\0TEX\0*.tex\0All files\0*.*\0",
         suggestedExtension == L".chk" ? L"chk" : L"xtx",
         suggestedName);
     if (outputPath.empty()) return;
@@ -16648,65 +16648,82 @@ static LRESULT CALLBACK previewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+static void setStorylandWindowVisible(HWND hwnd, bool visible) {
+    if (!hwnd || !IsWindow(hwnd)) return;
+    const bool current = IsWindowVisible(hwnd) != FALSE;
+    if (current != visible) ShowWindow(hwnd, visible ? SW_SHOWNA : SW_HIDE);
+}
+
+static void setStorylandWindowEnabled(HWND hwnd, bool enabled) {
+    if (!hwnd || !IsWindow(hwnd)) return;
+    const bool current = IsWindowEnabled(hwnd) != FALSE;
+    if (current != enabled) EnableWindow(hwnd, enabled ? TRUE : FALSE);
+}
+
+static void setStorylandWindowText(HWND hwnd, const wchar_t* text) {
+    if (!hwnd || !IsWindow(hwnd) || !text) return;
+    wchar_t current[256] = {};
+    GetWindowTextW(hwnd, current, int(sizeof(current) / sizeof(current[0])));
+    if (wcscmp(current, text) != 0) SetWindowTextW(hwnd, text);
+}
+
 static void updateActionBar() {
     if (!gActionBar || !gActionPrimary || !gActionSecondary || !gActionTertiary || !gActionQuaternary) return;
-    ShowWindow(gActionPrimary, SW_HIDE);
-    ShowWindow(gActionSecondary, SW_HIDE);
-    if (gMediaTimeline) ShowWindow(gMediaTimeline, SW_HIDE);
-    ShowWindow(gActionTertiary, SW_HIDE);
-    ShowWindow(gActionQuaternary, SW_HIDE);
-    EnableWindow(gActionSecondary, TRUE);
-    EnableWindow(gActionTertiary, TRUE);
+
+    bool showBar = false;
+    bool showPrimary = false;
+    bool showSecondary = false;
+    bool showTertiary = false;
+    bool showQuaternary = false;
+    bool enablePrimary = true;
+    bool enableSecondary = true;
+    bool enableTertiary = true;
+    bool enableQuaternary = true;
+
+    const wchar_t* primaryText = nullptr;
+    const wchar_t* secondaryText = nullptr;
+    const wchar_t* tertiaryText = nullptr;
+    const wchar_t* quaternaryText = nullptr;
 
     if (gMode == StorylandMode::ModelFile ||
         (gMode == StorylandMode::DtzArchive && gDtzEmbeddedPreviewKind == DtzEmbeddedPreviewKind::ModelFile)) {
-        SetWindowTextW(gActionPrimary, (gMode == StorylandMode::ModelFile && gModelFile.isEmptyDraft()) ? L"Import MDL Data..." : L"Test Model");
-        SetWindowTextW(gActionSecondary, L"Apply Animation...");
-        ShowWindow(gActionBar, SW_SHOW);
-        ShowWindow(gActionPrimary, SW_SHOW);
-        if (!(gMode == StorylandMode::ModelFile && gModelFile.isEmptyDraft()) && currentModelCanUsePedCutsceneAnimation())
-            ShowWindow(gActionSecondary, SW_SHOW);
+        showBar = true;
+        showPrimary = true;
+        primaryText = (gMode == StorylandMode::ModelFile && gModelFile.isEmptyDraft())
+            ? L"Import MDL Data..." : L"Test Model";
+        secondaryText = L"Apply Animation...";
+        showSecondary = !(gMode == StorylandMode::ModelFile && gModelFile.isEmptyDraft()) &&
+            currentModelCanUsePedCutsceneAnimation();
         if (gMode == StorylandMode::ModelFile && gModelAnimLoaded) {
-            SetWindowTextW(gActionTertiary, L"Previous Frame");
-            SetWindowTextW(gActionQuaternary, L"Next Frame");
-            ShowWindow(gActionTertiary, SW_SHOW);
-            ShowWindow(gActionQuaternary, SW_SHOW);
+            tertiaryText = L"Previous Frame";
+            quaternaryText = L"Next Frame";
+            showTertiary = true;
+            showQuaternary = true;
         }
     } else if (gMode == StorylandMode::AnimFile) {
-        SetWindowTextW(gActionPrimary, gAnimPlaying ? L"Pause" : L"Play");
-        SetWindowTextW(gActionSecondary, L"Stop");
-        SetWindowTextW(gActionTertiary, L"Previous Frame");
-        SetWindowTextW(gActionQuaternary, L"Next Frame");
-        ShowWindow(gActionBar, SW_SHOW);
-        ShowWindow(gActionPrimary, SW_SHOW);
-        ShowWindow(gActionSecondary, SW_SHOW);
-        ShowWindow(gActionTertiary, SW_SHOW);
-        ShowWindow(gActionQuaternary, SW_SHOW);
+        showBar = true;
+        showPrimary = showSecondary = showTertiary = showQuaternary = true;
+        primaryText = gAnimPlaying ? L"Pause" : L"Play";
+        secondaryText = L"Stop";
+        tertiaryText = L"Previous Frame";
+        quaternaryText = L"Next Frame";
     } else if (gMode == StorylandMode::TextureArchive) {
-        SetWindowTextW(gActionPrimary, L"Test Texture");
-        SetWindowTextW(gActionSecondary, L"Add Material...");
-        SetWindowTextW(gActionTertiary, L"Edit Material...");
-        SetWindowTextW(gActionQuaternary, L"Remove Material");
-        ShowWindow(gActionBar, SW_SHOW);
-        ShowWindow(gActionPrimary, SW_SHOW);
-        ShowWindow(gActionSecondary, SW_SHOW);
-        ShowWindow(gActionTertiary, SW_SHOW);
-        ShowWindow(gActionQuaternary, SW_SHOW);
-
-        const BOOL haveMaterialSelection =
-            (gSelectedIndex >= 0 &&
-             size_t(gSelectedIndex) < gTextureArchive.textures().size()) ? TRUE : FALSE;
-        EnableWindow(gActionPrimary, TRUE);
-        EnableWindow(gActionSecondary, TRUE);
-        EnableWindow(gActionTertiary, haveMaterialSelection);
-        EnableWindow(gActionQuaternary, haveMaterialSelection);
+        showBar = true;
+        showPrimary = showSecondary = showTertiary = showQuaternary = true;
+        primaryText = L"Test Texture";
+        secondaryText = L"Add Material...";
+        tertiaryText = L"Edit Material...";
+        quaternaryText = L"Remove Material";
+        const bool haveMaterialSelection =
+            gSelectedIndex >= 0 && size_t(gSelectedIndex) < gTextureArchive.textures().size();
+        enableTertiary = haveMaterialSelection;
+        enableQuaternary = haveMaterialSelection;
     } else if (gMode == StorylandMode::DtzArchive &&
                gDtzEmbeddedPreviewKind == DtzEmbeddedPreviewKind::TextureArchive) {
-        SetWindowTextW(gActionPrimary, L"Test Texture");
-        SetWindowTextW(gActionSecondary, L"Back to GAME.DTZ");
-        ShowWindow(gActionBar, SW_SHOW);
-        ShowWindow(gActionPrimary, SW_SHOW);
-        ShowWindow(gActionSecondary, SW_SHOW);
+        showBar = true;
+        showPrimary = showSecondary = true;
+        primaryText = L"Test Texture";
+        secondaryText = L"Back to GAME.DTZ";
     } else if (gMode == StorylandMode::ArchiveFile && gArchiveBrowser.hasLvzContext()) {
         const bool haveEntry = gSelectedKind == StorylandTreeKind::ArchiveEntry &&
             gSelectedIndex >= 0 && size_t(gSelectedIndex) < gArchiveBrowser.entries().size();
@@ -16717,44 +16734,56 @@ static void updateActionBar() {
                                 gSelectedKind == StorylandTreeKind::ArchivePlacement) &&
                                selectedArchiveResourceId(selectedResourceId);
 
+        showBar = true;
+        showPrimary = showSecondary = showTertiary = showQuaternary = true;
         if (haveTexture) {
-            SetWindowTextW(gActionPrimary, L"Export Texture...");
-            SetWindowTextW(gActionSecondary, L"Replace Texture...");
-            SetWindowTextW(gActionTertiary, L"Test LVZ/IMG");
+            primaryText = L"Export Texture...";
+            secondaryText = L"Replace Texture...";
+            tertiaryText = L"Test LVZ/IMG";
         } else {
-            SetWindowTextW(gActionPrimary, L"Add Resource...");
+            primaryText = L"Add Resource...";
             if (haveModel) {
-                SetWindowTextW(gActionSecondary, L"Place Resource...");
-                SetWindowTextW(gActionTertiary, L"Replace Model...");
+                secondaryText = L"Place Resource...";
+                tertiaryText = L"Replace Model...";
             } else {
-                SetWindowTextW(gActionSecondary, L"Replace Resource...");
-                SetWindowTextW(gActionTertiary, L"Test LVZ/IMG");
+                secondaryText = L"Replace Resource...";
+                tertiaryText = L"Test LVZ/IMG";
             }
         }
-        SetWindowTextW(gActionQuaternary, L"Save LVZ + IMG");
-        ShowWindow(gActionBar, SW_SHOW);
-        ShowWindow(gActionPrimary, SW_SHOW);
-        ShowWindow(gActionSecondary, SW_SHOW);
-        ShowWindow(gActionTertiary, SW_SHOW);
-        ShowWindow(gActionQuaternary, SW_SHOW);
-        EnableWindow(gActionSecondary, haveEntry || haveTexture || haveModel);
-        EnableWindow(gActionTertiary, TRUE);
+        quaternaryText = L"Save LVZ + IMG";
+        enableSecondary = haveEntry || haveTexture || haveModel;
     } else if (gMode == StorylandMode::MediaFile) {
-        SetWindowTextW(gActionPrimary, L"Play");
-        SetWindowTextW(gActionSecondary, L"Stop");
-        ShowWindow(gActionBar, SW_SHOW);
-        ShowWindow(gActionPrimary, SW_SHOW);
-        ShowWindow(gActionSecondary, SW_SHOW);
+        showBar = true;
+        showPrimary = showSecondary = true;
+        primaryText = L"Play";
+        secondaryText = L"Stop";
         if (gMediaFile.kind() == StorylandMediaKind::Video) {
-            SetWindowTextW(gActionTertiary, L"Previous Frame");
-            SetWindowTextW(gActionQuaternary, L"Next Frame");
-            ShowWindow(gActionTertiary, SW_SHOW);
-            ShowWindow(gActionQuaternary, SW_SHOW);
+            tertiaryText = L"Previous Frame";
+            quaternaryText = L"Next Frame";
+            showTertiary = true;
+            showQuaternary = true;
             updateMediaTimelineFromDecoder();
         }
-    } else {
-        ShowWindow(gActionBar, SW_HIDE);
     }
+
+    if (primaryText) setStorylandWindowText(gActionPrimary, primaryText);
+    if (secondaryText) setStorylandWindowText(gActionSecondary, secondaryText);
+    if (tertiaryText) setStorylandWindowText(gActionTertiary, tertiaryText);
+    if (quaternaryText) setStorylandWindowText(gActionQuaternary, quaternaryText);
+
+    setStorylandWindowEnabled(gActionPrimary, enablePrimary);
+    setStorylandWindowEnabled(gActionSecondary, enableSecondary);
+    setStorylandWindowEnabled(gActionTertiary, enableTertiary);
+    setStorylandWindowEnabled(gActionQuaternary, enableQuaternary);
+
+    setStorylandWindowVisible(gActionPrimary, showPrimary);
+    setStorylandWindowVisible(gActionSecondary, showSecondary);
+    setStorylandWindowVisible(gActionTertiary, showTertiary);
+    setStorylandWindowVisible(gActionQuaternary, showQuaternary);
+    if (gMediaTimeline && !(gMode == StorylandMode::MediaFile && gMediaFile.kind() == StorylandMediaKind::Video)) {
+        setStorylandWindowVisible(gMediaTimeline, false);
+    }
+    setStorylandWindowVisible(gActionBar, showBar);
 }
 
 static void refreshModeUi() {
@@ -17021,10 +17050,11 @@ static void layoutChildren(HWND hwnd) {
     };
     storylandMoveWindowToRect(gDetails, detailsRect);
 
-    // Child controls are repositioned without repainting one-by-one. Repaint the
-    // settled layout once, which avoids button/tree fragments while resizing.
+    // Repaint only the newly exposed parent background. Child controls repaint
+    // themselves when needed; invalidating every child here made the owner-drawn
+    // action buttons visibly erase and redraw during ordinary layout changes.
     if (hwnd && IsWindow(hwnd)) {
-        RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN);
+        InvalidateRect(hwnd, nullptr, FALSE);
     }
 }
 static void selectPayloadForCurrentMode(const StorylandTreePayload& payload) {
@@ -17630,7 +17660,7 @@ static bool buildTreeContextMenu(HMENU menu) {
             hasItems = addContextMenuItem(menu, ID_ARCHIVE_REPLACE_SELECTED_RESOURCE, L"Replace Model...") || hasItems;
             hasItems = addContextMenuItem(menu, ID_FILE_EXPORT_SELECTED_RESOURCE, L"Export Model Resource...") || hasItems;
         } else if (gSelectedKind == StorylandTreeKind::ArchiveDirectTexture) {
-            hasItems = addContextMenuItem(menu, ID_ARCHIVE_EXPORT_DIRECT_TEXTURE, L"Export Texture as XTX...") || hasItems;
+            hasItems = addContextMenuItem(menu, ID_ARCHIVE_EXPORT_DIRECT_TEXTURE, L"Export Texture...") || hasItems;
             hasItems = addContextMenuItem(menu, ID_ARCHIVE_REPLACE_DIRECT_TEXTURE, L"Replace Texture...") || hasItems;
         }
         if (gArchiveBrowser.hasLvzContext() && gArchiveBrowser.hasImgContext()) {
@@ -18748,10 +18778,10 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         gDetails = CreateWindowExW(0, L"EDIT", nullptr, WS_CHILD | WS_CLIPSIBLINGS | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_NOHIDESEL, 0, 0, 100, 100, hwnd, reinterpret_cast<HMENU>(ID_DETAILS), gInstance, nullptr);
         SendMessageW(gDetails, EM_SETLIMITTEXT, 16 * 1024 * 1024, 0);
         gActionBar = CreateWindowExW(0, L"STATIC", nullptr, WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN, 0, 0, 100, 36, hwnd, reinterpret_cast<HMENU>(ID_ACTION_BAR), gInstance, nullptr);
-        gActionPrimary = CreateWindowExW(0, L"BUTTON", L"Test Model", WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 118, 28, hwnd, reinterpret_cast<HMENU>(ID_ACTION_PRIMARY), gInstance, nullptr);
-        gActionSecondary = CreateWindowExW(0, L"BUTTON", L"Apply Animation...", WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 118, 28, hwnd, reinterpret_cast<HMENU>(ID_ACTION_SECONDARY), gInstance, nullptr);
-        gActionTertiary = CreateWindowExW(0, L"BUTTON", L"Remove Material", WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 118, 28, hwnd, reinterpret_cast<HMENU>(ID_ACTION_TERTIARY), gInstance, nullptr);
-        gActionQuaternary = CreateWindowExW(0, L"BUTTON", L"Validate Archive", WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 118, 28, hwnd, reinterpret_cast<HMENU>(ID_ACTION_QUATERNARY), gInstance, nullptr);
+        gActionPrimary = CreateWindowExW(0, L"BUTTON", L"Test Model", WS_CHILD | WS_TABSTOP | WS_CLIPSIBLINGS | BS_OWNERDRAW, 0, 0, 118, 28, hwnd, reinterpret_cast<HMENU>(ID_ACTION_PRIMARY), gInstance, nullptr);
+        gActionSecondary = CreateWindowExW(0, L"BUTTON", L"Apply Animation...", WS_CHILD | WS_TABSTOP | WS_CLIPSIBLINGS | BS_OWNERDRAW, 0, 0, 118, 28, hwnd, reinterpret_cast<HMENU>(ID_ACTION_SECONDARY), gInstance, nullptr);
+        gActionTertiary = CreateWindowExW(0, L"BUTTON", L"Remove Material", WS_CHILD | WS_TABSTOP | WS_CLIPSIBLINGS | BS_OWNERDRAW, 0, 0, 118, 28, hwnd, reinterpret_cast<HMENU>(ID_ACTION_TERTIARY), gInstance, nullptr);
+        gActionQuaternary = CreateWindowExW(0, L"BUTTON", L"Validate Archive", WS_CHILD | WS_TABSTOP | WS_CLIPSIBLINGS | BS_OWNERDRAW, 0, 0, 118, 28, hwnd, reinterpret_cast<HMENU>(ID_ACTION_QUATERNARY), gInstance, nullptr);
         gMediaTimeline = CreateWindowExW(0, TRACKBAR_CLASSW, nullptr,
             WS_CHILD | WS_TABSTOP | TBS_HORZ | TBS_NOTICKS | TBS_ENABLESELRANGE,
             0, 0, 100, 28, hwnd, reinterpret_cast<HMENU>(ID_MEDIA_TIMELINE), gInstance, nullptr);
@@ -18804,7 +18834,7 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             ShowWindow(gRenderPieWindow, SW_HIDE);
         layoutChildren(hwnd);
         if (wParam != SIZE_MINIMIZED) {
-            RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+            InvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
 
@@ -18839,19 +18869,6 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
              draw->CtlID == ID_ACTION_SECONDARY ||
              draw->CtlID == ID_ACTION_TERTIARY ||
              draw->CtlID == ID_ACTION_QUATERNARY)) {
-            const int drawWidth = std::max(1, static_cast<int>(draw->rcItem.right - draw->rcItem.left));
-            const int drawHeight = std::max(1, static_cast<int>(draw->rcItem.bottom - draw->rcItem.top));
-            HDC bufferDc = CreateCompatibleDC(draw->hDC);
-            HBITMAP bufferBitmap = bufferDc
-                ? CreateCompatibleBitmap(draw->hDC, drawWidth, drawHeight)
-                : nullptr;
-            HGDIOBJ oldBitmap = bufferBitmap ? SelectObject(bufferDc, bufferBitmap) : nullptr;
-            const bool buffered = oldBitmap && oldBitmap != HGDI_ERROR;
-            HDC drawDc = buffered ? bufferDc : draw->hDC;
-            if (buffered) {
-                SetViewportOrgEx(bufferDc, -draw->rcItem.left, -draw->rcItem.top, nullptr);
-            }
-
             const bool disabled = (draw->itemState & ODS_DISABLED) != 0;
             const bool pressed = (draw->itemState & ODS_SELECTED) != 0;
             const COLORREF accent = storylandPaneBorderColor();
@@ -18866,55 +18883,77 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 ? (disabled ? RGB(119, 123, 132) : RGB(238, 239, 243))
                 : (disabled ? RGB(130, 150, 170) : RGB(24, 57, 91));
 
-            paintStorylandAeroGradient(drawDc, draw->rcItem, top, bottom);
+            const int drawWidth = std::max(1, draw->rcItem.right - draw->rcItem.left);
+            const int drawHeight = std::max(1, draw->rcItem.bottom - draw->rcItem.top);
+            HDC paintDc = draw->hDC;
+            HDC memoryDc = CreateCompatibleDC(draw->hDC);
+            HBITMAP memoryBitmap = memoryDc ? CreateCompatibleBitmap(draw->hDC, drawWidth, drawHeight) : nullptr;
+            HGDIOBJ oldBitmap = nullptr;
+            RECT buttonRect = draw->rcItem;
+
+            if (memoryDc && memoryBitmap) {
+                oldBitmap = SelectObject(memoryDc, memoryBitmap);
+                paintDc = memoryDc;
+                SetRect(&buttonRect, 0, 0, drawWidth, drawHeight);
+            }
+
+            paintStorylandAeroGradient(paintDc, buttonRect, top, bottom);
 
             HPEN pen = CreatePen(PS_SOLID, 1, border);
-            HGDIOBJ oldPen = SelectObject(drawDc, pen);
-            HGDIOBJ oldBrush = SelectObject(drawDc, GetStockObject(HOLLOW_BRUSH));
+            HGDIOBJ oldPen = SelectObject(paintDc, pen);
+            HGDIOBJ oldBrush = SelectObject(paintDc, GetStockObject(HOLLOW_BRUSH));
             const int buttonRight =
-                std::max(draw->rcItem.left, draw->rcItem.right - 1);
+                std::max(buttonRect.left, buttonRect.right - 1);
             const int buttonBottom =
-                std::max(draw->rcItem.top, draw->rcItem.bottom - 1);
+                std::max(buttonRect.top, buttonRect.bottom - 1);
             RoundRect(
-                drawDc,
-                draw->rcItem.left,
-                draw->rcItem.top,
+                paintDc,
+                buttonRect.left,
+                buttonRect.top,
                 buttonRight,
                 buttonBottom,
                 8, 8);
-            SelectObject(drawDc, oldBrush);
-            SelectObject(drawDc, oldPen);
+            SelectObject(paintDc, oldBrush);
+            SelectObject(paintDc, oldPen);
             DeleteObject(pen);
 
             wchar_t text[128] = {};
             GetWindowTextW(draw->hwndItem, text, int(sizeof(text) / sizeof(text[0])));
-            RECT textRect = draw->rcItem;
+            RECT textRect = buttonRect;
             if (pressed) OffsetRect(&textRect, 1, 1);
-            SetBkMode(drawDc, TRANSPARENT);
-            SetTextColor(drawDc, textColor);
+            SetBkMode(paintDc, TRANSPARENT);
+            SetTextColor(paintDc, textColor);
             HFONT font = reinterpret_cast<HFONT>(SendMessageW(draw->hwndItem, WM_GETFONT, 0, 0));
-            HGDIOBJ oldFont = font ? SelectObject(drawDc, font) : nullptr;
+            HGDIOBJ oldFont = font ? SelectObject(paintDc, font) : nullptr;
             DrawTextW(
-                drawDc,
+                paintDc,
                 text,
                 -1,
                 &textRect,
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-            if (oldFont) SelectObject(drawDc, oldFont);
+            if (oldFont) SelectObject(paintDc, oldFont);
 
             if ((draw->itemState & ODS_FOCUS) != 0 && !disabled) {
-                RECT focusRect = draw->rcItem;
+                RECT focusRect = buttonRect;
                 InflateRect(&focusRect, -3, -3);
-                DrawFocusRect(drawDc, &focusRect);
+                DrawFocusRect(paintDc, &focusRect);
             }
-            if (buffered) {
-                SetViewportOrgEx(bufferDc, 0, 0, nullptr);
-                BitBlt(draw->hDC, draw->rcItem.left, draw->rcItem.top,
-                    drawWidth, drawHeight, bufferDc, 0, 0, SRCCOPY);
-                SelectObject(bufferDc, oldBitmap);
+
+            if (paintDc == memoryDc && memoryBitmap) {
+                BitBlt(
+                    draw->hDC,
+                    draw->rcItem.left,
+                    draw->rcItem.top,
+                    drawWidth,
+                    drawHeight,
+                    memoryDc,
+                    0,
+                    0,
+                    SRCCOPY);
             }
-            if (bufferBitmap) DeleteObject(bufferBitmap);
-            if (bufferDc) DeleteDC(bufferDc);
+            if (oldBitmap) SelectObject(memoryDc, oldBitmap);
+            if (memoryBitmap) DeleteObject(memoryBitmap);
+            if (memoryDc) DeleteDC(memoryDc);
             return TRUE;
         }
         if (draw && draw->CtlID == ID_STATUS) {

@@ -80,6 +80,7 @@ struct StorylandDirectTextureResource {
     bool storedInImg = false;
     uint32_t baseOffset = 0;
     uint32_t storageBytes = 0;
+    bool legacyRaw4bpp = false;
     std::string source;
     std::string name;
     std::vector<uint8_t> rgba;
