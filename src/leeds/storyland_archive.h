@@ -168,6 +168,8 @@ public:
     bool extractWorldMeshResourceBytes(uint32_t resourceId, std::vector<uint8_t>& outBytes, std::string& errorMessage) const;
     bool replaceWorldMeshResourceBytes(uint32_t resourceId, const std::vector<uint8_t>& replacementBytes, std::string& report, std::string& errorMessage);
     bool addWorldPlacement(uint32_t resourceId, float x, float y, float z, std::string& report, std::string& errorMessage);
+    bool moveWorldPlacement(size_t placementIndex, float x, float y, float z, std::string& report, std::string& errorMessage);
+    bool bindWorldMeshTextureResource(uint32_t modelResourceId, uint32_t textureResourceId, std::string& report, std::string& errorMessage);
     bool exportDirectTextureAsXtx(size_t textureIndex, std::vector<uint8_t>& outBytes, std::string& errorMessage) const;
     bool replaceDirectTextureFromArchive(size_t textureIndex, const std::vector<uint8_t>& replacementBytes, std::string& report, std::string& errorMessage);
     std::string resourceDisplayName(uint32_t resourceId) const;

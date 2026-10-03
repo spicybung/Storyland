@@ -31,6 +31,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -277,6 +278,7 @@ typedef void (APIENTRY *PFNGLACTIVETEXTUREPROC)(GLenum texture);
 #define ID_ARCHIVE_DUPLICATE_PLACEMENT 1117
 #define ID_ARCHIVE_EXPORT_DIRECT_TEXTURE 1118
 #define ID_ARCHIVE_REPLACE_DIRECT_TEXTURE 1119
+#define ID_ARCHIVE_CREATE_DIR 1120
 #define ID_MEDIA_REPLACE_CURRENT_FRAME 1109
 #define ID_SCRIPT_NEW 2101
 #define ID_SCRIPT_OPEN 2102
@@ -303,6 +305,7 @@ typedef void (APIENTRY *PFNGLACTIVETEXTUREPROC)(GLenum texture);
 #define ID_ACTION_TERTIARY 2009
 #define ID_ACTION_QUATERNARY 2010
 #define ID_MEDIA_TIMELINE 2011
+#define ID_ARCHIVE_CREATE_DIR_INLINE 2012
 
 static HINSTANCE gInstance = nullptr;
 static HWND gMainWindow = nullptr;
@@ -317,6 +320,7 @@ static HWND gActionSecondary = nullptr;
 static HWND gActionTertiary = nullptr;
 static HWND gActionQuaternary = nullptr;
 static HWND gMediaTimeline = nullptr;
+static HWND gArchiveCreateDirInlineButton = nullptr;
 static bool gMediaTimelineInternalUpdate = false;
 static HWND gRenderPieWindow = nullptr;
 static HMENU gMainMenu = nullptr;
@@ -842,6 +846,7 @@ struct StorylandTreePayload {
 };
 
 static std::vector<StorylandTreePayload> gTreePayloads;
+static HTREEITEM gArchiveCreateDirSpacerItem = nullptr;
 static int gTreeMutationDepth = 0;
 
 static std::vector<uint32_t> gArchiveMeshResourceIds;
@@ -865,6 +870,31 @@ static float gArchiveViewFocusX = 0.0f;
 static float gArchiveViewFocusY = 0.0f;
 static float gArchiveViewFocusZ = 0.0f;
 static float gArchiveViewFocusSpan = 1.0f;
+
+enum class ArchivePlacementGizmoAxis { None, X, Y, Z };
+struct ArchivePlacementGizmoScreen {
+    bool valid = false;
+    int centerX = 0;
+    int centerY = 0;
+    int endX[3] = {};
+    int endY[3] = {};
+    bool axisValid[3] = {};
+    float worldLength = 1.0f;
+};
+static ArchivePlacementGizmoScreen gArchivePlacementGizmoScreen;
+static ArchivePlacementGizmoAxis gArchivePlacementGizmoAxis = ArchivePlacementGizmoAxis::None;
+static bool gArchivePlacementGizmoDragging = false;
+static int gArchivePlacementGizmoPlacementIndex = -1;
+static POINT gArchivePlacementGizmoMouseStart = {};
+static float gArchivePlacementGizmoStartX = 0.0f;
+static float gArchivePlacementGizmoStartY = 0.0f;
+static float gArchivePlacementGizmoStartZ = 0.0f;
+static float gArchivePlacementGizmoPreviewX = 0.0f;
+static float gArchivePlacementGizmoPreviewY = 0.0f;
+static float gArchivePlacementGizmoPreviewZ = 0.0f;
+static float gArchivePlacementGizmoScreenUnitX = 0.0f;
+static float gArchivePlacementGizmoScreenUnitY = 0.0f;
+static float gArchivePlacementGizmoWorldPerPixel = 0.1f;
 
 static HWND gScriptWindow = nullptr;
 static HWND gScriptToolbar = nullptr;
@@ -1448,6 +1478,7 @@ static void rebuildViewMenu();
 static void updateModelTextureVAutoDetection();
 static bool effectiveModelTextureVFlip();
 static void updateActionBar();
+static void updateArchiveCreateDirInlineButton();
 static void createNewStorylandResource();
 static void addTextureMaterial();
 static void applyAnimationToCurrentModel();
@@ -5648,6 +5679,7 @@ static void addArchiveEntryTreeItem(HTREEITEM parent, const StorylandArchiveEntr
 static void populateArchiveList() {
     clearView();
     rebuildArchiveResourceScrollLists();
+    gArchiveCreateDirSpacerItem = nullptr;
 
     if (gActiveAreaArchive >= 0) {
         HTREEITEM gameRoot = addTreeItem(TVI_ROOT, L"GAME.DTZ + area archives");
@@ -5668,8 +5700,9 @@ static void populateArchiveList() {
     HTREEITEM root = addTreeItem(TVI_ROOT, archiveRootLabel);
     if (gArchiveBrowser.hasLvzContext()) addTreeItem(root, L"LVZ: " + gArchiveBrowser.lvzPath());
     if (gArchiveBrowser.hasImgContext()) addTreeItem(root, L"IMG: " + gArchiveBrowser.imgPath());
-    if (gArchiveBrowser.hasLvzContext()) addTreeItem(root, L"No .DIR: retail LVZ+IMG uses LVZ chunk headers + IMG payloads.");
-    if (!gArchiveBrowser.levelSummary().empty()) addTreeItem(root, widen(gArchiveBrowser.levelSummary()));
+    if (gArchiveBrowser.hasLvzContext()) gArchiveCreateDirSpacerItem = addTreeItem(root, L" ");
+    if (!gArchiveBrowser.hasLvzContext() && !gArchiveBrowser.levelSummary().empty())
+        addTreeItem(root, widen(gArchiveBrowser.levelSummary()));
 
     if (!gArchiveBrowser.hasLvzContext()) {
         const auto& entries = gArchiveBrowser.entries();
@@ -5961,6 +5994,12 @@ static void populateArchiveList() {
     expandTreeItem(root);
     expandTreeItem(resolutionRoot);
     expandTreeItem(meshResourceRoot);
+    UpdateWindow(gTree);
+    updateArchiveCreateDirInlineButton();
+    if (gArchiveCreateDirInlineButton && IsWindowVisible(gArchiveCreateDirInlineButton)) {
+        RedrawWindow(gArchiveCreateDirInlineButton, nullptr, nullptr,
+                     RDW_INVALIDATE | RDW_UPDATENOW | RDW_FRAME);
+    }
 
     gSelectedIndex = -1;
     gSelectedKind = StorylandTreeKind::None;
@@ -6031,19 +6070,17 @@ static void selectArchiveRoot() {
     }
 
     std::wstringstream ss;
-    ss << L"LVZ + IMG archive preview\r\n\r\n"
+    ss << L"LVZ + IMG\r\n\r\n"
        << L"LVZ: " << gArchiveBrowser.lvzPath() << L"\r\n"
-       << L"IMG: " << gArchiveBrowser.imgPath() << L"\r\n"
-       << L"DIR source: none; retail LVZ+IMG mode reconstructs entries from LVZ chunk headers.\r\n\r\n"
+       << L"IMG: " << gArchiveBrowser.imgPath() << L"\r\n\r\n"
        << L"WRLD/AREA chunks: " << worldCount << L"\r\n"
        << L"Model chunks: " << modelCount << L"\r\n"
        << L"Texture chunks: " << textureCount << L"\r\n"
        << L"Other chunks: " << otherCount << L"\r\n"
-       << L"Parsed sectors: " << sectors.size() << L"\r\n"
-       << L"Parsed visible placements: " << placements.size() << L"\r\n"
-       << L"Parsed real mesh resources: " << gArchiveBrowser.worldMeshes().size() << L"\r\n\r\n"
-       << L"The OpenGL viewport shows the whole map/resource layout when no singular WRLD/AREA entry is selected.\r\n"
-       << L"WRLD/AREA placement is parsed from sLevelSectorDirectory, sector pass pointers, and 0x50-byte sGeomInstance rows with sector-origin translation.\r\n";
+       << L"Sectors: " << sectors.size() << L"\r\n"
+       << L"Placements: " << placements.size() << L"\r\n"
+       << L"Models found: " << gArchiveBrowser.worldMeshes().size() << L"\r\n\r\n"
+       << L"Select a world area, model, placement, or texture in the tree to inspect it.\r\n";
     setDetails(ss.str());
     InvalidateRect(gPreview, nullptr, TRUE);
 }
@@ -6073,7 +6110,6 @@ static void selectArchiveEntry(int index) {
     }
     if (gArchiveBrowser.hasLvzContext()) ss << L"LVZ context: " << gArchiveBrowser.lvzPath() << L"\r\n";
     if (gArchiveBrowser.hasImgContext()) ss << L"IMG source: " << gArchiveBrowser.imgPath() << L"\r\n";
-    if (gArchiveBrowser.hasLvzContext()) ss << L"DIR source: none; LVZ+IMG mode reconstructs entries from LVZ chunk headers.\r\n";
 
     if (archiveEntryIsWorld(entry)) {
         ss << L"\r\nPreview: this WRLD/AREA sector is shown alone in the OpenGL viewport.\r\n";
@@ -6155,6 +6191,7 @@ static void selectArchivePlacement(int placementIndex) {
        << L"Scale: " << placement.scaleX << L", " << placement.scaleY << L", " << placement.scaleZ << L"\r\n"
        << L"Bounds: " << placement.boundX << L", " << placement.boundY << L", " << placement.boundZ
        << L"  r=" << placement.boundRadius << L"\r\n\r\n"
+       << L"Drag the red/green/blue XYZ gizmo in the viewport to move this placement. "
        << L"Right-click this placement to duplicate it. View Selected puts the camera in front of this instance.";
     setDetails(ss.str());
     InvalidateRect(gPreview, nullptr, TRUE);
@@ -11996,12 +12033,14 @@ static std::wstring buildExportLogText() {
         ss << (gArchiveBrowser.hasLvzContext() ? L"Mode: LVZ + IMG archive\r\n\r\n" : L"Mode: Mobile LCS raw gta3.img archive\r\n\r\n");
         if (gArchiveBrowser.hasLvzContext()) ss << L"LVZ: " << gArchiveBrowser.lvzPath() << L"\r\n";
         if (gArchiveBrowser.hasImgContext()) ss << L"IMG: " << gArchiveBrowser.imgPath() << L"\r\n";
-        ss << (gArchiveBrowser.hasLvzContext() ? L"DIR: none; retail LVZ+IMG mode\r\n" : L"Directory: sector-scanned Mobile LCS RenderWare clumps; no GAME.DTZ/LVZ/DIR\r\n");
-        ss << L"Summary: " << widen(gArchiveBrowser.levelSummary()) << L"\r\n";
+        if (!gArchiveBrowser.hasLvzContext()) {
+            ss << L"Directory: sector-scanned Mobile LCS RenderWare clumps; no GAME.DTZ/LVZ/DIR\r\n";
+            ss << L"Summary: " << widen(gArchiveBrowser.levelSummary()) << L"\r\n";
+        }
         ss << L"IMG size: " << gArchiveBrowser.imgFileSize() << L" bytes\r\n";
-        ss << L"Parsed sectors: " << gArchiveBrowser.sectors().size() << L"\r\n";
-        ss << L"Parsed visible placements: " << gArchiveBrowser.placements().size() << L"\r\n";
-        ss << L"Parsed real mesh resources: " << gArchiveBrowser.worldMeshes().size() << L"\r\n\r\n";
+        ss << L"Sectors: " << gArchiveBrowser.sectors().size() << L"\r\n";
+        ss << L"Placements: " << gArchiveBrowser.placements().size() << L"\r\n";
+        ss << L"Models found: " << gArchiveBrowser.worldMeshes().size() << L"\r\n\r\n";
 
         ss << L"Sectors\r\n-------\r\n";
         for (const auto& sector : gArchiveBrowser.sectors()) {
@@ -12321,14 +12360,61 @@ static void addResourceToCurrentArchive() {
         return;
     }
 
+    const std::wstring sourceExtension = getExtensionLower(sourcePath);
+    if (sourceExtension == L".mdl" && addedResourceId != 0xFFFFFFFFu) {
+        std::wstring prompt = L"Added model" + std::to_wstring(addedResourceId) +
+            L".mdl.\r\n\r\nAdd a CHK/XTX/TEX texture resource for this model now?\r\n"
+            L"Storyland will create textureX and bind the new model's material id to it.";
+        const int choice = MessageBoxW(gMainWindow, prompt.c_str(), L"Add model texture", MB_ICONQUESTION | MB_YESNO);
+        if (choice == IDYES) {
+            std::wstring texturePath = openFileDialog(
+                L"Leeds textures\0*.xtx;*.chk;*.tex\0XTX\0*.xtx\0CHK\0*.chk\0TEX\0*.tex\0All files\0*.*\0");
+            if (!texturePath.empty()) {
+                std::vector<uint8_t> textureBytes;
+                std::string textureReadError;
+                if (!readBinaryFileForUi(texturePath, textureBytes, textureReadError)) {
+                    MessageBoxW(gMainWindow, widen(textureReadError).c_str(), L"Add model texture", MB_ICONERROR);
+                } else {
+                    uint32_t textureResourceId = 0xFFFFFFFFu;
+                    std::string textureReport;
+                    std::string textureAddError;
+                    const std::string textureName = narrow(std::filesystem::path(texturePath).filename().wstring());
+                    if (!gArchiveBrowser.addResourceBytes(textureName, textureBytes, textureReport, textureAddError, &textureResourceId)) {
+                        MessageBoxW(gMainWindow, widen(textureAddError).c_str(), L"Add model texture failed", MB_ICONERROR);
+                    } else {
+                        std::string bindingReport;
+                        std::string bindingError;
+                        if (!gArchiveBrowser.bindWorldMeshTextureResource(addedResourceId, textureResourceId, bindingReport, bindingError)) {
+                            MessageBoxW(gMainWindow, widen(bindingError).c_str(), L"Bind model texture failed", MB_ICONERROR);
+                        } else {
+                            report += "\r\n\r\n" + textureReport + "\r\n\r\n" + bindingReport;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     populateArchiveList();
     rebuildArchiveResourceScrollLists();
 
     if (addedResourceId != 0xFFFFFFFFu) {
+        bool selectedAddedResource = false;
         for (size_t i = 0; i < gArchiveMeshResourceIds.size(); ++i) {
             if (gArchiveMeshResourceIds[i] != addedResourceId) continue;
             selectArchiveMeshResource(int(i));
+            selectedAddedResource = true;
             break;
+        }
+        if (!selectedAddedResource) {
+            const auto& textures = gArchiveBrowser.directTextures();
+            for (size_t i = 0; i < textures.size(); ++i) {
+                if (textures[i].materialId != int32_t(addedResourceId)) continue;
+                selectTreePayloadItem(StorylandTreeKind::ArchiveDirectTexture, int(i));
+                selectArchiveDirectTexture(int(i));
+                selectedAddedResource = true;
+                break;
+            }
         }
     } else {
         const auto& entries = gArchiveBrowser.entries();
@@ -12347,43 +12433,15 @@ static void addResourceToCurrentArchive() {
     }
 
     setDetails(widen(report));
-    setStatus(L"Added " + std::filesystem::path(sourcePath).filename().wstring() +
-              L" to the loaded LVZ + IMG pair in memory.");
+    if (addedResourceId != 0xFFFFFFFFu) {
+        setStatus(L"Added resource " + std::to_wstring(addedResourceId) + L" to the loaded LVZ + IMG pair in memory.");
+    } else {
+        setStatus(L"Added " + std::filesystem::path(sourcePath).filename().wstring() + L" to the loaded LVZ + IMG pair in memory.");
+    }
     refreshModeUi();
     InvalidateRect(gPreview, nullptr, FALSE);
 }
 
-
-static bool askArchivePlacementPosition(
-    const wchar_t* title,
-    float defaultX,
-    float defaultY,
-    float defaultZ,
-    float& xOut,
-    float& yOut,
-    float& zOut
-) {
-    std::wostringstream initial;
-    initial << std::fixed << std::setprecision(3) << defaultX << L" " << defaultY << L" " << defaultZ;
-    std::wstring value = initial.str();
-    if (!askString(title, L"World position (X Y Z):", value, value)) return false;
-
-    std::wistringstream stream(value);
-    float x = 0.0f;
-    float y = 0.0f;
-    float z = 0.0f;
-    if (!(stream >> x >> y >> z) || !std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
-        MessageBoxW(gMainWindow,
-                    L"Enter three finite numbers separated by spaces, for example:\r\n\r\n125.0 -42.5 8.0",
-                    title,
-                    MB_ICONERROR);
-        return false;
-    }
-    xOut = x;
-    yOut = y;
-    zOut = z;
-    return true;
-}
 
 static void selectNewestArchivePlacement(uint32_t resourceId, float x, float y, float z) {
     const auto& placements = gArchiveBrowser.placements();
@@ -12453,7 +12511,6 @@ static void placeSelectedArchiveResource() {
     float x = defaultX;
     float y = defaultY;
     float z = defaultZ;
-    if (!askArchivePlacementPosition(L"Place Resource", defaultX, defaultY, defaultZ, x, y, z)) return;
 
     std::string report;
     std::string error;
@@ -12465,9 +12522,10 @@ static void placeSelectedArchiveResource() {
     populateArchiveList();
     rebuildArchiveResourceScrollLists();
     selectNewestArchivePlacement(resourceId, x, y, z);
+    viewSelectedInRenderer();
     setDetails(widen(report));
     setStatus(L"Placed " + widen(gArchiveBrowser.resourceDisplayName(resourceId)) +
-              L". Use Place Resource again for another instance, then Save LVZ + IMG.");
+              L". Drag the red/green/blue XYZ gizmo in the viewport to position it, then Save.");
     refreshModeUi();
     InvalidateRect(gPreview, nullptr, FALSE);
 }
@@ -12484,7 +12542,6 @@ static void duplicateSelectedArchivePlacement() {
     float x = source.x + 2.0f;
     float y = source.y;
     float z = source.z;
-    if (!askArchivePlacementPosition(L"Duplicate Placement", x, y, z, x, y, z)) return;
 
     std::string report;
     std::string error;
@@ -12496,8 +12553,10 @@ static void duplicateSelectedArchivePlacement() {
     populateArchiveList();
     rebuildArchiveResourceScrollLists();
     selectNewestArchivePlacement(source.resourceIndex, x, y, z);
+    viewSelectedInRenderer();
     setDetails(widen(report));
-    setStatus(L"Duplicated placement of " + widen(gArchiveBrowser.resourceDisplayName(source.resourceIndex)) + L".");
+    setStatus(L"Duplicated placement of " + widen(gArchiveBrowser.resourceDisplayName(source.resourceIndex)) +
+              L". Drag the XYZ gizmo to move the new copy.");
     refreshModeUi();
     InvalidateRect(gPreview, nullptr, FALSE);
 }
@@ -12691,16 +12750,84 @@ static void replaceSelectedArchiveResourceFromFile() {
     refreshModeUi();
 }
 
+static void createDirForCurrentLvzImg() {
+    if (gMode != StorylandMode::ArchiveFile || !gArchiveBrowser.hasLvzContext() ||
+        !gArchiveBrowser.hasImgContext()) {
+        MessageBoxW(gMainWindow, L"Open an LVZ + IMG pair first.", L"Create .DIR", MB_ICONINFORMATION);
+        return;
+    }
+
+    const auto& entries = gArchiveBrowser.entries();
+    if (entries.empty()) {
+        MessageBoxW(gMainWindow, L"There are no archive entries to write.", L"Create .DIR", MB_ICONWARNING);
+        return;
+    }
+
+    std::vector<uint8_t> dirBytes;
+    dirBytes.reserve(entries.size() * 32u);
+
+    auto appendU32 = [&dirBytes](uint32_t value) {
+        dirBytes.push_back(uint8_t(value & 0xFFu));
+        dirBytes.push_back(uint8_t((value >> 8u) & 0xFFu));
+        dirBytes.push_back(uint8_t((value >> 16u) & 0xFFu));
+        dirBytes.push_back(uint8_t((value >> 24u) & 0xFFu));
+    };
+
+    size_t written = 0u;
+    for (size_t i = 0u; i < entries.size(); ++i) {
+        const StorylandArchiveEntry& entry = entries[i];
+        if (entry.sectorCount == 0u) continue;
+
+        appendU32(entry.startSector);
+        appendU32(entry.sectorCount);
+
+        std::string name = entry.name;
+        if (name.empty()) name = "entry" + std::to_string(i) + ".bin";
+        if (name.size() > 23u) name.resize(23u);
+
+        const size_t nameStart = dirBytes.size();
+        dirBytes.resize(nameStart + 24u, 0u);
+        std::copy(name.begin(), name.end(), dirBytes.begin() + nameStart);
+        ++written;
+    }
+
+    if (written == 0u) {
+        MessageBoxW(gMainWindow, L"There are no usable archive entries to write.", L"Create .DIR", MB_ICONWARNING);
+        return;
+    }
+
+    std::wstring initialPath = getDirectoryPart(gArchiveBrowser.lvzPath()) +
+        getFileStemPart(gArchiveBrowser.lvzPath()) + L".dir";
+    std::wstring outputPath = saveFileDialogWithInitial(
+        L"GTA Stories DIR\0*.dir\0All files\0*.*\0",
+        L"dir",
+        initialPath);
+    if (outputPath.empty()) return;
+
+    std::string error;
+    if (!writeWholeFileBinary(outputPath, dirBytes, error)) {
+        MessageBoxW(gMainWindow, widen(error).c_str(), L"Create .DIR failed", MB_ICONERROR);
+        return;
+    }
+
+    setStatus(L"Created .DIR: " + outputPath);
+    MessageBoxW(
+        gMainWindow,
+        (L"Created " + std::to_wstring(written) + L" entries.\n\n" + outputPath).c_str(),
+        L".DIR created",
+        MB_ICONINFORMATION);
+}
+
 static void testCurrentLvzImgPair() {
     if (gMode != StorylandMode::ArchiveFile || !gArchiveBrowser.hasLvzContext() || !gArchiveBrowser.hasImgContext()) {
-        MessageBoxW(gMainWindow, L"Open an LVZ + IMG pair first.", L"Test LVZ/IMG Pair", MB_ICONINFORMATION);
+        MessageBoxW(gMainWindow, L"Open an LVZ + IMG pair first.", L"Check Archive", MB_ICONINFORMATION);
         return;
     }
     std::string report;
     std::string error;
     if (!gArchiveBrowser.validateLvzImgPair(report, error)) {
         setDetails(widen(error));
-        MessageBoxW(gMainWindow, L"LVZ/IMG pair test failed. The detailed report is shown in the lower pane.", L"Test LVZ/IMG Pair", MB_ICONERROR);
+        MessageBoxW(gMainWindow, L"Archive check failed. Details are shown below.", L"Check Archive", MB_ICONERROR);
         setStatus(L"LVZ/IMG test: FAIL");
         return;
     }
@@ -13289,7 +13416,7 @@ static void runCurrentModelTest() {
 
 static void exportLvzImgPair() {
     if (gMode != StorylandMode::ArchiveFile || !gArchiveBrowser.hasLvzContext() || !gArchiveBrowser.hasImgContext()) {
-        MessageBoxW(gMainWindow, L"Open a retail LVZ+IMG pair first.", L"Storyland", MB_ICONINFORMATION);
+        MessageBoxW(gMainWindow, L"Open an LVZ + IMG pair first.", L"Storyland", MB_ICONINFORMATION);
         return;
     }
 
@@ -13330,7 +13457,7 @@ static void exportLvzImgPair() {
 
 static void overwriteCurrentLvzImgPair() {
     if (gMode != StorylandMode::ArchiveFile || !gArchiveBrowser.hasLvzContext() || !gArchiveBrowser.hasImgContext()) {
-        MessageBoxW(gMainWindow, L"Open a retail LVZ+IMG pair first.", L"Storyland", MB_ICONINFORMATION);
+        MessageBoxW(gMainWindow, L"Open an LVZ + IMG pair first.", L"Storyland", MB_ICONINFORMATION);
         return;
     }
 
@@ -14398,8 +14525,99 @@ static bool projectArchiveViewportPoint(
     return true;
 }
 
+static float pointSegmentDistanceSquared(int px, int py, int ax, int ay, int bx, int by) {
+    const float vx = float(bx - ax);
+    const float vy = float(by - ay);
+    const float wx = float(px - ax);
+    const float wy = float(py - ay);
+    const float lengthSquared = vx * vx + vy * vy;
+    if (lengthSquared <= 0.0001f) {
+        const float dx = float(px - ax);
+        const float dy = float(py - ay);
+        return dx * dx + dy * dy;
+    }
+    const float t = std::clamp((wx * vx + wy * vy) / lengthSquared, 0.0f, 1.0f);
+    const float dx = float(px) - (float(ax) + vx * t);
+    const float dy = float(py) - (float(ay) + vy * t);
+    return dx * dx + dy * dy;
+}
+
+static bool beginArchivePlacementGizmoDrag(int mouseX, int mouseY) {
+    if (gMode != StorylandMode::ArchiveFile ||
+        gSelectedKind != StorylandTreeKind::ArchivePlacement ||
+        gSelectedIndex < 0 ||
+        size_t(gSelectedIndex) >= gArchiveBrowser.placements().size() ||
+        !gArchivePlacementGizmoScreen.valid) {
+        return false;
+    }
+
+    int bestAxis = -1;
+    float bestDistance = 64.0f;
+    for (int axis = 0; axis < 3; ++axis) {
+        if (!gArchivePlacementGizmoScreen.axisValid[axis]) continue;
+        const float distance = pointSegmentDistanceSquared(
+            mouseX,
+            mouseY,
+            gArchivePlacementGizmoScreen.centerX,
+            gArchivePlacementGizmoScreen.centerY,
+            gArchivePlacementGizmoScreen.endX[axis],
+            gArchivePlacementGizmoScreen.endY[axis]);
+        if (distance < bestDistance) {
+            bestDistance = distance;
+            bestAxis = axis;
+        }
+    }
+    if (bestAxis < 0) return false;
+
+    const auto& placement = gArchiveBrowser.placements()[size_t(gSelectedIndex)];
+    gArchivePlacementGizmoPlacementIndex = gSelectedIndex;
+    gArchivePlacementGizmoMouseStart = {mouseX, mouseY};
+    gArchivePlacementGizmoStartX = placement.x;
+    gArchivePlacementGizmoStartY = placement.y;
+    gArchivePlacementGizmoStartZ = placement.z;
+    gArchivePlacementGizmoPreviewX = placement.x;
+    gArchivePlacementGizmoPreviewY = placement.y;
+    gArchivePlacementGizmoPreviewZ = placement.z;
+
+    const float screenDx = float(gArchivePlacementGizmoScreen.endX[bestAxis] - gArchivePlacementGizmoScreen.centerX);
+    const float screenDy = float(gArchivePlacementGizmoScreen.endY[bestAxis] - gArchivePlacementGizmoScreen.centerY);
+    const float screenLength = std::sqrt(screenDx * screenDx + screenDy * screenDy);
+    if (screenLength < 2.0f) return false;
+
+    gArchivePlacementGizmoScreenUnitX = screenDx / screenLength;
+    gArchivePlacementGizmoScreenUnitY = screenDy / screenLength;
+    gArchivePlacementGizmoWorldPerPixel = gArchivePlacementGizmoScreen.worldLength / screenLength;
+    gArchivePlacementGizmoAxis = bestAxis == 0 ? ArchivePlacementGizmoAxis::X :
+                                 bestAxis == 1 ? ArchivePlacementGizmoAxis::Y :
+                                                 ArchivePlacementGizmoAxis::Z;
+    gArchivePlacementGizmoDragging = true;
+    return true;
+}
+
+static void updateArchivePlacementGizmoDrag(int mouseX, int mouseY) {
+    if (!gArchivePlacementGizmoDragging) return;
+    const float dx = float(mouseX - gArchivePlacementGizmoMouseStart.x);
+    const float dy = float(mouseY - gArchivePlacementGizmoMouseStart.y);
+    const float pixels = dx * gArchivePlacementGizmoScreenUnitX + dy * gArchivePlacementGizmoScreenUnitY;
+    const float worldDelta = pixels * gArchivePlacementGizmoWorldPerPixel;
+
+    gArchivePlacementGizmoPreviewX = gArchivePlacementGizmoStartX;
+    gArchivePlacementGizmoPreviewY = gArchivePlacementGizmoStartY;
+    gArchivePlacementGizmoPreviewZ = gArchivePlacementGizmoStartZ;
+    if (gArchivePlacementGizmoAxis == ArchivePlacementGizmoAxis::X) gArchivePlacementGizmoPreviewX += worldDelta;
+    else if (gArchivePlacementGizmoAxis == ArchivePlacementGizmoAxis::Y) gArchivePlacementGizmoPreviewY += worldDelta;
+    else if (gArchivePlacementGizmoAxis == ArchivePlacementGizmoAxis::Z) gArchivePlacementGizmoPreviewZ += worldDelta;
+}
+
+static void clearArchivePlacementGizmoDrag() {
+    gArchivePlacementGizmoDragging = false;
+    gArchivePlacementGizmoAxis = ArchivePlacementGizmoAxis::None;
+    gArchivePlacementGizmoPlacementIndex = -1;
+}
+
 static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
     gArchiveViewportPicks.clear();
+    gArchivePlacementGizmoScreen.valid = false;
     if (!gOpenGlReady && !initializeOpenGlPreview(hwnd)) {
         FillRect(dc, &rc, reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1));
         TextOutW(dc, rc.left + 8, rc.top + 8, L"OpenGL init failed for LVZ/IMG preview", 38);
@@ -14498,12 +14716,10 @@ static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
         SwapBuffers(dc);
         wglMakeCurrent(nullptr, nullptr);
 
-        std::wstring title = L"OpenGL LVZ/AREA texture viewport  |  ";
+        std::wstring title = L"Texture  |  ";
         title += widen(texture.name);
         title += L"  |  " + std::to_wstring(texture.width) + L"x" + std::to_wstring(texture.height);
-        title += L"  |  bpp=" + std::to_wstring(texture.bpp);
-        title += L"  |  header=" + hexWide(texture.headerOffset, 6);
-        title += L"  |  no .DIR";
+        title += L"  |  " + std::to_wstring(texture.bpp) + L"bpp";
             return;
     }
 
@@ -14816,6 +15032,19 @@ static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
         uploadedArchiveTextures[materialId] = handle;
         return handle;
     };
+    auto materialNeedsFractionalAlpha = [&](uint32_t materialId) -> bool {
+        auto found = boundTextureByMaterial.find(materialId);
+        if (found == boundTextureByMaterial.end() || found->second == nullptr) return false;
+        const auto& rgba = found->second->rgba;
+        if (rgba.size() < 4u) return false;
+        const size_t pixelCount = rgba.size() / 4u;
+        size_t fractional = 0u;
+        for (size_t pixel = 0; pixel < pixelCount; ++pixel) {
+            const uint8_t alpha = rgba[pixel * 4u + 3u];
+            if (alpha > 8u && alpha < 247u) ++fractional;
+        }
+        return fractional >= std::max<size_t>(8u, pixelCount / 100u);
+    };
 
     // Leeds WRLD stores geometry in render passes.  Drawing every pass as opaque
     // geometry makes the night-light shells and alpha meshes look like enormous
@@ -14823,16 +15052,51 @@ static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
     // retail pass intent: opaque first, then no-z-write, transparent, and finally
     // night-only light geometry.  SUPERLOD/LOD were already excluded while
     // parsing the placement lists.
-    const bool worldNight = gStoriesSky.time() < 6.0f || gStoriesSky.time() >= 20.0f;
     auto placementRenderPhase = [&](const StorylandWorldPlacement& placement) -> int {
-        if (placement.passName == "LIGHTS") return worldNight ? 3 : -1;
+        // LIGHTS is a real WRLD mesh pass, not a GAME.DTZ 2DFX-only bucket.
+        // Keep it visible in the archive preview at all times; otherwise valid
+        // streamed geometry disappears completely during daytime preview.
+        if (placement.passName == "LIGHTS") return 3;
         if (placement.passName == "TRANSPARENT") return 2;
         if (placement.passName == "NOZWRITE") return 1;
         return 0;
     };
 
-    glEnable(GL_CULL_FACE);
-    glCullFace(GL_BACK);
+    auto placementDetailRank = [](const StorylandWorldPlacement& placement) -> int {
+        if (placement.passName == "SUPERLOD") return 1;
+        if (placement.passName == "LOD") return 2;
+        return 3;
+    };
+
+    // Keep LOD/SUPERLOD available as a visual fallback when the corresponding
+    // detailed instance does not have a decoded mesh.  When a renderable detail
+    // instance exists for the same IPL id, suppress the lower-detail copy to
+    // avoid z-fighting and double buildings.
+    using ArchiveLodKey = std::tuple<uint32_t, int32_t, int32_t, int32_t>;
+    auto archiveLodKey = [](const StorylandWorldPlacement& placement) -> ArchiveLodKey {
+        return {
+            placement.iplId,
+            int32_t(std::lround(placement.x * 2.0f)),
+            int32_t(std::lround(placement.y * 2.0f)),
+            int32_t(std::lround(placement.z * 2.0f))
+        };
+    };
+    std::map<ArchiveLodKey, int> bestRenderableRankByPlacement;
+    for (const StorylandWorldPlacement& placement : placements) {
+        const uint64_t key = (uint64_t(placement.sectorIndex) << 32) | uint64_t(placement.resourceIndex);
+        const auto found = meshByKey.find(key);
+        if (found == meshByKey.end() || found->second == nullptr || found->second->triangles.empty()) continue;
+        const int rank = placementDetailRank(placement);
+        const ArchiveLodKey lodKey = archiveLodKey(placement);
+        auto best = bestRenderableRankByPlacement.find(lodKey);
+        if (best == bestRenderableRankByPlacement.end() || rank > best->second) bestRenderableRankByPlacement[lodKey] = rank;
+    }
+
+    // Leeds streamed world geometry is not consistently wound once
+    // decoded into Storyland's preview meshes. Back-face culling therefore
+    // punches holes through otherwise valid buildings. Prefer complete preview
+    // coverage here over aggressive culling.
+    glDisable(GL_CULL_FACE);
     for (int renderPhase = 0; renderPhase < 4; ++renderPhase) {
         if (renderPhase == 0) {
             glDisable(GL_BLEND);
@@ -14841,9 +15105,12 @@ static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
             glDisable(GL_BLEND);
             glDepthMask(GL_FALSE);
         } else if (renderPhase == 2) {
-            glEnable(GL_BLEND);
-            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-            glDepthMask(GL_FALSE);
+            // Decide blend-vs-alpha-test per material below.  Many Leeds
+            // TRANSPARENT-pass meshes are cutout geometry; globally blending
+            // the whole pass made walls and roofs look ghosted.
+            glDisable(GL_BLEND);
+            glDisable(GL_ALPHA_TEST);
+            glDepthMask(GL_TRUE);
         } else {
             glEnable(GL_BLEND);
             glBlendFunc(GL_SRC_ALPHA, GL_ONE);
@@ -14853,9 +15120,12 @@ static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
         bool triangleBatchOpen = false;
         GLuint activeTexture = GLuint(-1);
         uint32_t activeMaterial = 0xFFFFFFFEu;
-        for (const auto& placement : placements) {
+        for (size_t placementIndex = 0; placementIndex < placements.size(); ++placementIndex) {
+            const StorylandWorldPlacement& placement = placements[placementIndex];
             if (gArchiveSoloResourceId >= 0) continue;
             if (placementRenderPhase(placement) != renderPhase) continue;
+            const auto bestRank = bestRenderableRankByPlacement.find(archiveLodKey(placement));
+            if (bestRank != bestRenderableRankByPlacement.end() && placementDetailRank(placement) < bestRank->second) continue;
             if (selectedSectorIndex >= 0 && int(placement.sectorIndex) != selectedSectorIndex) continue;
             uint64_t key = (uint64_t(placement.sectorIndex) << 32) | uint64_t(placement.resourceIndex);
             auto found = meshByKey.find(key);
@@ -14881,6 +15151,24 @@ static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
                     } else {
                         glDisable(GL_TEXTURE_2D);
                     }
+                    if (renderPhase == 2) {
+                        const bool fractionalAlpha = textureHandle != 0 && materialNeedsFractionalAlpha(desiredMaterial);
+                        if (fractionalAlpha) {
+                            glDisable(GL_ALPHA_TEST);
+                            glEnable(GL_BLEND);
+                            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                            glDepthMask(GL_FALSE);
+                        } else {
+                            glDisable(GL_BLEND);
+                            glDepthMask(GL_TRUE);
+                            if (textureHandle != 0) {
+                                glEnable(GL_ALPHA_TEST);
+                                glAlphaFunc(GL_GREATER, 0.08f);
+                            } else {
+                                glDisable(GL_ALPHA_TEST);
+                            }
+                        }
+                    }
                     glBegin(GL_TRIANGLES);
                     triangleBatchOpen = true;
                 }
@@ -14890,9 +15178,12 @@ static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
                 float r = 0.30f + float((seed * 37u + 31u) & 0x7Fu) / 255.0f;
                 float g = 0.30f + float((seed * 67u + 91u) & 0x7Fu) / 255.0f;
                 float b = 0.30f + float((seed * 97u + 17u) & 0x7Fu) / 255.0f;
-                const float fallbackAlpha = renderPhase == 2 ? 0.45f : (renderPhase == 3 ? 0.70f : 1.0f);
+                // If a material has no decoded texture, do not make the entire
+                // fallback mesh translucent merely because it belongs to a
+                // transparent/no-z-write pass.  That produced ghost buildings.
+                const float fallbackAlpha = 1.0f;
                 if (isSelectedResource) {
-                    glColor4f(1.0f, 0.12f, 0.12f, renderPhase >= 2 ? 0.85f : 1.0f);
+                    glColor4f(1.0f, 0.12f, 0.12f, 1.0f);
                 } else if (textureHandle != 0) {
                     glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
                 } else {
@@ -14905,35 +15196,26 @@ static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
                     &mesh.vertices[tri.c]
                 };
 
-                // The retail sGeomInstance bounding sphere is authoritative for
-                // this placement.  A decoded strip can contain false tail data
-                // when the WRLD payload parser walks past the real packet end.
-                // Those false vertices are exactly what produce the remaining
-                // giant wedges/slabs even when the instance matrix itself is
-                // correct.  Do not draw a triangle if any transformed vertex
-                // falls materially outside the retail placement sphere.
+                // Draw the complete decoded triangle.  WRLD placement spheres are
+                // streaming/culling metadata, not reliable per-triangle clip volumes;
+                // using them as hard geometry bounds removes large portions of valid
+                // mainland meshes.
                 float transformed[3][3] = {};
-                bool triangleInsideRetailBound = true;
-                const float retailRadius = std::max(0.01f, std::fabs(placement.boundRadius));
-                const float retailLimit = retailRadius * 1.20f + 0.50f;
-                const float retailLimitSquared = retailLimit * retailLimit;
+                float gizmoDeltaX = 0.0f;
+                float gizmoDeltaY = 0.0f;
+                float gizmoDeltaZ = 0.0f;
+                if (gArchivePlacementGizmoDragging &&
+                    int(placementIndex) == gArchivePlacementGizmoPlacementIndex) {
+                    gizmoDeltaX = gArchivePlacementGizmoPreviewX - placement.x;
+                    gizmoDeltaY = gArchivePlacementGizmoPreviewY - placement.y;
+                    gizmoDeltaZ = gArchivePlacementGizmoPreviewZ - placement.z;
+                }
                 for (int vertexIndex = 0; vertexIndex < 3; ++vertexIndex) {
                     const StorylandWorldMeshVertex* vertex = verts[vertexIndex];
-                    const float wx = placement.matrix[0] * vertex->x + placement.matrix[4] * vertex->y + placement.matrix[8]  * vertex->z + placement.matrix[12];
-                    const float wy = placement.matrix[1] * vertex->x + placement.matrix[5] * vertex->y + placement.matrix[9]  * vertex->z + placement.matrix[13];
-                    const float wz = placement.matrix[2] * vertex->x + placement.matrix[6] * vertex->y + placement.matrix[10] * vertex->z + placement.matrix[14];
-                    transformed[vertexIndex][0] = wx;
-                    transformed[vertexIndex][1] = wy;
-                    transformed[vertexIndex][2] = wz;
-                    const float dx = wx - placement.boundX;
-                    const float dy = wy - placement.boundY;
-                    const float dz = wz - placement.boundZ;
-                    if (dx * dx + dy * dy + dz * dz > retailLimitSquared) {
-                        triangleInsideRetailBound = false;
-                        break;
-                    }
+                    transformed[vertexIndex][0] = placement.matrix[0] * vertex->x + placement.matrix[4] * vertex->y + placement.matrix[8]  * vertex->z + placement.matrix[12] + gizmoDeltaX;
+                    transformed[vertexIndex][1] = placement.matrix[1] * vertex->x + placement.matrix[5] * vertex->y + placement.matrix[9]  * vertex->z + placement.matrix[13] + gizmoDeltaY;
+                    transformed[vertexIndex][2] = placement.matrix[2] * vertex->x + placement.matrix[6] * vertex->y + placement.matrix[10] * vertex->z + placement.matrix[14] + gizmoDeltaZ;
                 }
-                if (!triangleInsideRetailBound) continue;
 
                 for (int vertexIndex = 0; vertexIndex < 3; ++vertexIndex) {
                     if (textureHandle != 0) glTexCoord2f(verts[vertexIndex]->u, verts[vertexIndex]->v);
@@ -14947,6 +15229,7 @@ static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
     }
     glDepthMask(GL_TRUE);
     glDisable(GL_BLEND);
+    glDisable(GL_ALPHA_TEST);
     glDisable(GL_TEXTURE_2D);
     glDisable(GL_CULL_FACE);
 
@@ -15022,6 +15305,77 @@ static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
         }
         glEnd();
         glPointSize(1.0f);
+    }
+
+    if (gSelectedKind == StorylandTreeKind::ArchivePlacement &&
+        gSelectedIndex >= 0 && size_t(gSelectedIndex) < placements.size()) {
+        const StorylandWorldPlacement& selectedPlacement = placements[size_t(gSelectedIndex)];
+        float gizmoX = selectedPlacement.x;
+        float gizmoY = selectedPlacement.y;
+        float gizmoZ = selectedPlacement.z;
+        if (gArchivePlacementGizmoDragging && gArchivePlacementGizmoPlacementIndex == gSelectedIndex) {
+            gizmoX = gArchivePlacementGizmoPreviewX;
+            gizmoY = gArchivePlacementGizmoPreviewY;
+            gizmoZ = gArchivePlacementGizmoPreviewZ;
+        }
+
+        const float gizmoLength = std::clamp(largestSpan * 0.08f, 2.0f, 40.0f);
+        int centerScreenX = 0;
+        int centerScreenY = 0;
+        float centerDepth = 1.0f;
+        if (projectArchiveViewportPoint(gizmoX, gizmoY, gizmoZ,
+                                        pickModel, pickProjection, pickViewport,
+                                        centerScreenX, centerScreenY, centerDepth)) {
+            gArchivePlacementGizmoScreen.valid = true;
+            gArchivePlacementGizmoScreen.centerX = centerScreenX;
+            gArchivePlacementGizmoScreen.centerY = centerScreenY;
+            gArchivePlacementGizmoScreen.worldLength = gizmoLength;
+            for (int axis = 0; axis < 3; ++axis) gArchivePlacementGizmoScreen.axisValid[axis] = false;
+
+            const float axisEnd[3][3] = {
+                {gizmoX + gizmoLength, gizmoY, gizmoZ},
+                {gizmoX, gizmoY + gizmoLength, gizmoZ},
+                {gizmoX, gizmoY, gizmoZ + gizmoLength}
+            };
+            for (int axis = 0; axis < 3; ++axis) {
+                float axisDepth = 1.0f;
+                int axisX = 0;
+                int axisY = 0;
+                if (projectArchiveViewportPoint(axisEnd[axis][0], axisEnd[axis][1], axisEnd[axis][2],
+                                                pickModel, pickProjection, pickViewport,
+                                                axisX, axisY, axisDepth)) {
+                    gArchivePlacementGizmoScreen.endX[axis] = axisX;
+                    gArchivePlacementGizmoScreen.endY[axis] = axisY;
+                    gArchivePlacementGizmoScreen.axisValid[axis] = true;
+                }
+            }
+
+            glDisable(GL_TEXTURE_2D);
+            glDisable(GL_BLEND);
+            glDisable(GL_CULL_FACE);
+            glDisable(GL_DEPTH_TEST);
+            glLineWidth(4.0f);
+            glBegin(GL_LINES);
+            glColor3f(0.92f, 0.18f, 0.18f);
+            glVertex3f(gizmoX, gizmoY, gizmoZ);
+            glVertex3f(gizmoX + gizmoLength, gizmoY, gizmoZ);
+            glColor3f(0.20f, 0.85f, 0.30f);
+            glVertex3f(gizmoX, gizmoY, gizmoZ);
+            glVertex3f(gizmoX, gizmoY + gizmoLength, gizmoZ);
+            glColor3f(0.20f, 0.45f, 0.95f);
+            glVertex3f(gizmoX, gizmoY, gizmoZ);
+            glVertex3f(gizmoX, gizmoY, gizmoZ + gizmoLength);
+            glEnd();
+            glPointSize(9.0f);
+            glBegin(GL_POINTS);
+            glColor3f(0.92f, 0.18f, 0.18f); glVertex3f(gizmoX + gizmoLength, gizmoY, gizmoZ);
+            glColor3f(0.20f, 0.85f, 0.30f); glVertex3f(gizmoX, gizmoY + gizmoLength, gizmoZ);
+            glColor3f(0.20f, 0.45f, 0.95f); glVertex3f(gizmoX, gizmoY, gizmoZ + gizmoLength);
+            glEnd();
+            glPointSize(1.0f);
+            glLineWidth(1.0f);
+            glEnable(GL_DEPTH_TEST);
+        }
     }
 
     drawOpenGlViewCube(hwnd, dc, width, height);
@@ -16167,8 +16521,9 @@ static void drawDtzLeeds2dfxPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
     size_t drawnAreaTriangles = 0;
     size_t drawnTexturedTriangles = 0;
     glDisable(GL_BLEND);
-    glEnable(GL_CULL_FACE);
-    glCullFace(GL_BACK);
+    // Use the same no-cull policy as the standalone LVZ+IMG preview so
+    // mixed-winding retail strips do not disappear when you orbit the map.
+    glDisable(GL_CULL_FACE);
 
     for (size_t areaIndex = 0; areaIndex < areaBrowsers.size(); ++areaIndex) {
         const StorylandArchiveBrowser* browser = areaBrowsers[areaIndex];
@@ -16214,13 +16569,39 @@ static void drawDtzLeeds2dfxPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
         // Render WRLD pass classes with the same intent as the standalone
         // LVZ+IMG viewport.  In particular, LIGHTS is a night-only geometry
         // pass and TRANSPARENT must not be drawn as opaque world geometry.
-        const bool areaNight = gStoriesSky.time() < 6.0f || gStoriesSky.time() >= 20.0f;
         auto placementRenderPhase = [&](const StorylandWorldPlacement& placement) -> int {
-            if (placement.passName == "LIGHTS") return areaNight ? 3 : -1;
+            // Match the standalone LVZ+IMG preview: LIGHTS is streamed mesh
+            // geometry and must not vanish just because the preview clock is day.
+            if (placement.passName == "LIGHTS") return 3;
             if (placement.passName == "TRANSPARENT") return 2;
             if (placement.passName == "NOZWRITE") return 1;
             return 0;
         };
+
+        auto placementDetailRank = [](const StorylandWorldPlacement& placement) -> int {
+            if (placement.passName == "SUPERLOD") return 1;
+            if (placement.passName == "LOD") return 2;
+            return 3;
+        };
+        using AreaLodKey = std::tuple<uint32_t, int32_t, int32_t, int32_t>;
+        auto areaLodKey = [](const StorylandWorldPlacement& placement) -> AreaLodKey {
+            return {
+                placement.iplId,
+                int32_t(std::lround(placement.x * 2.0f)),
+                int32_t(std::lround(placement.y * 2.0f)),
+                int32_t(std::lround(placement.z * 2.0f))
+            };
+        };
+        std::map<AreaLodKey, int> bestRenderableRankByPlacement;
+        for (const StorylandWorldPlacement& placement : browser->placements()) {
+            const uint64_t key = (uint64_t(placement.sectorIndex) << 32) | placement.resourceIndex;
+            const auto found = meshByKey.find(key);
+            if (found == meshByKey.end() || found->second == nullptr || found->second->triangles.empty()) continue;
+            const int rank = placementDetailRank(placement);
+            const AreaLodKey lodKey = areaLodKey(placement);
+            auto best = bestRenderableRankByPlacement.find(lodKey);
+            if (best == bestRenderableRankByPlacement.end() || rank > best->second) bestRenderableRankByPlacement[lodKey] = rank;
+        }
 
         for (int renderPhase = 0; renderPhase < 4; ++renderPhase) {
             if (renderPhase == 0) {
@@ -16245,6 +16626,8 @@ static void drawDtzLeeds2dfxPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
 
             for (const auto& placement : browser->placements()) {
                 if (placementRenderPhase(placement) != renderPhase) continue;
+                const auto bestRank = bestRenderableRankByPlacement.find(areaLodKey(placement));
+                if (bestRank != bestRenderableRankByPlacement.end() && placementDetailRank(placement) < bestRank->second) continue;
                 const uint64_t key = (uint64_t(placement.sectorIndex) << 32) | placement.resourceIndex;
                 const auto found = meshByKey.find(key);
                 if (found == meshByKey.end() || found->second == nullptr) continue;
@@ -16282,7 +16665,7 @@ static void drawDtzLeeds2dfxPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
                         const uint32_t seed = triangle.textureId == 0xFFFFFFFFu
                             ? placement.resourceIndex : triangle.textureId;
                         const float tint = areaIndex == 0 ? 0.07f : (areaIndex == 1 ? 0.0f : 0.12f);
-                        const float alpha = renderPhase == 2 ? 0.45f : (renderPhase == 3 ? 0.70f : 1.0f);
+                        const float alpha = 1.0f;
                         glColor4f(0.32f + float((seed * 37u + 31u) & 0x7Fu) / 255.0f + tint,
                                   0.32f + float((seed * 67u + 91u) & 0x7Fu) / 255.0f + tint,
                                   0.32f + float((seed * 97u + 17u) & 0x7Fu) / 255.0f,
@@ -16296,27 +16679,12 @@ static void drawDtzLeeds2dfxPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
                     };
 
                     float transformed[3][3] = {};
-                    bool triangleInsideRetailBound = true;
-                    const float retailRadius = std::max(0.01f, std::fabs(placement.boundRadius));
-                    const float retailLimit = retailRadius * 1.20f + 0.50f;
-                    const float retailLimitSquared = retailLimit * retailLimit;
                     for (int vertexIndex = 0; vertexIndex < 3; ++vertexIndex) {
                         const StorylandWorldMeshVertex* vertex = vertices[vertexIndex];
-                        const float wx = placement.matrix[0] * vertex->x + placement.matrix[4] * vertex->y + placement.matrix[8]  * vertex->z + placement.matrix[12];
-                        const float wy = placement.matrix[1] * vertex->x + placement.matrix[5] * vertex->y + placement.matrix[9]  * vertex->z + placement.matrix[13];
-                        const float wz = placement.matrix[2] * vertex->x + placement.matrix[6] * vertex->y + placement.matrix[10] * vertex->z + placement.matrix[14];
-                        transformed[vertexIndex][0] = wx;
-                        transformed[vertexIndex][1] = wy;
-                        transformed[vertexIndex][2] = wz;
-                        const float dx = wx - placement.boundX;
-                        const float dy = wy - placement.boundY;
-                        const float dz = wz - placement.boundZ;
-                        if (dx * dx + dy * dy + dz * dz > retailLimitSquared) {
-                            triangleInsideRetailBound = false;
-                            break;
-                        }
+                        transformed[vertexIndex][0] = placement.matrix[0] * vertex->x + placement.matrix[4] * vertex->y + placement.matrix[8]  * vertex->z + placement.matrix[12];
+                        transformed[vertexIndex][1] = placement.matrix[1] * vertex->x + placement.matrix[5] * vertex->y + placement.matrix[9]  * vertex->z + placement.matrix[13];
+                        transformed[vertexIndex][2] = placement.matrix[2] * vertex->x + placement.matrix[6] * vertex->y + placement.matrix[10] * vertex->z + placement.matrix[14];
                     }
-                    if (!triangleInsideRetailBound) continue;
 
                     for (int vertexIndex = 0; vertexIndex < 3; ++vertexIndex) {
                         if (textureHandle != 0) glTexCoord2f(vertices[vertexIndex]->u, vertices[vertexIndex]->v);
@@ -16547,6 +16915,12 @@ static LRESULT CALLBACK previewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         EndPaint(hwnd, &ps);
         return 0;
     }
+    if (msg == WM_KEYDOWN && wParam == VK_ESCAPE && gArchivePlacementGizmoDragging) {
+        clearArchivePlacementGizmoDrag();
+        InvalidateRect(hwnd, nullptr, FALSE);
+        setStatus(L"Placement gizmo move cancelled.");
+        return 0;
+    }
     if (msg == WM_KEYDOWN && wParam == VK_SPACE && currentModeUsesInteractiveModelViewport()) {
         resetModelViewport();
         InvalidateRect(hwnd, nullptr, FALSE);
@@ -16555,6 +16929,16 @@ static LRESULT CALLBACK previewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     }
     if (msg == WM_KEYDOWN && handleModelViewportShortcut(wParam)) {
         return 0;
+    }
+    if (msg == WM_LBUTTONDOWN && gMode == StorylandMode::ArchiveFile) {
+        const int mouseX = GET_X_LPARAM(lParam);
+        const int mouseY = GET_Y_LPARAM(lParam);
+        if (beginArchivePlacementGizmoDrag(mouseX, mouseY)) {
+            SetFocus(hwnd);
+            SetCapture(hwnd);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
     }
     if (msg == WM_LBUTTONDOWN && currentModeUsesInteractiveModelViewport()) {
         gModelLeftDrag = true;
@@ -16579,6 +16963,36 @@ static LRESULT CALLBACK previewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         gModelMouseDownPoint = gModelLastMouse;
         SetFocus(hwnd);
         SetCapture(hwnd);
+        return 0;
+    }
+    if (msg == WM_LBUTTONUP && gArchivePlacementGizmoDragging) {
+        const int placementIndex = gArchivePlacementGizmoPlacementIndex;
+        const float x = gArchivePlacementGizmoPreviewX;
+        const float y = gArchivePlacementGizmoPreviewY;
+        const float z = gArchivePlacementGizmoPreviewZ;
+        uint32_t resourceId = 0u;
+        if (placementIndex >= 0 && size_t(placementIndex) < gArchiveBrowser.placements().size()) {
+            resourceId = gArchiveBrowser.placements()[size_t(placementIndex)].resourceIndex;
+        }
+        clearArchivePlacementGizmoDrag();
+        ReleaseCapture();
+
+        std::string moveReport;
+        std::string moveError;
+        if (placementIndex < 0 ||
+            !gArchiveBrowser.moveWorldPlacement(size_t(placementIndex), x, y, z, moveReport, moveError)) {
+            MessageBoxW(gMainWindow, widen(moveError).c_str(), L"Move Placement failed", MB_ICONERROR);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+
+        populateArchiveList();
+        rebuildArchiveResourceScrollLists();
+        selectNewestArchivePlacement(resourceId, x, y, z);
+        setDetails(widen(moveReport));
+        setStatus(L"Placement moved with the XYZ gizmo. Save to write the LVZ + IMG pair.");
+        refreshModeUi();
+        InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     }
     if ((msg == WM_LBUTTONUP || msg == WM_RBUTTONUP) && currentModeUsesInteractiveModelViewport()) {
@@ -16606,6 +17020,11 @@ static LRESULT CALLBACK previewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             }
         }
         if (!gModelLeftDrag && !gModelRightDrag) ReleaseCapture();
+        return 0;
+    }
+    if (msg == WM_MOUSEMOVE && gArchivePlacementGizmoDragging) {
+        updateArchivePlacementGizmoDrag(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+        InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     }
     if (msg == WM_MOUSEMOVE && currentModeUsesInteractiveModelViewport()) {
@@ -16665,6 +17084,59 @@ static void setStorylandWindowText(HWND hwnd, const wchar_t* text) {
     wchar_t current[256] = {};
     GetWindowTextW(hwnd, current, int(sizeof(current) / sizeof(current[0])));
     if (wcscmp(current, text) != 0) SetWindowTextW(hwnd, text);
+}
+
+static void updateArchiveCreateDirInlineButton() {
+    if (!gArchiveCreateDirInlineButton || !IsWindow(gArchiveCreateDirInlineButton) || !gMainWindow) return;
+
+    bool show = false;
+    if (gMode == StorylandMode::ArchiveFile &&
+        gArchiveBrowser.hasLvzContext() &&
+        gTree && IsWindow(gTree) && IsWindowVisible(gTree) &&
+        gArchiveCreateDirSpacerItem != nullptr) {
+        RECT itemRect{};
+        if (TreeView_GetItemRect(gTree, gArchiveCreateDirSpacerItem, &itemRect, TRUE)) {
+            RECT treeClient{};
+            GetClientRect(gTree, &treeClient);
+            const int itemHeight = itemRect.bottom - itemRect.top;
+            if (itemRect.bottom > treeClient.top && itemRect.top < treeClient.bottom && itemHeight > 4) {
+                POINT topLeft{itemRect.left, itemRect.top};
+                ClientToScreen(gTree, &topLeft);
+                ScreenToClient(gMainWindow, &topLeft);
+
+                RECT treeWindow{};
+                GetWindowRect(gTree, &treeWindow);
+                POINT treeTopLeft{treeWindow.left, treeWindow.top};
+                ScreenToClient(gMainWindow, &treeTopLeft);
+                const int treeWidth = std::max(0, static_cast<int>(treeWindow.right - treeWindow.left));
+
+                const int buttonX = treeTopLeft.x + 28;
+                const int buttonY = topLeft.y + std::max(0, (itemHeight - 24) / 2);
+                const int buttonWidth = std::clamp(treeWidth - 52, 120, 220);
+                RECT currentRect{};
+                GetWindowRect(gArchiveCreateDirInlineButton, &currentRect);
+                POINT currentTopLeft{currentRect.left, currentRect.top};
+                ScreenToClient(gMainWindow, &currentTopLeft);
+                const int currentWidth = static_cast<int>(currentRect.right - currentRect.left);
+                const int currentHeight = static_cast<int>(currentRect.bottom - currentRect.top);
+                const bool rectChanged = currentTopLeft.x != buttonX || currentTopLeft.y != buttonY ||
+                                         currentWidth != buttonWidth || currentHeight != 24;
+                if (rectChanged) {
+                    MoveWindow(gArchiveCreateDirInlineButton, buttonX, buttonY, buttonWidth, 24, FALSE);
+                }
+                const bool wasVisible = IsWindowVisible(gArchiveCreateDirInlineButton) != FALSE;
+                SetWindowPos(gArchiveCreateDirInlineButton, HWND_TOP, buttonX, buttonY, buttonWidth, 24,
+                             SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                if (!wasVisible || rectChanged) {
+                    RedrawWindow(gArchiveCreateDirInlineButton, nullptr, nullptr,
+                                 RDW_INVALIDATE | RDW_UPDATENOW | RDW_FRAME);
+                }
+                show = true;
+            }
+        }
+    }
+
+    setStorylandWindowVisible(gArchiveCreateDirInlineButton, show);
 }
 
 static void updateActionBar() {
@@ -16739,19 +17211,22 @@ static void updateActionBar() {
         if (haveTexture) {
             primaryText = L"Export Texture...";
             secondaryText = L"Replace Texture...";
-            tertiaryText = L"Test LVZ/IMG";
+            tertiaryText = L"Check Archive";
         } else {
             primaryText = L"Add Resource...";
             if (haveModel) {
                 secondaryText = L"Place Resource...";
                 tertiaryText = L"Replace Model...";
-            } else {
+            } else if (haveEntry) {
                 secondaryText = L"Replace Resource...";
-                tertiaryText = L"Test LVZ/IMG";
+                tertiaryText = L"Check Archive";
+            } else {
+                secondaryText = L"No .DIR, create one?";
+                tertiaryText = L"Check Archive";
             }
         }
-        quaternaryText = L"Save LVZ + IMG";
-        enableSecondary = haveEntry || haveTexture || haveModel;
+        quaternaryText = L"Save";
+        enableSecondary = true;
     } else if (gMode == StorylandMode::MediaFile) {
         showBar = true;
         showPrimary = showSecondary = true;
@@ -16784,6 +17259,7 @@ static void updateActionBar() {
         setStorylandWindowVisible(gMediaTimeline, false);
     }
     setStorylandWindowVisible(gActionBar, showBar);
+    updateArchiveCreateDirInlineButton();
 }
 
 static void refreshModeUi() {
@@ -17049,6 +17525,7 @@ static void layoutChildren(HWND hwnd) {
         detailsBottom
     };
     storylandMoveWindowToRect(gDetails, detailsRect);
+    updateArchiveCreateDirInlineButton();
 
     // Repaint only the newly exposed parent background. Child controls repaint
     // themselves when needed; invalidating every child here made the owner-drawn
@@ -17645,7 +18122,7 @@ static bool buildTreeContextMenu(HMENU menu) {
             hasItems = addAnalyzeSubmenu(menu, resourceNameSupportsAnalyzeGraph(resourceName)) || hasItems;
             if (gArchiveBrowser.hasLvzContext()) {
                 AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-                hasItems = addContextMenuItem(menu, ID_ARCHIVE_REPLACE_SELECTED_RESOURCE, L"Replace selected LVZ+IMG resource...") || hasItems;
+                hasItems = addContextMenuItem(menu, ID_ARCHIVE_REPLACE_SELECTED_RESOURCE, L"Replace Resource...") || hasItems;
             }
         } else if (gSelectedKind == StorylandTreeKind::ArchiveMeshResource) {
             hasItems = addContextMenuItem(menu, ID_ARCHIVE_PLACE_RESOURCE, L"Place Resource...") || hasItems;
@@ -17666,9 +18143,10 @@ static bool buildTreeContextMenu(HMENU menu) {
         if (gArchiveBrowser.hasLvzContext() && gArchiveBrowser.hasImgContext()) {
             if (hasItems) AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
             hasItems = addContextMenuItem(menu, ID_ARCHIVE_ADD_RESOURCE, L"Add Resource...") || hasItems;
-            hasItems = addContextMenuItem(menu, ID_ARCHIVE_TEST_LVZ_IMG_PAIR, L"Test LVZ/IMG Pair") || hasItems;
-            hasItems = addContextMenuItem(menu, ID_ARCHIVE_EXPORT_LVZ_IMG_PAIR, L"Rebuild LVZ + IMG As...") || hasItems;
-            hasItems = addContextMenuItem(menu, ID_ARCHIVE_OVERWRITE_LVZ_IMG_PAIR, L"Overwrite Current LVZ + IMG...") || hasItems;
+            hasItems = addContextMenuItem(menu, ID_ARCHIVE_CREATE_DIR, L"Create .DIR...") || hasItems;
+            hasItems = addContextMenuItem(menu, ID_ARCHIVE_TEST_LVZ_IMG_PAIR, L"Check Archive") || hasItems;
+            hasItems = addContextMenuItem(menu, ID_ARCHIVE_EXPORT_LVZ_IMG_PAIR, L"Save Copy...") || hasItems;
+            hasItems = addContextMenuItem(menu, ID_ARCHIVE_OVERWRITE_LVZ_IMG_PAIR, L"Save") || hasItems;
         }
     } else if (gMode == StorylandMode::MediaFile && gMediaFile.kind() == StorylandMediaKind::Video) {
         hasItems = addContextMenuItem(menu, ID_MEDIA_REPLACE_CURRENT_FRAME, L"Replace Current Frame Image...") || hasItems;
@@ -18757,6 +19235,7 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             WS_CHILD, 0, 0, 100, 28, hwnd,
             reinterpret_cast<HMENU>(ID_MENU_STRIP), gInstance, nullptr);
         gTree = createStorylandResourceTree(hwnd);
+        gArchiveCreateDirInlineButton = CreateWindowExW(0, L"BUTTON", L"No .DIR, create one?", WS_CHILD | WS_TABSTOP | WS_CLIPSIBLINGS | BS_OWNERDRAW, 0, 0, 170, 24, hwnd, reinterpret_cast<HMENU>(ID_ARCHIVE_CREATE_DIR_INLINE), gInstance, nullptr);
         WNDCLASSW previewClass = {};
         previewClass.lpfnWndProc = previewProc;
         previewClass.hInstance = gInstance;
@@ -18808,7 +19287,7 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         if (gUiFont) {
             const HWND controls[] = {
                 gTree, gDetails, gStatus,
-                gActionPrimary, gActionSecondary, gActionTertiary, gActionQuaternary
+                gActionPrimary, gActionSecondary, gActionTertiary, gActionQuaternary, gArchiveCreateDirInlineButton
             };
             for (HWND control : controls) {
                 if (control) SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(gUiFont), TRUE);
@@ -18823,6 +19302,7 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         ShowWindow(gPreview, SW_SHOW);
         ShowWindow(gDetails, SW_SHOW);
         ShowWindow(gStatus, SW_SHOW);
+        ShowWindow(gArchiveCreateDirInlineButton, SW_HIDE);
         gStoriesSkyLastTick = GetTickCount();
         SetTimer(hwnd, 2, 33, nullptr);
         SetTimer(hwnd, 3, 10, nullptr);
@@ -18868,20 +19348,31 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             (draw->CtlID == ID_ACTION_PRIMARY ||
              draw->CtlID == ID_ACTION_SECONDARY ||
              draw->CtlID == ID_ACTION_TERTIARY ||
-             draw->CtlID == ID_ACTION_QUATERNARY)) {
+             draw->CtlID == ID_ACTION_QUATERNARY ||
+             draw->CtlID == ID_ARCHIVE_CREATE_DIR_INLINE)) {
             const bool disabled = (draw->itemState & ODS_DISABLED) != 0;
             const bool pressed = (draw->itemState & ODS_SELECTED) != 0;
+            wchar_t buttonText[128] = {};
+            GetWindowTextW(draw->hwndItem, buttonText, int(sizeof(buttonText) / sizeof(buttonText[0])));
+            const bool createDirButton = wcscmp(buttonText, L"No .DIR, create one?") == 0;
             const COLORREF accent = storylandPaneBorderColor();
             const COLORREF base = gEyeFriendlyPaneBackground ? RGB(37, 40, 48) : RGB(250, 253, 255);
-            const COLORREF top = storylandBlendUiColor(base, accent,
-                pressed ? (gEyeFriendlyPaneBackground ? 35 : 40) : (gEyeFriendlyPaneBackground ? 12 : 10));
-            const COLORREF bottom = storylandBlendUiColor(base, accent,
-                pressed ? (gEyeFriendlyPaneBackground ? 48 : 69) : (gEyeFriendlyPaneBackground ? 27 : 34));
-            const COLORREF border = storylandBlendUiColor(base, accent,
-                gEyeFriendlyPaneBackground ? 67 : 79);
-            COLORREF textColor = gEyeFriendlyPaneBackground
-                ? (disabled ? RGB(119, 123, 132) : RGB(238, 239, 243))
-                : (disabled ? RGB(130, 150, 170) : RGB(24, 57, 91));
+            const COLORREF top = createDirButton
+                ? (pressed ? RGB(224, 224, 224) : RGB(255, 255, 255))
+                : storylandBlendUiColor(base, accent,
+                    pressed ? (gEyeFriendlyPaneBackground ? 35 : 40) : (gEyeFriendlyPaneBackground ? 12 : 10));
+            const COLORREF bottom = createDirButton
+                ? (pressed ? RGB(210, 210, 210) : RGB(245, 245, 245))
+                : storylandBlendUiColor(base, accent,
+                    pressed ? (gEyeFriendlyPaneBackground ? 48 : 69) : (gEyeFriendlyPaneBackground ? 27 : 34));
+            const COLORREF border = createDirButton
+                ? RGB(185, 185, 185)
+                : storylandBlendUiColor(base, accent, gEyeFriendlyPaneBackground ? 67 : 79);
+            COLORREF textColor = createDirButton
+                ? (disabled ? RGB(145, 145, 145) : RGB(24, 24, 24))
+                : (gEyeFriendlyPaneBackground
+                    ? (disabled ? RGB(119, 123, 132) : RGB(238, 239, 243))
+                    : (disabled ? RGB(130, 150, 170) : RGB(24, 57, 91)));
 
             const int drawWidth = std::max(1, static_cast<int>(draw->rcItem.right - draw->rcItem.left));
             const int drawHeight = std::max(1, static_cast<int>(draw->rcItem.bottom - draw->rcItem.top));
@@ -18917,8 +19408,6 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             SelectObject(paintDc, oldPen);
             DeleteObject(pen);
 
-            wchar_t text[128] = {};
-            GetWindowTextW(draw->hwndItem, text, int(sizeof(text) / sizeof(text[0])));
             RECT textRect = buttonRect;
             if (pressed) OffsetRect(&textRect, 1, 1);
             SetBkMode(paintDc, TRANSPARENT);
@@ -18927,7 +19416,7 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             HGDIOBJ oldFont = font ? SelectObject(paintDc, font) : nullptr;
             DrawTextW(
                 paintDc,
-                text,
+                buttonText,
                 -1,
                 &textRect,
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
@@ -18986,6 +19475,9 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             return 0;
         }
         if (wParam == 3) {
+            if (gMode == StorylandMode::ArchiveFile && gArchiveBrowser.hasLvzContext()) {
+                updateArchiveCreateDirInlineButton();
+            }
             if (gMode == StorylandMode::MediaFile && gMediaFile.kind() == StorylandMediaKind::Video && gMediaFile.isPlaying()) {
                 std::string mediaError;
                 if (!gMediaFile.tickVideo(mediaError)) {
@@ -19262,11 +19754,15 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             } else if (gMode == StorylandMode::DtzArchive && gDtzEmbeddedPreviewKind == DtzEmbeddedPreviewKind::TextureArchive) {
                 returnToGameDtz();
             } else if (gMode == StorylandMode::ArchiveFile && gArchiveBrowser.hasLvzContext()) {
-                if (gSelectedKind == StorylandTreeKind::ArchiveMeshResource ||
-                    gSelectedKind == StorylandTreeKind::ArchivePlacement) {
+                if (gSelectedKind == StorylandTreeKind::ArchiveDirectTexture) {
+                    replaceSelectedArchiveDirectTexture();
+                } else if (gSelectedKind == StorylandTreeKind::ArchiveMeshResource ||
+                           gSelectedKind == StorylandTreeKind::ArchivePlacement) {
                     placeSelectedArchiveResource();
-                } else {
+                } else if (gSelectedKind == StorylandTreeKind::ArchiveEntry) {
                     replaceSelectedArchiveResourceFromFile();
+                } else {
+                    createDirForCurrentLvzImg();
                 }
             } else if (gMode == StorylandMode::MediaFile) {
                 gMediaFile.stop();
@@ -19335,6 +19831,8 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         case ID_ARCHIVE_DUPLICATE_PLACEMENT: duplicateSelectedArchivePlacement(); break;
         case ID_ARCHIVE_EXPORT_DIRECT_TEXTURE: exportSelectedArchiveDirectTexture(); break;
         case ID_ARCHIVE_REPLACE_DIRECT_TEXTURE: replaceSelectedArchiveDirectTexture(); break;
+        case ID_ARCHIVE_CREATE_DIR:
+        case ID_ARCHIVE_CREATE_DIR_INLINE: createDirForCurrentLvzImg(); break;
         case ID_ARCHIVE_REPLACE_SELECTED_RESOURCE: replaceSelectedArchiveResourceFromFile(); break;
         case ID_ARCHIVE_REPLACE_MESH_WITH_RESOURCE_ID: replaceSelectedMeshResourceWithResourceId(); break;
         case ID_ARCHIVE_CHANGE_SELECTED_MESH_RESOURCE_ID: changeSelectedMeshResourceId(); break;
