@@ -18,6 +18,9 @@ Storyland is a modding suite for Leeds Engine/Renderware specific files; it curr
 - [X] Animation files ( .anim, .ifp)
   - [X] Import
   - [X] Export *
+- [x] Map files (.wrld, .wbl
+  - [X] Import
+  - [X] Export *
 - [X] IMG archives (.img + .lvz)
   - [X] Import *
   - [ ] Export
