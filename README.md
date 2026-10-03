@@ -2,28 +2,17 @@
 
 [![License](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
 
-Storyland is a modding suite for Leeds Engine/Renderware specific files; it currently is an analyzer, editor, and viewer for Grand Theft Auto Stories, Chinatown Wars, and Manhunt 2 file formats. It can inspect and edit CHK, XTX, TEX, MDL, DFF, IMG, LVZ, GAME.DTZ files, .ANIM, as well as more.
+Storyland is a modding suite for Leeds Engine/Renderware specific files; it is currently an analyzer, editor, and viewer for Grand Theft Auto Stories, Chinatown Wars, and Manhunt 2 file formats. It is also intended to support Chinatown Wars. It can inspect and edit CHK, XTX, TEX, MDL, DFF, IMG, LVZ, GAME.DTZ files, .ANIM, as well as more.
 
-- [ ] #### File Types
+#### File Types
 
 - [X] Model files (.mdl, .wbl)*
-  - [X] Import
-  - [x] Export *
-- [X] Texture Files (.chk, .xtx, .tex)
-  - [X] Import
-  - [x] Export *
-- [X] Collision files (.col2)
-  - [X] Import
-  - [X] Export *
-- [X] Animation files ( .anim, .ifp)
-  - [X] Import
-  - [X] Export *
-- [x] Map files (.wrld, .wbl
-  - [X] Import
-  - [X] Export *
-- [X] IMG archives (.img + .lvz)
-  - [X] Import *
-  - [ ] Export
+- [X] Texture Files (.chk, .xtx, .tex)*
+- [X] Collision files (.col2)*
+- [X] Map files (.wrld, .wbl)*
+- [X] ZLib files (.lvz, .dtz)*
+- [X] Archive files  (.img)
+- [X] Animation files (.anim)*
 
 * all of the above are currently experimental, meaning not all files have been tested yet.
 
