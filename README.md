@@ -19,6 +19,10 @@ Storyland is a modding suite for Leeds Engine/Renderware specific files; it is c
 
 * all of the above are currently experimental, meaning not all files have been tested yet.
 
+## Wiki
+
+For more information regarding formats, see the [BLeeds Wiki](https://github.com/spicybung/BLeeds/wiki).
+
 ## License
 
 This project is licensed under the GPL 3.0 License - see the [LICENSE](LICENSE) file for details.
