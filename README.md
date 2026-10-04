@@ -6,13 +6,16 @@ Storyland is a modding suite for Leeds Engine/Renderware specific files; it is c
 
 #### File Types
 
-- [X] Model files (.mdl, .wbl, .dff)*
-- [X] Texture Files (.chk, .xtx, .tex)*
+- [X] Model files (.mdl, .wbl, .dff)
+- [X] Texture Files (.chk, .xtx, .tex)
 - [X] Collision files (.col2)*
 - [X] Map files (.wrld, .wbl)*
 - [X] ZLib files (.lvz, .dtz, .zimg)*
-- [X] Archive files  (.img)
+- [X] Archive files  (.img)*
 - [X] Animation files (.anim, .ifp)*
+- [X] Video files (.pss)
+- [X] Audio files (.vb)
+- [X] Text files (.gxt)
 
 * all of the above are currently experimental, meaning not all files have been tested yet.
 
