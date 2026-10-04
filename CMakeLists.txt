@@ -6,6 +6,14 @@ project(Storyland VERSION 1.1.7 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+option(STORYLAND_GXT_TESTS_ONLY "Build portable GXT tests without Windows dependencies" OFF)
+if(STORYLAND_GXT_TESTS_ONLY)
+    enable_testing()
+    add_executable(gxt_tests tests/gxt_tests.cpp src/storyland/storyland_gxt.cpp)
+    target_include_directories(gxt_tests PRIVATE src/storyland)
+    add_test(NAME gxt_tests COMMAND gxt_tests)
+    return()
+endif()
 option(STORYLAND_ARCHIVE_TESTS_ONLY "Build portable archive inspection and parser tests without the Windows UI" OFF)
 if(STORYLAND_ARCHIVE_TESTS_ONLY)
     find_package(ZLIB REQUIRED)
@@ -131,6 +139,7 @@ add_executable(Storyland WIN32
     src/storyland/storyland_sky.cpp
     src/storyland/storyland_sky.h
     src/storyland/storyland_scm.cpp
+    src/storyland/storyland_gxt.cpp
     src/storyland/storyland_scm.h
     src/storyland/storyland_media.cpp
     src/storyland/storyland_media.h

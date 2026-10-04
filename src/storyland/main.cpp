@@ -55,6 +55,7 @@
 #include "storyland_anim.h"
 #include "storyland_sky.h"
 #include "storyland_scm.h"
+#include "storyland_gxt.h"
 #include "wic_image.h"
 #include "resource.h"
 
@@ -288,6 +289,14 @@ typedef void (APIENTRY *PFNGLACTIVETEXTUREPROC)(GLenum texture);
 #define ID_MEDIA_REPLACE_CURRENT_FRAME 1109
 #define ID_SCRIPT_NEW 2101
 #define ID_SCRIPT_OPEN 2102
+#define ID_GXT_EDIT 2200
+#define ID_GXT_FIND 2201
+#define ID_GXT_SAVE 2202
+#define ID_GXT_SAVE_AS 2203
+#define ID_GXT_TEXT 2204
+#define ID_GXT_LCS_FONT 2205
+#define ID_GXT_1252 2206
+#define ID_GXT_UNICODE 2207
 #define ID_SCRIPT_SAVE 2103
 #define ID_SCRIPT_RUN 2104
 #define ID_SCRIPT_EDITOR 2105
@@ -466,6 +475,7 @@ static std::vector<StorylandAreaArchive> gAreaArchives;
 static int gActiveAreaArchive = -1;
 static StorylandAnimFile gAnimFile;
 static StorylandScmFile gScmFile;
+static StorylandGxtFile gGxtFile;
 static StorylandMediaFile gMediaFile;
 static std::wstring gSannyBuilderPath;
 static RgbaImage gCurrentImage;
@@ -749,7 +759,7 @@ enum class StorylandPrelightViewMode { Combined, Raw, Off };
 static StorylandPrelightViewMode gPrelightViewMode = StorylandPrelightViewMode::Combined;
 static int gSelectedPrelightVertex = -1;
 
-static enum class StorylandMode { Empty, TextureArchive, DtzArchive, ModelFile, WblFile, ArchiveFile, AnimFile, ScmFile, MediaFile } gMode = StorylandMode::Empty;
+static enum class StorylandMode { Empty, TextureArchive, DtzArchive, ModelFile, WblFile, ArchiveFile, AnimFile, ScmFile, MediaFile, GxtFile } gMode = StorylandMode::Empty;
 static int gSelectedIndex = -1;
 
 
@@ -786,6 +796,9 @@ enum class StorylandTreeKind {
     AnimTrack,
     AnimField,
     AnimString,
+    GxtOverview,
+    GxtTable,
+    GxtEntry,
     ScmOverview,
     ScmSource,
     ScmMission,
@@ -1169,7 +1182,7 @@ static std::wstring canonicalDtzImgResourceName(const std::wstring& displayName)
     std::transform(lower.begin(), lower.end(), lower.begin(), [](wchar_t c) { return wchar_t(towlower(c)); });
 
     const wchar_t* knownExtensions[] = {
-        L".mdl", L".dff", L".wbl", L".xtx", L".chk", L".tex", L".txd", L".anim", L".col", L".col2", L".dat", L".ipl", L".ide", L".cut", L".dir", L".bin", L".dtz", L".zmg"
+        L".mdl", L".dff", L".wbl", L".xtx", L".chk", L".tex", L".txd", L".anim", L".col", L".col2", L".dat", L".ipl", L".ide", L".cut", L".dir", L".bin", L".dtz", L".zmg", L".gxt"
     };
 
     size_t bestPos = std::wstring::npos;
@@ -1483,6 +1496,9 @@ static bool writeWholeFileBinary(const std::wstring& path, const std::vector<uin
 static bool writeUtf8TextFile(const std::wstring& path, const std::wstring& text, std::string& error);
 static std::wstring getDetailsText();
 static void populateScmList();
+static void populateGxtList();
+static bool saveGxt(bool saveAs);
+static bool confirmGxtChanges();
 static void selectScmPayload(const StorylandTreePayload& payload);
 static bool decompileCurrentScm(const std::string& modeId, bool showFailureDialog);
 static void compileCurrentScm();
@@ -2277,7 +2293,7 @@ static bool askUnsigned(const wchar_t* title, const wchar_t* label, uint32_t ini
     return accepted;
 }
 
-static bool askString(const wchar_t* title, const wchar_t* label, const std::wstring& initialValue, std::wstring& valueOut) {
+static bool askString(const wchar_t* title, const wchar_t* label, const std::wstring& initialValue, std::wstring& valueOut, bool multiline = false) {
     WNDCLASSW wc = {};
     wc.lpfnWndProc = DefWindowProcW;
     wc.hInstance = gInstance;
@@ -2291,8 +2307,8 @@ static bool askString(const wchar_t* title, const wchar_t* label, const std::wst
         WS_POPUP | WS_CAPTION | WS_SYSMENU,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
-        420,
-        140,
+        multiline ? 680 : 420,
+        multiline ? 430 : 140,
         gMainWindow,
         nullptr,
         gInstance,
@@ -2300,24 +2316,24 @@ static bool askString(const wchar_t* title, const wchar_t* label, const std::wst
     );
     if (!dialog) return false;
 
-    CreateWindowW(L"STATIC", label, WS_CHILD | WS_VISIBLE, 12, 14, 380, 20, dialog, nullptr, gInstance, nullptr);
+    CreateWindowW(L"STATIC", label, WS_CHILD | WS_VISIBLE, 12, 14, multiline ? 640 : 380, 20, dialog, nullptr, gInstance, nullptr);
     HWND edit = CreateWindowExW(
         WS_EX_CLIENTEDGE,
         L"EDIT",
         initialValue.c_str(),
-        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+        WS_CHILD | WS_VISIBLE | (multiline ? (ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL) : ES_AUTOHSCROLL),
         12,
         38,
-        380,
-        24,
+        multiline ? 640 : 380,
+        multiline ? 300 : 24,
         dialog,
         nullptr,
         gInstance,
         nullptr
     );
-    HWND ok = CreateWindowW(L"BUTTON", L"OK", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 232, 76, 75, 26, dialog, reinterpret_cast<HMENU>(IDOK), gInstance, nullptr);
-    HWND cancel = CreateWindowW(L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE, 317, 76, 75, 26, dialog, reinterpret_cast<HMENU>(IDCANCEL), gInstance, nullptr);
-    SendMessageW(edit, EM_SETLIMITTEXT, 63, 0);
+    HWND ok = CreateWindowW(L"BUTTON", L"OK", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, multiline ? 492 : 232, multiline ? 354 : 76, 75, 26, dialog, reinterpret_cast<HMENU>(IDOK), gInstance, nullptr);
+    HWND cancel = CreateWindowW(L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE, multiline ? 577 : 317, multiline ? 354 : 76, 75, 26, dialog, reinterpret_cast<HMENU>(IDCANCEL), gInstance, nullptr);
+    SendMessageW(edit, EM_SETLIMITTEXT, multiline ? 1048576 : 63, 0);
     SendMessageW(edit, EM_SETSEL, 0, -1);
 
     RECT parentRect = {};
@@ -2331,9 +2347,10 @@ static bool askString(const wchar_t* title, const wchar_t* label, const std::wst
     MSG msg = {};
     while (IsWindow(dialog) && GetMessageW(&msg, nullptr, 0, 0)) {
         if (msg.hwnd == ok || msg.hwnd == cancel || IsChild(dialog, msg.hwnd)) {
-            if (msg.message == WM_KEYDOWN && msg.wParam == VK_RETURN) {
-                wchar_t buffer[256] = {};
-                GetWindowTextW(edit, buffer, 256);
+            if (msg.message == WM_KEYDOWN && msg.wParam == VK_RETURN && (!multiline || (GetKeyState(VK_CONTROL) & 0x8000))) {
+                std::wstring buffer(size_t(GetWindowTextLengthW(edit)) + 1, L'\0');
+                GetWindowTextW(edit, buffer.data(), int(buffer.size()));
+                buffer.resize(buffer.size() - 1);
                 valueOut = buffer;
                 accepted = true;
                 DestroyWindow(dialog);
@@ -2345,8 +2362,9 @@ static bool askString(const wchar_t* title, const wchar_t* label, const std::wst
             }
         }
         if (msg.message == WM_COMMAND && LOWORD(msg.wParam) == IDOK) {
-            wchar_t buffer[256] = {};
-            GetWindowTextW(edit, buffer, 256);
+            std::wstring buffer(size_t(GetWindowTextLengthW(edit)) + 1, L'\0');
+            GetWindowTextW(edit, buffer.data(), int(buffer.size()));
+            buffer.resize(buffer.size() - 1);
             valueOut = buffer;
             accepted = true;
             DestroyWindow(dialog);
@@ -11525,6 +11543,107 @@ static void populateMediaList() {
     expandTreeItem(root);
 }
 
+
+static std::wstring gxtWide(const std::u16string& text) {
+    std::wstring result;
+    for (char16_t character : text) {
+        if (character == u'\n' && (result.empty() || result.back() != L'\r')) result += L'\r';
+        result += wchar_t(character);
+    }
+    return result;
+}
+static std::wstring gxtEntryLabel(size_t index) {
+    const auto& entry = gGxtFile.entries()[index];
+    std::wstring preview = gxtWide(gGxtFile.text(index));
+    for (auto& character : preview) if (character == L'\r' || character == L'\n' || character == L'\t') character = L' ';
+    if (preview.size() > 100) preview = preview.substr(0, 100) + L"...";
+    return widen(entry.key) + (entry.edited ? L" *  " : L"  ") + preview;
+}
+static void selectGxtPayload(const StorylandTreePayload& payload) {
+    gSelectedKind = payload.kind;
+    gSelectedIndex = payload.index;
+    if (payload.kind == StorylandTreeKind::GxtEntry && payload.index >= 0 && size_t(payload.index) < gGxtFile.entries().size()) {
+        const auto& entry = gGxtFile.entries()[size_t(payload.index)];
+        setDetails(L"Table: " + widen(gGxtFile.tables()[entry.table].name) + L"\r\nKey / index: " + widen(entry.key) +
+            L"\r\n\r\n" + gxtWide(gGxtFile.text(size_t(payload.index))));
+    } else if (payload.kind == StorylandTreeKind::GxtTable && payload.index >= 0 && size_t(payload.index) < gGxtFile.tables().size()) {
+        const auto& table = gGxtFile.tables()[size_t(payload.index)];
+        setDetails(L"Table: " + widen(table.name) + L"\r\nStrings: " + std::to_wstring(table.entries.size()));
+    } else {
+        setDetails(widen(gGxtFile.summary()) + L"\r\n\r\nSelect a string to read it. Double-click to edit.\r\nFile menu: Find, Save, Save As, Export Text, and character encoding.\r\n\r\nGame tokens remain intact. Raw codes use ~#XXXX~.\r\nCharacter encoding changes display and input conversion only; existing raw codes are preserved.\r\nModified text remains in memory until saved.");
+    }
+    updateActionBar();
+}
+static void populateGxtList() {
+    clearView();
+    SendMessageW(gTree, WM_SETREDRAW, FALSE, 0);
+    HTREEITEM root = addTreeItem(TVI_ROOT, widen(gGxtFile.summary()), StorylandTreeKind::GxtOverview, 0);
+    for (size_t tableIndex = 0; tableIndex < gGxtFile.tables().size(); ++tableIndex) {
+        const auto& table = gGxtFile.tables()[tableIndex];
+        HTREEITEM item = addTreeItem(root, widen(table.name) + L" (" + std::to_wstring(table.entries.size()) + L")", StorylandTreeKind::GxtTable, int(tableIndex));
+        for (size_t index : table.entries) addTreeItem(item, gxtEntryLabel(index), StorylandTreeKind::GxtEntry, int(index));
+    }
+    expandTreeItem(root);
+    SendMessageW(gTree, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(gTree, nullptr, TRUE);
+    selectGxtPayload({StorylandTreeKind::GxtOverview, 0});
+}
+static void editGxtEntry() {
+    if (gMode != StorylandMode::GxtFile || gSelectedKind != StorylandTreeKind::GxtEntry || gSelectedIndex < 0) return;
+    const size_t index = size_t(gSelectedIndex);
+    std::wstring text = gxtWide(gGxtFile.text(index));
+    if (!askString(L"Edit GXT string", L"Keep game tokens intact. Raw codes: ~#XXXX~. Ctrl+Enter applies.", text, text, true)) return;
+    std::u16string units(text.begin(), text.end());
+    std::string error;
+    if (!gGxtFile.setText(index, units, error)) {
+        MessageBoxW(gMainWindow, widen(error).c_str(), L"GXT edit failed", MB_ICONERROR);
+        return;
+    }
+    populateGxtList();
+    selectTreePayloadItem(StorylandTreeKind::GxtEntry, int(index));
+    setStatus(widen(gGxtFile.summary()));
+}
+static void findGxtText() {
+    static std::wstring query;
+    if (!askString(L"Find GXT text", L"Find table, key, or text (repeat to find next):", query, query) || query.empty()) return;
+    auto lower = [](std::wstring text) { for (auto& character : text) character = wchar_t(towlower(character)); return text; };
+    const std::wstring needle = lower(query);
+    const auto& entries = gGxtFile.entries();
+    const size_t start = gSelectedKind == StorylandTreeKind::GxtEntry && gSelectedIndex >= 0 ? size_t(gSelectedIndex) + 1 : 0;
+    for (size_t count = 0; count < entries.size(); ++count) {
+        const size_t index = (start + count) % entries.size();
+        if (lower(widen(gGxtFile.tables()[entries[index].table].name) + L" " + widen(entries[index].key) + L" " + gxtWide(gGxtFile.text(index))).find(needle) != std::wstring::npos) {
+            selectTreePayloadItem(StorylandTreeKind::GxtEntry, int(index));
+            return;
+        }
+    }
+    setStatus(L"GXT search: no matching string.");
+}
+static bool saveGxt(bool saveAs) {
+    std::wstring path = gGxtFile.sourcePath();
+    if (saveAs) path = saveFileDialogWithInitial(L"Game text\0*.gxt\0All files\0*.*\0", L"gxt", std::filesystem::path(path).filename().wstring());
+    if (path.empty()) return false;
+    std::string error;
+    const auto encoding = gGxtFile.encoding();
+    if (!gGxtFile.saveToFile(path, error)) {
+        MessageBoxW(gMainWindow, widen(error).c_str(), L"GXT save failed", MB_ICONERROR);
+        return false;
+    }
+    if (!gGxtFile.loadFromFile(path, error)) {
+        MessageBoxW(gMainWindow, widen(error).c_str(), L"GXT reload failed", MB_ICONERROR);
+        return false;
+    }
+    gGxtFile.setEncoding(encoding);
+    populateGxtList();
+    setStatus(L"Saved and verified GXT: " + path);
+    return true;
+}
+static bool confirmGxtChanges() {
+    if (gMode != StorylandMode::GxtFile || !gGxtFile.dirty()) return true;
+    const int choice = MessageBoxW(gMainWindow, L"Save changes to the current GXT before continuing?", L"Unsaved GXT", MB_YESNOCANCEL | MB_ICONQUESTION);
+    if (choice == IDCANCEL) return false;
+    return choice == IDNO || saveGxt(false);
+}
 static void openStorylandFile(const std::wstring& path) {
     if (gAnalyzeGraphActive) {
         gAnalyzeGraphActive = false;
@@ -11533,6 +11652,7 @@ static void openStorylandFile(const std::wstring& path) {
         ShowWindow(gPreview, SW_SHOW);
     }
     if (path.empty()) return;
+    if (!confirmGxtChanges()) return;
     if (!gOpeningDtzStandaloneChild) {
         gDtzReturnAvailable = false;
         gDtzReturnSelectedIndex = -1;
@@ -11556,9 +11676,26 @@ static void openStorylandFile(const std::wstring& path) {
     if (!gOpeningDtzStandaloneChild &&
         (ext == L".anim" || ext == L".chk" || ext == L".xtx" || ext == L".tex" || ext == L".txd" ||
          ext == L".img" || ext == L".lvz" || ext == L".wbl" || ext == L".dir" || ext == L".scm" ||
-         ext == L".dtz" || ext == L".bin" || ext == L".mdl" || ext == L".dff" ||
+         ext == L".gxt" || ext == L".dtz" || ext == L".bin" || ext == L".mdl" || ext == L".dff" ||
          isStorylandMediaExtension(ext))) {
         addRecentFile(path);
+    }
+
+    if (ext == L".gxt") {
+        if (!gGxtFile.loadFromFile(path, error)) {
+            MessageBoxW(gMainWindow, widen(error).c_str(), L"GXT open failed", MB_ICONERROR);
+            return;
+        }
+        clearView();
+        gMode = StorylandMode::GxtFile;
+        populateGxtList();
+        SetWindowTextW(gMainWindow, L"Storyland - GXT Text");
+        const auto hint = titleTintFromPath(path);
+        applyStorylandTitleTint(gGxtFile.format() == StorylandGxtFormat::ChinatownWars ? StorylandTitleTint::CTW :
+            gGxtFile.family() == "LCS" ? StorylandTitleTint::LCS : gGxtFile.family() == "VCS" ? StorylandTitleTint::VCS : hint);
+        refreshModeUi();
+        setStatus(widen(gGxtFile.summary()));
+        return;
     }
 
     if (isStorylandMediaExtension(ext)) {
@@ -11957,9 +12094,9 @@ static void openSelectedArchiveEntry() {
         setStatus(L"WRLD/AREA sector is shown alone in the LVZ/IMG OpenGL preview.");
         return;
     }
-    if (!(ext == L".mdl" || ext == L".dff" || ext == L".xtx" || ext == L".chk" || ext == L".tex" || ext == L".txd" || ext == L".dtz")) {
+    if (!(ext == L".mdl" || ext == L".dff" || ext == L".xtx" || ext == L".chk" || ext == L".tex" || ext == L".txd" || ext == L".dtz" || ext == L".gxt")) {
         selectArchiveEntry(gSelectedIndex);
-        setStatus(L"Selected embedded resource is listed but not directly openable. Only recognized model, texture, and DTZ entries can be entered safely.");
+        setStatus(L"Selected embedded resource is listed but not directly openable. Recognized model, texture, DTZ, and GXT entries can be opened.");
         return;
     }
 
@@ -12029,6 +12166,18 @@ static bool writeUtf8TextFile(const std::wstring& path, const std::wstring& text
         }
     }
     return storylandWriteFilesTransaction({{std::filesystem::path(path), &bytes}}, error);
+}
+
+static void exportGxtText() {
+    const std::wstring path = saveFileDialogWithInitial(L"Text\0*.txt\0All files\0*.*\0", L"txt", L"GXT-text.txt");
+    if (path.empty()) return;
+    std::wstring text = L"; Storyland GXT text export\r\n; " + widen(gGxtFile.summary()) + L"\r\n";
+    for (const auto& table : gGxtFile.tables()) {
+        for (size_t index : table.entries) text += L"\r\n[" + widen(gGxtFile.entries()[index].key) + L":" + widen(table.name) + L"]\r\n" + gxtWide(gGxtFile.text(index)) + L"\r\n";
+    }
+    std::string error;
+    if (!writeUtf8TextFile(path, text, error)) MessageBoxW(gMainWindow, widen(error).c_str(), L"GXT text export failed", MB_ICONERROR);
+    else setStatus(L"Exported GXT text: " + path);
 }
 
 static std::wstring getDetailsText() {
@@ -17633,7 +17782,7 @@ static void layoutChildren(HWND hwnd) {
         return;
     }
 
-    if (gPreview) ShowWindow(gPreview, SW_SHOW);
+    if (gPreview) ShowWindow(gPreview, gMode == StorylandMode::GxtFile ? SW_HIDE : SW_SHOW);
 
     // One canonical set of pane rectangles drives both child placement and
     // border painting. No control is allowed to extend beyond its pane.
@@ -17659,7 +17808,7 @@ static void layoutChildren(HWND hwnd) {
 
     const bool videoFrameViewer = gMode == StorylandMode::MediaFile &&
         gMediaFile.kind() == StorylandMediaKind::Video;
-    const int detailsH = videoFrameViewer && usableRightH > 240
+    const int detailsH = gMode == StorylandMode::GxtFile ? usableRightH : videoFrameViewer && usableRightH > 240
         ? std::clamp(usableRightH / 5, 100, 180)
         : usableRightH > 240
             ? std::clamp(usableRightH * 28 / 100, 140, 260)
@@ -17690,7 +17839,7 @@ static void layoutChildren(HWND hwnd) {
         }
     }
 
-    int cursorY = previewRect.bottom + gutter;
+    int cursorY = gMode == StorylandMode::GxtFile ? contentTop : previewRect.bottom + gutter;
 
     if (gActionBar) {
         const StorylandUiRect actionRect{
@@ -17800,6 +17949,7 @@ static void selectPayloadForCurrentMode(const StorylandTreePayload& payload) {
     else if (gMode == StorylandMode::AnimFile) selectAnimPayload(payload);
     else if (gMode == StorylandMode::ScmFile) selectScmPayload(payload);
     else if (gMode == StorylandMode::MediaFile) selectMediaPayload(payload);
+    else if (gMode == StorylandMode::GxtFile) selectGxtPayload(payload);
 }
 
 static bool selectTreeItemAtScreenPoint(POINT screenPoint) {
@@ -18018,6 +18168,7 @@ static void restoreTreeAfterAnalyzeGraph() {
     case StorylandMode::DtzArchive: populateDtzList(); break;
     case StorylandMode::WblFile: populateWblList(); break;
     case StorylandMode::ScmFile: populateScmList(); break;
+    case StorylandMode::GxtFile: populateGxtList(); break;
     case StorylandMode::MediaFile: populateMediaList(); break;
     default: break;
     }
@@ -18283,6 +18434,11 @@ static bool buildTreeContextMenu(HMENU menu) {
         return hasItems;
     }
 
+    if (gMode == StorylandMode::GxtFile) {
+        addContextMenuItem(menu, ID_GXT_FIND, L"Find text...");
+        if (gSelectedKind == StorylandTreeKind::GxtEntry) addContextMenuItem(menu, ID_GXT_EDIT, L"Edit string...");
+        return true;
+    }
     if (gMode == StorylandMode::DtzArchive) {
         hasItems = addContextMenuItem(menu, ID_DTZ_FIND, L"Find...") || hasItems;
         bool specificItems = false;
@@ -18725,6 +18881,21 @@ static void rebuildFileMenu() {
         AppendMenuW(gScmMenu, MF_STRING, ID_SCM_EXPORT_SOURCE, L"Export Source...");
         AppendMenuW(gScmMenu, MF_STRING, ID_SCM_COMPILE, L"Compile SCM...");
         AppendMenuW(gFileMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(gScmMenu), L"VCS SCM missions");
+    }
+
+    if (gMode == StorylandMode::GxtFile) {
+        AppendMenuW(gFileMenu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(gFileMenu, MF_STRING, ID_GXT_FIND, L"Find text...");
+        AppendMenuW(gFileMenu, MF_STRING, ID_GXT_EDIT, L"Edit selected string...");
+        AppendMenuW(gFileMenu, MF_STRING, ID_GXT_SAVE, L"Save GXT");
+        AppendMenuW(gFileMenu, MF_STRING, ID_GXT_SAVE_AS, L"Save GXT As...");
+        AppendMenuW(gFileMenu, MF_STRING, ID_GXT_TEXT, L"Export Text...");
+        HMENU encoding = CreatePopupMenu();
+        auto flags = [](StorylandGxtEncoding value) { return MF_STRING | (gGxtFile.encoding() == value ? MF_CHECKED : 0); };
+        AppendMenuW(encoding, flags(StorylandGxtEncoding::LcsFont), ID_GXT_LCS_FONT, L"LCS Latin font (PSP / PS2)");
+        AppendMenuW(encoding, flags(StorylandGxtEncoding::Windows1252), ID_GXT_1252, L"VCS / Windows-1252");
+        AppendMenuW(encoding, flags(StorylandGxtEncoding::Unicode), ID_GXT_UNICODE, L"Unicode / raw (Chinatown Wars)");
+        AppendMenuW(gFileMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(encoding), L"Character encoding");
     }
 
     if (gMode == StorylandMode::ModelFile || gMode == StorylandMode::TextureArchive) {
@@ -19903,6 +20074,7 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 case StorylandMode::WblFile: reloadPath = gWblFile.sourcePath(); break;
                 case StorylandMode::AnimFile: reloadPath = gAnimFile.sourcePath(); break;
                 case StorylandMode::ScmFile: reloadPath = gScmFile.sourcePath(); break;
+                case StorylandMode::GxtFile: reloadPath = gGxtFile.sourcePath(); break;
                 case StorylandMode::MediaFile: reloadPath = gMediaFile.sourcePath(); break;
                 case StorylandMode::ArchiveFile:
                     reloadPath = !gArchiveBrowser.lvzPath().empty() ? gArchiveBrowser.lvzPath() : gArchiveBrowser.imgPath();
@@ -19925,7 +20097,7 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         }
 
         case ID_FILE_OPEN: {
-            std::wstring path = openFileDialog(L"Storyland files\0*.scm;*.dtz;*.bin;*.img;*.dir;*.lvz;*.zmg;*.area;*.wbl;*.mdl;*.dff;*.anim;*.chk;*.xtx;*.tex;*.txd;*.sdt;*.raw;*.vag;*.vb;*.wav;*.at3;*.aa3;*.oma;*.mp3;*.ogg;*.flac;*.aac;*.m4a;*.wma;*.ac3;*.aif;*.aiff;*.adx;*.pss;*.pmf;*.mpg;*.mpeg;*.mp4;*.m4v;*.wmv;*.avi;*.mov;*.mkv;*.ts;*.m2ts;*.mts;*.vob;*.3gp;*.3g2;*.webm;*.ogv;*.flv\0Models\0*.mdl;*.dff;*.wbl\0Textures\0*.chk;*.xtx;*.tex;*.txd\0Audio\0*.sdt;*.raw;*.vag;*.vb;*.wav;*.at3;*.aa3;*.oma;*.mp3;*.ogg;*.flac;*.aac;*.m4a;*.wma;*.ac3;*.aif;*.aiff;*.adx\0Video\0*.pss;*.pmf;*.mpg;*.mpeg;*.mp4;*.m4v;*.wmv;*.avi;*.mov;*.mkv;*.ts;*.m2ts;*.mts;*.vob;*.3gp;*.3g2;*.webm;*.ogv;*.flv\0All files\0*.*\0");
+            std::wstring path = openFileDialog(L"Storyland files\0*.gxt;*.scm;*.dtz;*.bin;*.img;*.dir;*.lvz;*.zmg;*.area;*.wbl;*.mdl;*.dff;*.anim;*.chk;*.xtx;*.tex;*.txd;*.sdt;*.raw;*.vag;*.vb;*.wav;*.at3;*.aa3;*.oma;*.mp3;*.ogg;*.flac;*.aac;*.m4a;*.wma;*.ac3;*.aif;*.aiff;*.adx;*.pss;*.pmf;*.mpg;*.mpeg;*.mp4;*.m4v;*.wmv;*.avi;*.mov;*.mkv;*.ts;*.m2ts;*.mts;*.vob;*.3gp;*.3g2;*.webm;*.ogv;*.flv\0Game text\0*.gxt\0Models\0*.mdl;*.dff;*.wbl\0Textures\0*.chk;*.xtx;*.tex;*.txd\0Audio\0*.sdt;*.raw;*.vag;*.vb;*.wav;*.at3;*.aa3;*.oma;*.mp3;*.ogg;*.flac;*.aac;*.m4a;*.wma;*.ac3;*.aif;*.aiff;*.adx\0Video\0*.pss;*.pmf;*.mpg;*.mpeg;*.mp4;*.m4v;*.wmv;*.avi;*.mov;*.mkv;*.ts;*.m2ts;*.mts;*.vob;*.3gp;*.3g2;*.webm;*.ogv;*.flv\0All files\0*.*\0");
             openStorylandFile(path);
             break;
         }
@@ -19951,6 +20123,18 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         case ID_SCM_REFRESH_MISSIONS: refreshScmMissionTree(); break;
         case ID_SCM_EXPORT_SOURCE: exportCurrentScmSource(); break;
         case ID_SCM_COMPILE: compileCurrentScm(); break;
+        case ID_GXT_EDIT: editGxtEntry(); break;
+        case ID_GXT_FIND: findGxtText(); break;
+        case ID_GXT_SAVE: saveGxt(false); break;
+        case ID_GXT_SAVE_AS: saveGxt(true); break;
+        case ID_GXT_TEXT: exportGxtText(); break;
+        case ID_GXT_LCS_FONT:
+        case ID_GXT_1252:
+        case ID_GXT_UNICODE:
+            gGxtFile.setEncoding(LOWORD(wParam) == ID_GXT_LCS_FONT ? StorylandGxtEncoding::LcsFont : LOWORD(wParam) == ID_GXT_1252 ? StorylandGxtEncoding::Windows1252 : StorylandGxtEncoding::Unicode);
+            populateGxtList();
+            refreshModeUi();
+            break;
         case ID_FILE_EXPORT_LOG: exportCurrentLog(); break;
         case ID_FILE_EXPORT_CURRENT: exportCurrentOpenedFile(false); break;
         case ID_FILE_EXPORT_AS: exportCurrentOpenedFile(true); break;
@@ -20264,6 +20448,7 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             return 0;
         }
         if (header && header->idFrom == ID_TREE && header->code == NM_DBLCLK) {
+            if (gMode == StorylandMode::GxtFile) { editGxtEntry(); return 0; }
             if (gMode == StorylandMode::ModelFile && gSelectedKind == StorylandTreeKind::ModelPrelight) {
                 editSelectedModelPrelight();
                 return 0;
@@ -20299,6 +20484,10 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         }
         break;
     }
+    case WM_CLOSE:
+        if (!confirmGxtChanges()) return 0;
+        DestroyWindow(hwnd);
+        return 0;
     case WM_DESTROY:
         KillTimer(hwnd, 2);
         KillTimer(hwnd, 3);
