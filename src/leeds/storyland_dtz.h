@@ -4,6 +4,8 @@
 #include <vector>
 #include <map>
 
+enum class StorylandDtzGameVariant { Unknown, Lcs, Vcs };
+
 struct StorylandDtzHeaderField {
     std::string name;
     uint32_t offset = 0;
@@ -193,6 +195,7 @@ public:
     bool wasCompressedInput() const;
     bool hasCompanionDir() const;
     bool hasCompanionImg() const;
+    StorylandDtzGameVariant gameVariant() const;
 
 private:
     std::wstring path;
@@ -211,6 +214,7 @@ private:
     std::vector<uint8_t> dirRawData;
     std::vector<uint8_t> imgRawData;
     bool compressedInput = false;
+    StorylandDtzGameVariant detectedGameVariant = StorylandDtzGameVariant::Unknown;
     std::map<uint32_t, std::string> explicitStreamNames;
 
     bool writePatchedCompanionDir(const std::wstring& savedDtzPath, std::string& errorMessage) const;

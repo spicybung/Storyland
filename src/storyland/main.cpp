@@ -326,6 +326,7 @@ static HINSTANCE gInstance = nullptr;
 static HWND gMainWindow = nullptr;
 static HWND gTree = nullptr;
 static HWND gDetails = nullptr;
+static HWND gDetailsGrid = nullptr;
 static HWND gPreview = nullptr;
 static HWND gStatus = nullptr;
 static HWND gMenuStrip = nullptr;
@@ -1070,6 +1071,116 @@ static bool selectTreePayloadItem(StorylandTreeKind kind, int index) {
     return true;
 }
 
+static std::wstring treeItemText(HTREEITEM item) {
+    if (!gTree || !item) return {};
+    wchar_t buffer[512] = {};
+    TVITEMW treeItem = {};
+    treeItem.mask = TVIF_TEXT;
+    treeItem.hItem = item;
+    treeItem.pszText = buffer;
+    treeItem.cchTextMax = int(std::size(buffer));
+    if (!TreeView_GetItem(gTree, &treeItem)) return {};
+    return buffer;
+}
+
+static HTREEITEM findDtzDirectoryEntryItemRecursive(HTREEITEM item, int index, bool insideDirectoryRoot) {
+    while (item) {
+        const std::wstring text = treeItemText(item);
+        const bool thisIsDirectoryRoot = text == L"GAME.DTZ + gta3ps*.img directory";
+        const bool inDirectory = insideDirectoryRoot || thisIsDirectoryRoot;
+
+        TVITEMW treeItem = {};
+        treeItem.mask = TVIF_PARAM;
+        treeItem.hItem = item;
+        if (inDirectory && TreeView_GetItem(gTree, &treeItem)) {
+            const StorylandTreePayload payload = payloadFromLParam(treeItem.lParam);
+            if (payload.kind == StorylandTreeKind::DtzDirEntry && payload.index == index) return item;
+        }
+
+        HTREEITEM child = TreeView_GetChild(gTree, item);
+        if (child) {
+            HTREEITEM found = findDtzDirectoryEntryItemRecursive(child, index, inDirectory);
+            if (found) return found;
+        }
+        item = TreeView_GetNextSibling(gTree, item);
+    }
+    return nullptr;
+}
+
+static bool selectDtzDirectoryEntryItem(int index) {
+    if (!gTree) return false;
+    HTREEITEM root = TreeView_GetRoot(gTree);
+    HTREEITEM item = findDtzDirectoryEntryItemRecursive(root, index, false);
+    if (!item) return selectTreePayloadItem(StorylandTreeKind::DtzDirEntry, index);
+
+    HTREEITEM parent = TreeView_GetParent(gTree, item);
+    while (parent) {
+        TreeView_Expand(gTree, parent, TVE_EXPAND);
+        parent = TreeView_GetParent(gTree, parent);
+    }
+    TreeView_SelectItem(gTree, item);
+    TreeView_EnsureVisible(gTree, item);
+    return true;
+}
+
+static int firstVisibleDtzDirectoryEntryIndex() {
+    if (!gTree) return -1;
+    HTREEITEM item = TreeView_GetFirstVisible(gTree);
+    while (item) {
+        TVITEMW treeItem = {};
+        treeItem.mask = TVIF_PARAM;
+        treeItem.hItem = item;
+        if (TreeView_GetItem(gTree, &treeItem)) {
+            const StorylandTreePayload payload = payloadFromLParam(treeItem.lParam);
+            if (payload.kind == StorylandTreeKind::DtzDirEntry && payload.index >= 0) {
+                return payload.index;
+            }
+        }
+        item = TreeView_GetNextVisible(gTree, item);
+    }
+    return -1;
+}
+
+static void restoreDtzDirectoryViewport(int firstVisibleEntryIndex, int selectedEntryIndex) {
+    if (!gTree) return;
+
+    HTREEITEM root = TreeView_GetRoot(gTree);
+    HTREEITEM selectedItem = findDtzDirectoryEntryItemRecursive(root, selectedEntryIndex, false);
+    HTREEITEM firstVisibleItem = nullptr;
+
+    if (selectedItem) {
+        HTREEITEM parent = TreeView_GetParent(gTree, selectedItem);
+        while (parent) {
+            TreeView_Expand(gTree, parent, TVE_EXPAND);
+            parent = TreeView_GetParent(gTree, parent);
+        }
+    }
+
+    if (firstVisibleEntryIndex >= 0) {
+        firstVisibleItem = findDtzDirectoryEntryItemRecursive(root, firstVisibleEntryIndex, false);
+        if (firstVisibleItem) {
+            HTREEITEM parent = TreeView_GetParent(gTree, firstVisibleItem);
+            while (parent) {
+                TreeView_Expand(gTree, parent, TVE_EXPAND);
+                parent = TreeView_GetParent(gTree, parent);
+            }
+        }
+    }
+
+    // TreeView_SelectItem can scroll the selected row to the top after the tree
+    // has just been rebuilt. Select first, then restore the old first-visible
+    // resource as the final viewport operation. Do not call EnsureVisible after
+    // this: that was the regression which made every replacement jump so the
+    // edited MDL became the top row of the gta3PS*.img list.
+    if (selectedItem) {
+        TreeView_SelectItem(gTree, selectedItem);
+    }
+    if (firstVisibleItem) {
+        SendMessageW(gTree, TVM_SELECTITEM, TVGN_FIRSTVISIBLE,
+                     reinterpret_cast<LPARAM>(firstVisibleItem));
+    }
+}
+
 static std::wstring widen(const std::string& text) {
     if (text.empty()) return L"";
 
@@ -1286,6 +1397,27 @@ static StorylandTitleTint titleTintFromPath(const std::wstring& path) {
     if (lower.find(L"gta3") != std::wstring::npos || lower.find(L"gta iii") != std::wstring::npos ||
         lower.find(L"grand theft auto iii") != std::wstring::npos) return StorylandTitleTint::GTA3;
 
+    return StorylandTitleTint::Default;
+}
+
+static StorylandTitleTint storiesDtzTint() {
+    // The DTZ streaming serialization is authoritative when available.
+    // LCS retail uses the 0x14-byte CStreamingInfo table reached from header +0x7C;
+    // VCS retail uses the 0x18-byte sentinel rows.  Do not guess the game from
+    // generic gta3PS*.img naming or from a parent folder.
+    switch (gDtzArchive.gameVariant()) {
+    case StorylandDtzGameVariant::Vcs: return StorylandTitleTint::VCS;
+    case StorylandDtzGameVariant::Lcs: return StorylandTitleTint::LCS;
+    default: break;
+    }
+
+    const StorylandTitleTint sourceTint = titleTintFromPath(gDtzArchive.sourcePath());
+    if (sourceTint == StorylandTitleTint::VCS || sourceTint == StorylandTitleTint::LCS) return sourceTint;
+
+    const StorylandTitleTint imgTint = titleTintFromPath(gDtzArchive.companionImgPath());
+    if (imgTint == StorylandTitleTint::VCS || imgTint == StorylandTitleTint::LCS) return imgTint;
+
+    // Unknown Stories variant: stay neutral instead of lying about LCS/VCS.
     return StorylandTitleTint::Default;
 }
 
@@ -1674,13 +1806,227 @@ static std::wstring buildModelStatusLine() {
     return status.str();
 }
 
-static void setDetails(const std::wstring& text) {
-    SetWindowTextW(gDetails, text.c_str());
+static bool gDetailsReadOnly = true;
+
+static std::wstring cleanDetailsLabel(std::wstring label) {
+    const std::pair<const wchar_t*, const wchar_t*> replacements[] = {
+        {L"Byte budget", L"Size"}, {L"Internal map index", L"Entry"},
+        {L"Known target", L"File"}, {L"Companion IMG loaded", L"IMG"},
+        {L"Structured fields shown", L"Fields"}, {L"Editable fields shown", L"Editable fields"},
+        {L"Real scanned GAME.DTZ data block", L"GAME.DTZ Data"},
+        {L"Absolute offset", L"Offset"}, {L"Relative offset", L"Local offset"},
+        {L"Header field offset", L"Header offset"}, {L"Inferred end", L"End"},
+        {L"Inferred size", L"Size"}, {L"C2dEffect index", L"Effect"},
+        {L"C2dEffect type", L"Type"}, {L"Parser", L"Format"},
+        {L"native Leeds", L""}, {L"Leeds-engine", L""},
+        {L"raw DTZ", L"DTZ"}, {L"Real scanned", L""},
+        {L"decodable", L"readable"}, {L"payload", L"data"}
+    };
+    for (const auto& replacement : replacements) {
+        size_t at = 0;
+        const std::wstring from = replacement.first;
+        const std::wstring to = replacement.second;
+        while ((at = label.find(from, at)) != std::wstring::npos) {
+            label.replace(at, from.size(), to);
+            at += to.size();
+        }
+    }
+    while (!label.empty() && (label.front() == L' ' || label.front() == L'\t')) label.erase(label.begin());
+    while (!label.empty() && (label.back() == L' ' || label.back() == L'\t')) label.pop_back();
+    return label;
+}
+
+static std::vector<std::pair<std::wstring, std::wstring>> gDetailsRows;
+static int gDetailsScroll = 0;
+static constexpr int kDetailsRowHeight = 32;
+static constexpr int kDetailsHeaderHeight = 42;
+
+static void updateDetailsScroll(HWND window) {
+    if (!window) return;
+    RECT rect{};
+    GetClientRect(window, &rect);
+    const int height = std::max(1L, rect.bottom - rect.top);
+    const int contentHeight = kDetailsHeaderHeight + static_cast<int>(gDetailsRows.size()) * kDetailsRowHeight + 16;
+    gDetailsScroll = std::clamp(gDetailsScroll, 0, std::max(0, contentHeight - height));
+    SCROLLINFO info{};
+    info.cbSize = sizeof(info);
+    info.fMask = SIF_PAGE | SIF_RANGE | SIF_POS;
+    info.nMin = 0;
+    info.nMax = std::max(height, contentHeight) - 1;
+    info.nPage = static_cast<UINT>(height);
+    info.nPos = gDetailsScroll;
+    SetScrollInfo(window, SB_VERT, &info, TRUE);
+}
+
+static LRESULT CALLBACK detailsPanelProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_SIZE:
+        updateDetailsScroll(window);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+    case WM_MOUSEWHEEL: {
+        const int steps = GET_WHEEL_DELTA_WPARAM(wParam) / WHEEL_DELTA;
+        gDetailsScroll -= steps * kDetailsRowHeight * 3;
+        updateDetailsScroll(window);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+    }
+    case WM_VSCROLL: {
+        SCROLLINFO info{};
+        info.cbSize = sizeof(info);
+        info.fMask = SIF_ALL;
+        GetScrollInfo(window, SB_VERT, &info);
+        switch (LOWORD(wParam)) {
+        case SB_LINEUP: gDetailsScroll -= kDetailsRowHeight; break;
+        case SB_LINEDOWN: gDetailsScroll += kDetailsRowHeight; break;
+        case SB_PAGEUP: gDetailsScroll -= static_cast<int>(info.nPage); break;
+        case SB_PAGEDOWN: gDetailsScroll += static_cast<int>(info.nPage); break;
+        case SB_THUMBTRACK: gDetailsScroll = info.nTrackPos; break;
+        default: break;
+        }
+        updateDetailsScroll(window);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+    }
+    case WM_PAINT: {
+        PAINTSTRUCT paint{};
+        HDC dc = BeginPaint(window, &paint);
+        RECT client{};
+        GetClientRect(window, &client);
+        const int width = client.right - client.left;
+        const int height = client.bottom - client.top;
+        HDC buffer = CreateCompatibleDC(dc);
+        HBITMAP bitmap = CreateCompatibleBitmap(dc, std::max(1, width), std::max(1, height));
+        HGDIOBJ oldBitmap = SelectObject(buffer, bitmap);
+        HBRUSH background = CreateSolidBrush(RGB(26, 29, 36));
+        FillRect(buffer, &client, background);
+        DeleteObject(background);
+        HFONT oldFont = static_cast<HFONT>(SelectObject(buffer, gUiFont ? gUiFont : GetStockObject(DEFAULT_GUI_FONT)));
+        SetBkMode(buffer, TRANSPARENT);
+        RECT titleRect{16, 10 - gDetailsScroll, width - 16, kDetailsHeaderHeight - gDetailsScroll};
+        SetTextColor(buffer, RGB(198, 206, 220));
+        DrawTextW(buffer, L"Details", -1, &titleRect, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        const int labelWidth = std::clamp(width / 3, 120, 220);
+        for (size_t index = 0; index < gDetailsRows.size(); ++index) {
+            const int top = kDetailsHeaderHeight + static_cast<int>(index) * kDetailsRowHeight - gDetailsScroll;
+            if (top >= height) break;
+            if (top + kDetailsRowHeight < 0) continue;
+            RECT row{10, top, width - 10, top + kDetailsRowHeight - 2};
+            HBRUSH rowBrush = CreateSolidBrush(index % 2 == 0 ? RGB(35, 39, 48) : RGB(30, 34, 42));
+            FillRect(buffer, &row, rowBrush);
+            DeleteObject(rowBrush);
+            RECT label{row.left + 12, top, std::min<int>(width - 16, row.left + labelWidth), top + kDetailsRowHeight - 2};
+            SetTextColor(buffer, RGB(148, 160, 178));
+            DrawTextW(buffer, gDetailsRows[index].first.c_str(), -1, &label,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+            RECT value{std::min<int>(width - 12, row.left + labelWidth + 8), top,
+                width - 20, top + kDetailsRowHeight - 2};
+            SetTextColor(buffer, RGB(231, 235, 243));
+            DrawTextW(buffer, gDetailsRows[index].second.c_str(), -1, &value,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        }
+        SelectObject(buffer, oldFont);
+        BitBlt(dc, 0, 0, width, height, buffer, 0, 0, SRCCOPY);
+        SelectObject(buffer, oldBitmap);
+        DeleteObject(bitmap);
+        DeleteDC(buffer);
+        EndPaint(window, &paint);
+        return 0;
+    }
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+static void resizeDetailsGrid() {
+    if (!gDetails || !gDetailsGrid) return;
+    RECT rect{};
+    GetWindowRect(gDetails, &rect);
+    MapWindowPoints(nullptr, GetParent(gDetails), reinterpret_cast<POINT*>(&rect), 2);
+    SetWindowPos(gDetailsGrid, gDetails, rect.left, rect.top,
+        rect.right - rect.left, rect.bottom - rect.top, SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    updateDetailsScroll(gDetailsGrid);
+}
+
+static bool isDetailsSentence(const std::wstring& label, const std::wstring& value) {
+    if (label.empty() || label.size() > 32 || value.empty()) return true;
+    if (label.find(L".") != std::wstring::npos) return true;
+    if (label.find(L"This ") == 0 || label.find(L"The ") == 0 ||
+        label.find(L"If ") == 0 || label.find(L"Right-click") == 0 ||
+        label.find(L"You ") == 0) return true;
+    if (label == L"Preview source" || label == L"DTZ companion texture" ||
+        label == L"Viewport controls" || label == L"Instructions" ||
+        label == L"Description" || label == L"Note" || label == L"Hint") return true;
+    if (value.find(L"Right-click") != std::wstring::npos ||
+        value.find(L"double-click") != std::wstring::npos ||
+        value.find(L"This entry") != std::wstring::npos) return true;
+    return false;
+}
+
+static std::wstring detailsValue(const std::wstring& label, std::wstring value) {
+    if (label == L"Texture status") {
+        const size_t matched = value.find(L"matched ");
+        if (matched != std::wstring::npos) {
+            size_t begin = matched + 8;
+            size_t finish = value.find_first_not_of(L"0123456789/", begin);
+            return L"CHK " + value.substr(begin, finish == std::wstring::npos ? finish : finish - begin);
+        }
+        if (value.find(L"Loaded") != std::wstring::npos) return L"Loaded";
+    }
+    if (label == L"Detected model family") return value;
+    if (label == L"Flip V coordinate") return value;
+    const size_t temporaryPath = value.find(L"StorylandEmbedded_");
+    if (temporaryPath != std::wstring::npos) return L"Embedded resource";
+    if (value.size() > 100) {
+        const size_t separator = value.find(L" (");
+        if (separator != std::wstring::npos) value.resize(separator);
+    }
+    return value;
+}
+
+static void setDetails(const std::wstring& value) {
+    if (!gDetails) return;
+    const bool isSource = (gMode == StorylandMode::ScmFile &&
+        (gSelectedKind == StorylandTreeKind::ScmSource || gSelectedKind == StorylandTreeKind::ScmMission));
+    const bool showPanel = gDetailsReadOnly && !isSource && gDetailsGrid;
+    if (showPanel) {
+        gDetailsRows.clear();
+        std::wistringstream input(value);
+        std::wstring line;
+        while (std::getline(input, line)) {
+            if (!line.empty() && line.back() == L'\r') line.pop_back();
+            const size_t colon = line.find(L':');
+            if (colon == std::wstring::npos || colon == 0 || colon > 36) continue;
+            std::wstring label = cleanDetailsLabel(line.substr(0, colon));
+            std::wstring content = line.substr(colon + 1);
+            const size_t beginning = content.find_first_not_of(L" \t");
+            if (beginning == std::wstring::npos) continue;
+            content.erase(0, beginning);
+            if (isDetailsSentence(label, content)) continue;
+            content = detailsValue(label, std::move(content));
+            if (!content.empty()) gDetailsRows.emplace_back(std::move(label), std::move(content));
+        }
+        gDetailsScroll = 0;
+        resizeDetailsGrid();
+        InvalidateRect(gDetailsGrid, nullptr, FALSE);
+        ShowWindow(gDetails, SW_HIDE);
+        ShowWindow(gDetailsGrid, SW_SHOW);
+        return;
+    }
+    if (gDetailsGrid) ShowWindow(gDetailsGrid, SW_HIDE);
+    ShowWindow(gDetails, SW_SHOW);
+    SetWindowTextW(gDetails, value.c_str());
 }
 
 static void setDetailsReadOnly(bool readOnly) {
+    gDetailsReadOnly = readOnly;
     if (!gDetails) return;
     SendMessageW(gDetails, EM_SETREADONLY, readOnly ? TRUE : FALSE, 0);
+    if (!readOnly && gDetailsGrid) {
+        ShowWindow(gDetailsGrid, SW_HIDE);
+        ShowWindow(gDetails, SW_SHOW);
+    }
 }
 
 static std::wstring openFileDialog(const wchar_t* filter) {
@@ -2679,10 +3025,10 @@ static bool buildModelTextureAtlasFromCurrentArchive(int preferredIndex, int& fi
         region.y = cursorY;
         region.width = item.image.width;
         region.height = item.image.height;
-        region.u0 = float(cursorX) / float(atlasWidth);
-        region.v0 = float(cursorY) / float(atlasHeight);
-        region.u1 = float(cursorX + item.image.width) / float(atlasWidth);
-        region.v1 = float(cursorY + item.image.height) / float(atlasHeight);
+        region.u0 = (float(cursorX) + 0.5f) / float(atlasWidth);
+        region.v0 = (float(cursorY) + 0.5f) / float(atlasHeight);
+        region.u1 = (float(cursorX + item.image.width) - 0.5f) / float(atlasWidth);
+        region.v1 = (float(cursorY + item.image.height) - 0.5f) / float(atlasHeight);
         gModelTextureRegions.push_back(region);
 
         cursorX += item.image.width;
@@ -2973,18 +3319,29 @@ static int findModelTextureRegionByNeedles(std::initializer_list<const char*> ne
     return -1;
 }
 
+static std::string normalizeMaterialTextureName(std::string name) {
+    name = asciiLower(name);
+    size_t separator = name.find_last_of("/\\");
+    if (separator != std::string::npos) name.erase(0, separator + 1u);
+    size_t extension = name.find_last_of('.');
+    if (extension != std::string::npos) {
+        std::string suffix = name.substr(extension);
+        if (suffix == ".png" || suffix == ".bmp" || suffix == ".tga" || suffix == ".dds")
+            name.resize(extension);
+    }
+    return name;
+}
+
 static int findModelTextureRegionByMaterialName(const std::string& materialName) {
-    if (materialName.empty()) return -1;
-    std::string material = asciiLower(materialName);
+    const std::string material = normalizeMaterialTextureName(materialName);
+    if (material.empty()) return -1;
+    int match = -1;
     for (size_t index = 0; index < gModelTextureRegions.size(); ++index) {
-        std::string region = asciiLower(gModelTextureRegions[index].name);
-        if (region == material) return int(index);
+        if (normalizeMaterialTextureName(gModelTextureRegions[index].name) != material) continue;
+        if (match >= 0) return -1;
+        match = int(index);
     }
-    for (size_t index = 0; index < gModelTextureRegions.size(); ++index) {
-        std::string region = asciiLower(gModelTextureRegions[index].name);
-        if (region.find(material) != std::string::npos || material.find(region) != std::string::npos) return int(index);
-    }
-    return -1;
+    return match;
 }
 
 static int chooseModelTextureRegionForTriangle(
@@ -2997,41 +3354,28 @@ static int chooseModelTextureRegionForTriangle(
     float spanY,
     float spanZ
 ) {
-    if (gModelTextureRegions.empty()) return -1;
-    if (gModelTextureRegions.size() == 1) return 0;
+    (void)points;
+    (void)minX;
+    (void)minY;
+    (void)minZ;
+    (void)spanX;
+    (void)spanY;
+    (void)spanZ;
 
-    if (tri.materialIndex != 0xFFFFFFFFu) {
-        const auto& materialNames = gModelFile.previewMaterialTextureNames();
-        if (size_t(tri.materialIndex) < materialNames.size()) {
-            int exactRegion = findModelTextureRegionByMaterialName(materialNames[size_t(tri.materialIndex)]);
-            if (exactRegion >= 0) return exactRegion;
-        }
+    if (gModelTextureRegions.empty()) return -1;
+
+    const auto& materialNames = gModelFile.previewMaterialTextureNames();
+    if (tri.materialIndex != 0xFFFFFFFFu &&
+        size_t(tri.materialIndex) < materialNames.size()) {
+        const std::string& materialName = materialNames[size_t(tri.materialIndex)];
+        int textureRegion = findModelTextureRegionByMaterialName(materialName);
+        if (textureRegion >= 0) return textureRegion;
     }
 
-    if (tri.a >= points.size() || tri.b >= points.size() || tri.c >= points.size()) return 0;
-
-    const auto& a = points[tri.a];
-    const auto& b = points[tri.b];
-    const auto& c = points[tri.c];
-    float cx = (a.x + b.x + c.x) / 3.0f;
-    float cy = (a.y + b.y + c.y) / 3.0f;
-    float cz = (a.z + b.z + c.z) / 3.0f;
-
-    float nx = spanX > 0.00001f ? (cx - minX) / spanX : 0.5f;
-    float ny = spanY > 0.00001f ? (cy - minY) / spanY : 0.5f;
-    float nz = spanZ > 0.00001f ? (cz - minZ) / spanZ : 0.5f;
-    float sideAmount = std::fabs(nx - 0.5f);
-
-    int chosen = -1;
-    if (nz < 0.12f) chosen = findModelTextureRegionByNeedles({"shoe", "boot", "feet", "foot"});
-    if (chosen < 0 && nz < 0.46f) chosen = findModelTextureRegionByNeedles({"trouser", "pants", "jean", "leg"});
-    if (chosen < 0 && sideAmount > 0.27f && nz > 0.35f && nz < 0.82f) chosen = findModelTextureRegionByNeedles({"arm", "hand", "skin"});
-    if (chosen < 0 && nz > 0.78f) chosen = findModelTextureRegionByNeedles({"head", "face", "hair"});
-    if (chosen < 0 && nz > 0.42f && nz < 0.78f && sideAmount < 0.14f) chosen = findModelTextureRegionByNeedles({"tie"});
-    if (chosen < 0 && nz > 0.38f && nz < 0.82f) chosen = findModelTextureRegionByNeedles({"shirt", "top", "torso", "body"});
-    if (chosen < 0) chosen = findModelTextureRegionByNeedles({"body", "top", "shirt", "head", "trouser", "pants"});
-    if (chosen < 0) chosen = 0;
-    return chosen;
+    // A single-texture archive is unambiguous. With multiple textures, never
+    // substitute a raster according to triangle position or body-part words.
+    if (gModelTextureRegions.size() == 1u) return 0;
+    return -1;
 }
 
 static float wrapModelTextureCoordinate(float value) {
@@ -3189,8 +3533,8 @@ static void emitModelPreviewTexcoordInRegion(
     computeModelPreviewTexcoord(vertexIndex, points, texcoords, useRealTexcoords, minX, minY, minZ, spanX, spanY, spanZ, u, v);
     if (regionIndex >= 0 && size_t(regionIndex) < gModelTextureRegions.size()) {
         const auto& region = gModelTextureRegions[size_t(regionIndex)];
-        float atlasU = region.u0 + u * (region.u1 - region.u0);
-        float atlasV = region.v0 + v * (region.v1 - region.v0);
+        float atlasU = region.u0 + wrapModelTextureCoordinate(u) * (region.u1 - region.u0);
+        float atlasV = region.v0 + wrapModelTextureCoordinate(v) * (region.v1 - region.v0);
         glTexCoord2f(atlasU, atlasV);
     } else {
         glTexCoord2f(u, v);
@@ -4633,6 +4977,16 @@ static void clearDtzFindState(bool clearQuery) {
     if (clearQuery) gDtzFindQuery.clear();
 }
 
+static void invalidateDtzDeepTextureFindIndex() {
+    // Resource replacement does not rename or remove directory rows. Keep the visible
+    // Find results and query in place so the user does not lose navigation context;
+    // only the deep texture-name cache needs rebuilding because XTX/CHK/TEX bytes may change.
+    gDtzTextureNameIndex.clear();
+    gDtzTextureNameIndexReady = false;
+    gDtzTextureArchivesScanned = 0;
+    gDtzTextureArchivesRejected = 0;
+}
+
 static bool isDtzTextureArchiveExtension(const std::wstring& extension) {
     return extension == L".xtx" || extension == L".chk" || extension == L".tex" || extension == L".txd";
 }
@@ -5041,46 +5395,28 @@ static void populateDtzList() {
     }
 
     const auto& dirEntries = gDtzArchive.dirEntries();
-    if (!dirEntries.empty()) {
-        HTREEITEM previewRoot = addTreeItem(root, L"Previewable resources from loaded IMG (MDL/DFF + XTX/CHK/TEX/TXD)");
-        HTREEITEM modelRoot = addTreeItem(previewRoot, L"Models shown through the OpenGL MDL viewer");
-        HTREEITEM textureRoot = addTreeItem(previewRoot, L"Texture archives shown through the texture viewer");
-        size_t modelShown = 0;
-        size_t textureShown = 0;
-        for (size_t i = 0; i < dirEntries.size(); ++i) {
-            const auto& entry = dirEntries[i];
-            std::wstring entryName = widenResourceName(entry.name);
-            std::wstring resourceName = safeEmbeddedFileName(canonicalDtzImgResourceName(entryName), L"resource.bin");
-            std::wstring ext = getExtensionLower(resourceName);
-            if (ext == L".mdl" || ext == L".dff" || ext == L".xtx" || ext == L".chk" || ext == L".tex" || ext == L".txd") {
-                std::wstringstream line;
-                line << entryName
-                     << L"  [sector " << entry.startSector << L" +" << entry.sectorCount << L"]"
-                     << L"  " << ((uint64_t(entry.sectorCount) * 2048ull + 1023ull) / 1024ull) << L" KiB";
-                if (ext == L".mdl" || ext == L".dff") {
-                    addTreeItem(modelRoot, line.str(), StorylandTreeKind::DtzDirEntry, int(i));
-                    modelShown++;
-                } else {
-                    addTreeItem(textureRoot, line.str(), StorylandTreeKind::DtzDirEntry, int(i));
-                    textureShown++;
-                }
-            }
-        }
-        if (modelShown == 0) addTreeItem(modelRoot, L"No .mdl/.dff entries were named in the current internal map.");
-        if (textureShown == 0) addTreeItem(textureRoot, L"No .xtx/.chk/.tex/.txd entries were named in the current internal map.");
-        expandTreeItem(previewRoot);
-    }
 
+    // Keep a single authoritative mixed resource list.  Older Storyland builds
+    // showed MDL/XTX/CHK/TEX/etc. together in sector order, which makes the
+    // streaming layout obvious and prevents a replacement re-selection from
+    // appearing to "lose" companion textures simply because the UI jumped into
+    // a model-only preview subtree.  DtzDirEntry rows already know how to open
+    // models and textures with the appropriate viewer, so the duplicate
+    // Models/Textures preview trees are unnecessary.
     HTREEITEM imgRoot = addTreeItem(root, L"GAME.DTZ + gta3ps*.img directory");
     if (!dirEntries.empty()) {
         for (size_t i = 0; i < dirEntries.size(); ++i) {
             const auto& entry = dirEntries[i];
+            // Legacy sector view: keep the mixed IMG directory exactly as one
+            // interleaved MDL/XTX/CHK/TEX/etc. list.  Do not replace this with
+            // model-only/texture-only preview trees; those made companion resources
+            // appear to vanish after an edit and changed the scroll target.
             std::wstringstream line;
-            uint64_t imgBytes = uint64_t(entry.sectorCount) * 2048ull;
             line << widenResourceName(entry.name)
-                 << L"  [" << entry.startSector << L"-" << (entry.startSector + entry.sectorCount) << L"]"
-                 << L"  +" << entry.sectorCount << L" sectors"
-                 << L"  " << ((imgBytes + 1023ull) / 1024ull) << L" KiB";
+                 << L" [" << entry.startSector << L"-" << (entry.startSector + entry.sectorCount) << L"]"
+                 << L" +" << entry.sectorCount;
+            if (entry.sectorCount == 1u) line << L" sector";
+            else line << L" sectors";
             addTreeItem(imgRoot, line.str(), StorylandTreeKind::DtzDirEntry, int(i));
         }
     } else {
@@ -5154,8 +5490,7 @@ static void returnToDtzFromAreaArchive() {
     clearDtzFindState(true);
     populateDtzList();
     SetWindowTextW(gMainWindow, L"Storyland - GAME.DTZ + gta3PS*.img + area archives");
-    StorylandTitleTint tint = titleTintFromPath(gDtzArchive.sourcePath());
-    applyStorylandTitleTint(tint == StorylandTitleTint::Default ? StorylandTitleTint::LCS : tint);
+    applyStorylandTitleTint(storiesDtzTint());
     refreshModeUi();
 }
 
@@ -9510,46 +9845,16 @@ static bool findBestDtzModelCompanionTextureIndex(size_t modelIndex, size_t& com
     std::wstring modelStem = getFileStemPart(modelName);
 
     size_t sameStemIndex = 0;
-    if (gDtzArchive.findDirEntryByStemAndExtension(modelStem, {L".xtx", L".chk", L".tex", L".txd"}, sameStemIndex)) {
+    if (gDtzArchive.findDirEntryByStemAndExtension(modelStem, {L".chk", L".xtx", L".tex", L".txd"}, sameStemIndex)) {
         companionTextureIndexOut = sameStemIndex;
         reasonOut = L"same cleaned stem";
         return true;
     }
 
-    uint32_t modelStart = modelEntry.startSector;
-    size_t bestIndex = size_t(-1);
-    uint32_t bestDistance = 0xFFFFFFFFu;
-
-    for (size_t index = 0; index < entries.size(); ++index) {
-        if (index == modelIndex) continue;
-        const auto& candidate = entries[index];
-        std::wstring candidateName = canonicalDtzImgResourceName(widen(candidate.name));
-        std::wstring candidateExt = getExtensionLower(candidateName);
-        if (!(candidateExt == L".xtx" || candidateExt == L".chk" || candidateExt == L".tex" || candidateExt == L".txd")) continue;
-        if (candidate.startSector > modelStart) continue;
-
-        uint32_t candidateEnd = candidate.startSector + candidate.sectorCount;
-        if (candidateEnd == modelStart) {
-            companionTextureIndexOut = index;
-            reasonOut = L"previous DTZ texture entry ends exactly at this model start";
-            return true;
-        }
-
-        if (candidateEnd < modelStart) {
-            uint32_t distance = modelStart - candidateEnd;
-            if (distance <= 16u && distance < bestDistance) {
-                bestDistance = distance;
-                bestIndex = index;
-            }
-        }
-    }
-
-    if (bestIndex != size_t(-1)) {
-        companionTextureIndexOut = bestIndex;
-        reasonOut = L"nearest previous texture archive in DTZ sector order";
-        return true;
-    }
-
+    // LCS stores many CHK collections AFTER their matching MDL. Sector adjacency
+    // cannot identify a material dictionary and previously attached unrelated CHKs.
+    // If the DTZ name table cannot resolve the texture stem, leave it unmatched.
+    reasonOut = L"No matching named texture archive in GAME.DTZ";
     return false;
 }
 
@@ -9617,30 +9922,15 @@ static bool prepareDtzDirEntryPreview(int index, std::wstring& previewSummary) {
 
         const auto& firstTexture = gTextureArchive.textures()[0];
         std::wstringstream ss;
-        ss << L"Texture preview active in the right pane. Storyland extracted this internal IMG entry to a temp file and decoded the first texture in the archive.\r\n"
-           << L"Preview source: " << primaryPath << L"\r\n"
-           << L"Decoded textures in archive: " << gTextureArchive.textures().size() << L"\r\n";
-        if (!clampSummary.empty()) {
-            ss << L"BPP conversion: " << clampSummary << L"\r\n";
-        }
-        ss << L"Showing texture 0: " << widen(firstTexture.name) << L"  " << firstTexture.width << L"x" << firstTexture.height << L"  bpp=" << int(firstTexture.bpp);
+        ss << L"Textures: " << gTextureArchive.textures().size() << L"\r\n"
+           << L"Texture: " << widen(firstTexture.name) << L"\r\n"
+           << L"Width: " << firstTexture.width << L"\r\n"
+           << L"Height: " << firstTexture.height << L"\r\n"
+           << L"BPP: " << static_cast<unsigned>(firstTexture.bpp) << L"\r\n"
+           << L"Mipmaps: " << static_cast<unsigned>(firstTexture.mipCount) << L"\r\n"
+           << L"Swizzle: " << (firstTexture.swizzleMask ? L"Yes" : L"No") << L"\r\n";
         previewSummary = ss.str();
         return true;
-    }
-
-    size_t companionTextureIndex = 0;
-    std::wstring companionTextureReason;
-    std::wstring extractedCompanionTexturePath;
-    if (findBestDtzModelCompanionTextureIndex(size_t(index), companionTextureIndex, companionTextureReason)) {
-        std::vector<uint8_t> textureBytes;
-        if (gDtzArchive.extractDirEntryBytes(companionTextureIndex, textureBytes, error)) {
-            std::wstring companionTextureName = safeEmbeddedFileName(
-                canonicalDtzImgResourceName(widen(gDtzArchive.dirEntries()[companionTextureIndex].name)), L"texture.xtx");
-            std::wstring companionTexturePath = extractRoot + L"\\" + companionTextureName;
-            if (writeWholeFileBinary(companionTexturePath, textureBytes, error)) {
-                extractedCompanionTexturePath = companionTexturePath;
-            }
-        }
     }
 
     gModelAnimLoaded = false;
@@ -9658,24 +9948,138 @@ static bool prepareDtzDirEntryPreview(int index, std::wstring& previewSummary) {
     }
 
     resetModelViewport();
+    clearModelTexture();
     std::wstring textureStatus;
-    loadCompanionTextureForCurrentModel(primaryPath, textureStatus);
+    std::wstring extractedCompanionTexturePath;
+    std::wstring companionTextureReason;
+    const bool lcsPs2Img = std::any_of(entries.begin(), entries.end(), [](const StorylandDtzDirEntry& candidate) {
+        return candidate.detectedExtension == ".chk";
+    });
+    if (lcsPs2Img) {
+        // LCS model streaming indices are not CHK indices. Match the actual
+        // texture names referenced by the model, not guessed resource names.
+        std::set<std::string> requiredNames;
+        for (const std::string& hint : gModelFile.textureNameHints()) {
+            if (!hint.empty()) requiredNames.insert(asciiLower(hint));
+        }
+        // A DTZ streaming index is not an IDE ModelInfo index. In particular,
+        // the retail LCS archive interleaves models, CHKs and animation entries.
+        // A verified companion DIR names both files by their actual sectors.
+        // Resolve that pairing first; never dereference ModelInfo[streamingIndex].
+        const std::string modelFilename = asciiLower(entries[size_t(index)].name);
+        const size_t modelDot = modelFilename.find_last_of('.');
+        const std::string modelStem = modelFilename.substr(0u, modelDot);
+        size_t bestIndex = entries.size();
+        size_t bestMatches = 0u;
+        bool ambiguous = false;
+        bool matchedByDirectoryName = false;
+        if (!modelStem.empty() && modelStem.find("model_") != 0u &&
+            modelStem.find("hash_") != 0u) {
+            for (size_t candidateIndex = 0; candidateIndex < entries.size(); ++candidateIndex) {
+                if (entries[candidateIndex].detectedExtension != ".chk") continue;
+                const std::string candidateFilename = asciiLower(entries[candidateIndex].name);
+                const size_t candidateDot = candidateFilename.find_last_of('.');
+                if (candidateFilename.substr(0u, candidateDot) != modelStem) continue;
+                if (bestIndex != entries.size()) {
+                    ambiguous = true;
+                    break;
+                }
+                bestIndex = candidateIndex;
+                matchedByDirectoryName = true;
+            }
+        }
+        // The names of MDL materials are used to verify the CHK selection,
+        // not as a substitute for the matching retail streaming directory.
+        if (bestIndex == entries.size() && !requiredNames.empty()) {
+            for (size_t candidateIndex = 0; candidateIndex < entries.size(); ++candidateIndex) {
+                if (entries[candidateIndex].detectedExtension != ".chk") continue;
+                std::vector<uint8_t> bytes;
+                std::string archiveError;
+                if (!gDtzArchive.extractDirEntryBytes(candidateIndex, bytes, archiveError)) continue;
+                LeedsTextureArchive archive;
+                if (!archive.loadFromMemory(bytes, LeedsPlatform::Ps2, archiveError, L"candidate.chk")) continue;
+                std::set<std::string> present;
+                for (const LeedsTextureEntry& texture : archive.textures()) present.insert(asciiLower(texture.name));
+                size_t matches = 0u;
+                for (const std::string& name : requiredNames) if (present.count(name)) ++matches;
+                if (matches > bestMatches) {
+                    bestMatches = matches;
+                    bestIndex = candidateIndex;
+                    ambiguous = false;
+                } else if (matches != 0u && matches == bestMatches) {
+                    ambiguous = true;
+                }
+            }
+        }
+        if (bestIndex < entries.size() && !ambiguous &&
+            (matchedByDirectoryName ||
+             (bestMatches > 0u && (bestMatches == requiredNames.size() || bestMatches >= 2u)))) {
+            std::vector<uint8_t> bytes;
+            if (gDtzArchive.extractDirEntryBytes(bestIndex, bytes, error)) {
+                const std::wstring path = extractRoot + L"\\matched_materials.chk";
+                if (writeWholeFileBinary(path, bytes, error) &&
+                    gModelTextureArchive.loadFromMemory(bytes, LeedsPlatform::Ps2, error, path)) {
+                    int decodedIndex = -1;
+                    int decodedCount = 0;
+                    if (buildModelTextureAtlasFromCurrentArchive(0, decodedIndex, decodedCount, error)) {
+                        extractedCompanionTexturePath = path;
+                        companionTextureReason = matchedByDirectoryName
+                            ? L"matched MDL and CHK resource names from the streaming directory"
+                            : L"matched MDL material names against decoded CHK contents";
+                        gModelTexturePath = path;
+                        gModelTextureIndex = decodedIndex;
+                        gModelTextureLoaded = true;
+                        gModelTextureUploadNeeded = true;
+                        textureStatus = L"CHK loaded | matched " + std::to_wstring(bestMatches) + L"/" + std::to_wstring(requiredNames.size()) +
+                            L" | sector " +
+                            std::to_wstring(entries[bestIndex].startSector);
+                        gModelTextureStatus = textureStatus;
+                    }
+                }
+            }
+        }
+        if (!gModelTextureLoaded) {
+            clearModelTexture();
+            textureStatus = L"No matching CHK textures";
+            gModelTextureStatus = textureStatus;
+        }
+    } else {
+        size_t companionIndex = 0u;
+        if (findBestDtzModelCompanionTextureIndex(size_t(index), companionIndex, companionTextureReason)) {
+            std::vector<uint8_t> bytes;
+            if (gDtzArchive.extractDirEntryBytes(companionIndex, bytes, error)) {
+                const std::wstring companionName = safeEmbeddedFileName(
+                    canonicalDtzImgResourceName(widen(entries[companionIndex].name)), L"texture.xtx");
+                const std::wstring path = extractRoot + L"\\" + companionName;
+                if (writeWholeFileBinary(path, bytes, error)) extractedCompanionTexturePath = path;
+            }
+        }
+        loadCompanionTextureForCurrentModel(primaryPath, textureStatus);
+    }
     gDtzEmbeddedPreviewKind = DtzEmbeddedPreviewKind::ModelFile;
     gDtzEmbeddedPreviewIndex = index;
     gDtzEmbeddedPreviewPath = primaryPath;
 
     std::wstringstream ss;
-    ss << L"OpenGL model preview active in the right pane. Storyland extracted this internal IMG entry to a temp file and loaded it with the normal MDL viewer path.\r\n"
-       << L"Preview source: " << primaryPath << L"\r\n"
-       << L"Detected model family: " << widen(gModelFile.modelKindName()) << L"\r\n"
-       << L"Texture status: " << textureStatus << L"\r\n"
-       << L"Flip V coordinate: " << (gModelFlipTextureV ? L"on" : L"off") << L"\r\n";
-    if (!extractedCompanionTexturePath.empty()) {
-        ss << L"DTZ companion texture: " << extractedCompanionTexturePath << L" (" << companionTextureReason << L")\r\n";
-    } else {
-        ss << L"DTZ companion texture: none extracted for this model entry.\r\n";
+    ss << L"Model: " << widen(gModelFile.modelKindName()) << L"\r\n"
+       << L"Vertices: " << gModelFile.previewPoints().size() << L"\r\n"
+       << L"Triangles: " << gModelFile.previewTriangles().size() << L"\r\n"
+       << L"UVs: " << gModelFile.previewTexcoords().size() << L"\r\n"
+       << L"Bones: " << gModelFile.armatureBones().size() << L"\r\n"
+       << L"Materials: " << gModelFile.previewMaterialTextureNames().size() << L"\r\n";
+    size_t weightedVertices = 0;
+    for (const auto& weights : gModelFile.previewSkinWeights()) {
+        if (weights.valid && weights.influenceCount > 0) ++weightedVertices;
     }
-    ss << L"Viewport controls: LMB rotate, RMB pan, wheel zoom, double-click reset.";
+    if (!gModelFile.previewSkinWeights().empty()) {
+        ss << L"Skinned vertices: " << weightedVertices << L"\r\n";
+    }
+    ss << L"Texture: " << (gModelTextureLoaded ? L"Loaded" : L"Unavailable") << L"\r\n"
+       << L"Flip V: " << (gModelFlipTextureV ? L"On" : L"Off") << L"\r\n";
+    if (gModelTextureLoaded) {
+        ss << L"Atlas width: " << gModelTextureImage.width << L"\r\n"
+           << L"Atlas height: " << gModelTextureImage.height << L"\r\n";
+    }
     previewSummary = ss.str();
     return true;
 }
@@ -9718,7 +10122,7 @@ static void openDtzDirEntryStandaloneByIndex(int entryIndex, int preferredTextur
             std::vector<uint8_t> textureBytes;
             if (gDtzArchive.extractDirEntryBytes(companionIndex, textureBytes, error)) {
                 std::wstring companionName = safeEmbeddedFileName(
-                    canonicalDtzImgResourceName(widen(gDtzArchive.dirEntries()[companionIndex].name)), L"texture.xtx");
+                    canonicalDtzImgResourceName(widen(gDtzArchive.dirEntries()[companionIndex].name)), L"texture.chk");
                 std::wstring companionPath = extractRoot + L"\\" + companionName;
                 writeWholeFileBinary(companionPath, textureBytes, error);
             }
@@ -9773,68 +10177,53 @@ static void selectDtzDirEntry(int index) {
     gSelectedKind = StorylandTreeKind::DtzDirEntry;
 
     std::wstringstream ss;
-    ss << L"GAME.DTZ + gta3ps*.img directory entry\r\n\r\n"
-       << L"Name: " << widenResourceName(entry.name) << L"\r\n"
-       << L"Internal map index: " << entry.dirIndex << L"\r\n"
-       << L"Start sector: " << entry.startSector << L"\r\n"
-       << L"Sector count: " << entry.sectorCount << L"\r\n"
-       << L"End sector: " << (uint64_t(entry.startSector) + uint64_t(entry.sectorCount)) << L"\r\n"
-       << L"Byte budget: " << entry.byteLength << L" bytes\r\n"
-       << L"KiB budget: " << (entry.byteLength / 1024ull) << L" KiB\r\n"
-       << L"IMG byte offset: " << entry.byteOffset << L"\r\n"
-       << L"IMG byte end: " << (entry.byteOffset + entry.byteLength) << L"\r\n"
-       << L"Detected payload type: " << widen(entry.detectedExtension.empty() ? std::string("unknown") : entry.detectedExtension) << L"\r\n"
-       << L"Matching DTZ records: " << entry.matchingRecordIndices.size() << L"\r\n";
-    if (entry.countDiffersFromCompanionDir) {
-        ss << L"Matched GAME.DTZ record sector count: " << entry.matchedDtzSectorCount << L"\r\n"
-           << L"Browser/preview sector count source: loaded .dir pair. Same-start GAME.DTZ count does not match.\r\n"
-           << L"This avoids extracting a truncated or over-long model/texture slice for preview while still keeping the GAME.DTZ record linked for patching.\r\n";
-    }
+    auto row = [&](const wchar_t* label, const std::wstring& value) {
+        ss << std::left << std::setw(18) << label << L"  " << value << L"\r\n";
+    };
+    auto number = [](uint64_t value) { return std::to_wstring(value); };
+    row(L"File", widenResourceName(entry.name));
+    row(L"Type", widen(entry.detectedExtension.empty() ? std::string("Unknown") : entry.detectedExtension));
+    row(L"Index", number(entry.dirIndex));
+    row(L"Start", number(entry.startSector));
+    row(L"Sectors", number(entry.sectorCount));
+    row(L"End", number(uint64_t(entry.startSector) + entry.sectorCount));
+    row(L"Size", number(entry.byteLength) + L" bytes");
+    row(L"Offset", number(entry.byteOffset));
+    row(L"IMG", gDtzArchive.hasCompanionImg() ?
+        (entry.fullyBackedByImg ? L"Available" : L"Outside archive") : L"Not loaded");
+    if (!gDtzArchive.companionDirPath().empty()) row(L"Directory", L"Loaded");
+    if (entry.countDiffersFromCompanionDir)
+        row(L"DTZ sectors", number(entry.matchedDtzSectorCount));
+    if (entry.matchingRecordIndices.empty()) row(L"Editing", L"Unavailable");
     ss << L"\r\n";
-
-    if (gDtzArchive.hasCompanionImg()) {
-        const uint64_t imgOffset = entry.byteOffset;
-        ss << L"Companion IMG loaded: " << gDtzArchive.companionImgPath() << L"\r\n"
-           << L"Companion IMG size: " << gDtzArchive.companionImgSize() << L" bytes\r\n"
-           << L"Available bytes for this entry: " << entry.availableBytes << L" / " << entry.byteLength << L"\r\n"
-           << L"This entry range is " << (entry.fullyBackedByImg ? L"inside" : L"past") << L" the loaded IMG size.\r\n\r\n";
-        if (imgOffset > gDtzArchive.companionImgSize()) {
-            ss << L"Warning: start offset is beyond the loaded IMG. The selected GAME.DTZ entry cannot address data in this IMG. Verify the DTZ/IMG pair.\r\n\r\n";
-        }
-    } else {
-        ss << L"No companion IMG loaded. Load gta3PS2.img/gta3PSP.img/GTA3PSPHR.IMG if you want this same patch action to grow/shrink the physical IMG layout too.\r\n\r\n";
-    }
-
-    if (!gDtzArchive.companionDirPath().empty()) {
-        ss << L"Optional beta-build .dir loaded: " << gDtzArchive.companionDirPath() << L"\r\n\r\n";
-    }
-
-    if (entry.matchingRecordIndices.empty()) {
-        ss << L"This internal map row is not backed by a recognized editable GAME.DTZ sector record, so patching is blocked for this line.\r\n";
-    } else {
-        ss << L"This line comes from GAME.DTZ sector records. Right-click > Patch selected sector count edits matching GAME.DTZ count fields and can shift later internal starts by the sector delta. If a companion IMG is loaded and shifting is enabled, Storyland also inserts/deletes the matching 2048-byte sector span in the IMG.\r\n";
-    }
 
     std::wstring previewSummary;
     prepareDtzDirEntryPreview(index, previewSummary);
     if (gDtzEmbeddedPreviewKind == DtzEmbeddedPreviewKind::ModelFile && gModelFile.isPmlcMdl()) {
         applyStorylandTitleTint(StorylandTitleTint::BloodRed);
     } else {
-        StorylandTitleTint dtzTint = titleTintFromPath(gDtzArchive.sourcePath());
-        if (dtzTint == StorylandTitleTint::Default) dtzTint = StorylandTitleTint::LCS;
-        applyStorylandTitleTint(dtzTint);
+        applyStorylandTitleTint(storiesDtzTint());
     }
     if (!previewSummary.empty()) {
-        ss << L"\r\nPreview section\r\n\r\n" << previewSummary << L"\r\n";
-    }
-
-    std::wstring ext = getDtzImgResourceExtensionLower(widenResourceName(entry.name));
-    if (ext == L".mdl" || ext == L".dff" || ext == L".xtx" || ext == L".chk" || ext == L".tex" || ext == L".txd") {
-        ss << L"\r\nTip: double-click this entry in the tree to open it as a standalone extracted file too.\r\n";
+        ss << L"Preview\r\n" << previewSummary << L"\r\n";
     }
 
     setDetails(ss.str());
     InvalidateRect(gPreview, nullptr, TRUE);
+}
+
+static int selectedDtzDirEntryIndex() {
+    if (gMode != StorylandMode::DtzArchive) return -1;
+    if (gSelectedKind == StorylandTreeKind::DtzDirEntry &&
+        gSelectedIndex >= 0 && size_t(gSelectedIndex) < gDtzArchive.dirEntries().size()) {
+        return gSelectedIndex;
+    }
+    if (gSelectedKind == StorylandTreeKind::DtzFindResult &&
+        gSelectedIndex >= 0 && size_t(gSelectedIndex) < gDtzFindResults.size()) {
+        const int entryIndex = gDtzFindResults[size_t(gSelectedIndex)].dirEntryIndex;
+        if (entryIndex >= 0 && size_t(entryIndex) < gDtzArchive.dirEntries().size()) return entryIndex;
+    }
+    return -1;
 }
 
 static void selectDtzFindResult(int index) {
@@ -9889,11 +10278,9 @@ static void selectDtzFindResult(int index) {
         ss << L"Double-click this Find result to jump to the matching GAME.DTZ item.\r\n";
     }
 
-    StorylandTitleTint dtzTint = titleTintFromPath(gDtzArchive.sourcePath());
+    StorylandTitleTint dtzTint = storiesDtzTint();
     if (gDtzEmbeddedPreviewKind == DtzEmbeddedPreviewKind::ModelFile && gModelFile.isPmlcMdl()) {
         dtzTint = StorylandTitleTint::BloodRed;
-    } else if (dtzTint == StorylandTitleTint::Default) {
-        dtzTint = StorylandTitleTint::LCS;
     }
     applyStorylandTitleTint(dtzTint);
     setDetails(ss.str());
@@ -9904,10 +10291,19 @@ static void selectDtzFindResult(int index) {
 static void openDtzFindResult(int index) {
     if (index < 0 || size_t(index) >= gDtzFindResults.size()) return;
     const StorylandDtzFindResult result = gDtzFindResults[size_t(index)];
+
     if (result.dirEntryIndex >= 0) {
-        openDtzDirEntryStandaloneByIndex(result.dirEntryIndex, result.deepTextureName ? result.textureIndex : -1);
+        if (!selectDtzDirectoryEntryItem(result.dirEntryIndex)) {
+            setStatus(L"Find result resource is no longer present; run Find again.");
+            return;
+        }
+        selectDtzDirEntry(result.dirEntryIndex);
+        setStatus(L"Find | selected " + canonicalDtzImgResourceName(
+            widenResourceName(gDtzArchive.dirEntries()[size_t(result.dirEntryIndex)].name)) +
+            L". Right-click to replace, export, rename, or analyze it.");
         return;
     }
+
     if (result.targetKind != StorylandTreeKind::None && result.targetIndex >= 0) {
         if (!selectTreePayloadItem(result.targetKind, result.targetIndex)) {
             setStatus(L"Find result source item is no longer present; run Find again.");
@@ -10077,12 +10473,8 @@ static void returnToGameDtz() {
     populateDtzList();
     SetWindowTextW(gMainWindow, gDtzArchive.hasCompanionImg() ? L"Storyland - GAME.DTZ + gta3PS*.img" : L"Storyland - GAME.DTZ");
 
-    StorylandTitleTint tint = returnTint;
-    if (tint == StorylandTitleTint::BloodRed || tint == StorylandTitleTint::Default) {
-        tint = titleTintFromPath(gDtzArchive.sourcePath());
-        if (tint == StorylandTitleTint::Default) tint = StorylandTitleTint::LCS;
-    }
-    applyStorylandTitleTint(tint);
+    (void)returnTint;
+    applyStorylandTitleTint(storiesDtzTint());
     refreshModeUi();
 
     bool restored = false;
@@ -10393,9 +10785,7 @@ static void selectDtzPayload(const StorylandTreePayload& payload) {
     }
     if (payload.kind != StorylandTreeKind::DtzDirEntry) {
         clearDtzEmbeddedPreviewState();
-        StorylandTitleTint dtzTint = titleTintFromPath(gDtzArchive.sourcePath());
-        if (dtzTint == StorylandTitleTint::Default) dtzTint = StorylandTitleTint::LCS;
-        applyStorylandTitleTint(dtzTint);
+        applyStorylandTitleTint(storiesDtzTint());
     }
     if (payload.kind == StorylandTreeKind::DtzOverview) selectDtzOverview();
     else if (payload.kind == StorylandTreeKind::DtzHeader) selectDtzHeaderField(payload.index);
@@ -10669,9 +11059,7 @@ static bool openImgWithGameDtzPair(const std::wstring& imgPath, std::string& err
     gModelDistance = 4.0f;
     populateDtzList();
     SetWindowTextW(gMainWindow, L"Storyland - GAME.DTZ + gta3PS*.img");
-    StorylandTitleTint pairTint = titleTintFromPath(dtzPath);
-    if (pairTint == StorylandTitleTint::Default) pairTint = StorylandTitleTint::LCS;
-    applyStorylandTitleTint(pairTint);
+    applyStorylandTitleTint(storiesDtzTint());
     setStatus(L"Opened GAME.DTZ + IMG pair from IMG: " + imgPath);
     return true;
 }
@@ -11570,7 +11958,7 @@ static void selectGxtPayload(const StorylandTreePayload& payload) {
         const auto& table = gGxtFile.tables()[size_t(payload.index)];
         setDetails(L"Table: " + widen(table.name) + L"\r\nStrings: " + std::to_wstring(table.entries.size()));
     } else {
-        setDetails(widen(gGxtFile.summary()) + L"\r\n\r\nSelect a string to read it. Double-click to edit.\r\nFile menu: Find, Save, Save As, Export Text, and character encoding.\r\n\r\nGame tokens remain intact. Raw codes use ~#XXXX~.\r\nCharacter encoding changes display and input conversion only; existing raw codes are preserved.\r\nModified text remains in memory until saved.");
+        setDetails(widen(gGxtFile.summary()) + L"\r\n\r\nSelect a string to read it. Double-click to edit.\r\nFile menu: Find, Save, Save As, Export Text, and character encoding.");
     }
     updateActionBar();
 }
@@ -11955,9 +12343,7 @@ static void openStorylandFile(const std::wstring& path) {
         gModelDistance = 4.0f;
         populateDtzList();
         SetWindowTextW(gMainWindow, gDtzArchive.hasCompanionImg() ? L"Storyland - GAME.DTZ + gta3PS*.img" : L"Storyland - GAME.DTZ");
-        StorylandTitleTint dtzTint = titleTintFromPath(path);
-        if (dtzTint == StorylandTitleTint::Default) dtzTint = StorylandTitleTint::LCS;
-        applyStorylandTitleTint(dtzTint);
+        applyStorylandTitleTint(storiesDtzTint());
         refreshModeUi();
         InvalidateRect(gPreview, nullptr, FALSE);
         return;
@@ -12129,7 +12515,7 @@ static void openSelectedArchiveEntry() {
                 std::wstring companionName = mobileMatchedCompanion
                     ? stem + L".txd"
                     : widen(gArchiveBrowser.entries()[companionIndex].name);
-                companionName = safeEmbeddedFileName(companionName, L"texture.xtx");
+                companionName = safeEmbeddedFileName(companionName, L"texture.chk");
                 std::wstring companionPath = extractRoot + L"\\" + companionName;
                 writeWholeFileBinary(companionPath, textureBytes, error);
             }
@@ -13241,11 +13627,10 @@ static void exportSelectedResourceBytes() {
             MessageBoxW(gMainWindow, widen(error).c_str(), L"Texture resource export failed", MB_ICONERROR);
             return;
         }
-    } else if (gMode == StorylandMode::DtzArchive &&
-               gSelectedKind == StorylandTreeKind::DtzDirEntry && gSelectedIndex >= 0 &&
-               size_t(gSelectedIndex) < gDtzArchive.dirEntries().size()) {
-        suggestedName = canonicalDtzImgResourceName(widen(gDtzArchive.dirEntries()[size_t(gSelectedIndex)].name));
-        if (!gDtzArchive.extractDirEntryBytes(size_t(gSelectedIndex), bytes, error)) {
+    } else if (gMode == StorylandMode::DtzArchive && selectedDtzDirEntryIndex() >= 0) {
+        const int entryIndex = selectedDtzDirEntryIndex();
+        suggestedName = canonicalDtzImgResourceName(widen(gDtzArchive.dirEntries()[size_t(entryIndex)].name));
+        if (!gDtzArchive.extractDirEntryBytes(size_t(entryIndex), bytes, error)) {
             MessageBoxW(gMainWindow, widen(error).c_str(), L"DTZ stream export failed", MB_ICONERROR);
             return;
         }
@@ -14067,7 +14452,7 @@ static void openCompanionImgForCurrentDtz() {
     clearDtzFindState(true);
     populateDtzList();
     SetWindowTextW(gMainWindow, L"Storyland - GAME.DTZ + gta3PS*.img");
-    applyStorylandTitleTintForPath(path);
+    applyStorylandTitleTint(storiesDtzTint());
     setStatus(L"Loaded companion IMG for GAME.DTZ + gta3ps*.img directory: " + path);
 }
 
@@ -14435,17 +14820,147 @@ static bool selectedDtzEntryLooksReplaceable() {
            ext == L".col" || ext == L".bin";
 }
 
+static bool storylandReadPs2SimpleModelIdentity(
+    const std::vector<uint8_t>& bytes,
+    uint32_t& atomicOffset,
+    uint32_t& hashA,
+    uint32_t& hashB,
+    uint32_t& packedModelVisibility) {
+    atomicOffset = 0;
+    hashA = 0;
+    hashB = 0;
+    packedModelVisibility = 0;
+
+    if (bytes.size() < 0x24u ||
+        bytes[0] != 'l' || bytes[1] != 'd' || bytes[2] != 'm' || bytes[3] != 0) {
+        return false;
+    }
+
+    auto read32 = [&](size_t offset, uint32_t& value) -> bool {
+        if (offset + 4u > bytes.size()) return false;
+        value = uint32_t(bytes[offset + 0u]) |
+                (uint32_t(bytes[offset + 1u]) << 8u) |
+                (uint32_t(bytes[offset + 2u]) << 16u) |
+                (uint32_t(bytes[offset + 3u]) << 24u);
+        return true;
+    };
+
+    uint32_t logicalSize = 0;
+    if (!read32(0x08u, logicalSize) || logicalSize < 0x24u || logicalSize > bytes.size()) return false;
+    if (!read32(0x20u, atomicOffset)) return false;
+    if (atomicOffset == 0u || uint64_t(atomicOffset) + 0x34ull > logicalSize) return false;
+
+    uint32_t atomicMagic = 0;
+    uint32_t parentOrHelper = 0;
+    uint32_t geometryPointer = 0;
+    uint32_t clumpPointer = 0;
+    uint32_t hierarchyPointer = 0;
+    if (!read32(size_t(atomicOffset) + 0x00u, atomicMagic) ||
+        !read32(size_t(atomicOffset) + 0x04u, parentOrHelper) ||
+        !read32(size_t(atomicOffset) + 0x14u, geometryPointer) ||
+        !read32(size_t(atomicOffset) + 0x18u, clumpPointer) ||
+        !read32(size_t(atomicOffset) + 0x2Cu, hierarchyPointer)) {
+        return false;
+    }
+
+    // Retail PS2 Stories SimpleModels use Atomic1 0x0004AA01, have no Clump
+    // back-pointer/HAnim hierarchy, and point directly at their geometry wrapper.
+    // This deliberately excludes PED/CUT/vehicle atomics.
+    if (atomicMagic != 0x0004AA01u || geometryPointer == 0u ||
+        clumpPointer != 0u || hierarchyPointer != 0u) {
+        return false;
+    }
+    if (uint64_t(geometryPointer) + 0x20ull > logicalSize) return false;
+
+    if (!read32(size_t(atomicOffset) + 0x1Cu, hashA) ||
+        !read32(size_t(atomicOffset) + 0x20u, hashB) ||
+        !read32(size_t(atomicOffset) + 0x28u, packedModelVisibility)) {
+        return false;
+    }
+    return true;
+}
+
+static bool storylandApplyPs2SimpleModelTargetIdentity(
+    const std::vector<uint8_t>& originalTargetBytes,
+    std::vector<uint8_t>& replacementBytes,
+    uint32_t authoritativeModelId,
+    std::string& detail) {
+    detail.clear();
+
+    if (authoritativeModelId > 0xFFFFu) return false;
+
+    uint32_t sourceAtomic = 0, sourceHashA = 0, sourceHashB = 0, sourceModelVisibility = 0;
+    uint32_t replacementAtomic = 0, replacementHashA = 0, replacementHashB = 0, replacementModelVisibility = 0;
+    const bool sourceSimple = storylandReadPs2SimpleModelIdentity(
+        originalTargetBytes, sourceAtomic, sourceHashA, sourceHashB, sourceModelVisibility);
+    if (!storylandReadPs2SimpleModelIdentity(
+            replacementBytes, replacementAtomic, replacementHashA, replacementHashB, replacementModelVisibility)) {
+        return false;
+    }
+
+    auto write32 = [&](size_t offset, uint32_t value) -> bool {
+        if (offset + 4u > replacementBytes.size()) return false;
+        replacementBytes[offset + 0u] = uint8_t(value & 0xFFu);
+        replacementBytes[offset + 1u] = uint8_t((value >> 8u) & 0xFFu);
+        replacementBytes[offset + 2u] = uint8_t((value >> 16u) & 0xFFu);
+        replacementBytes[offset + 3u] = uint8_t((value >> 24u) & 0xFFu);
+        return true;
+    };
+
+    // GAME.DTZ's CStreamingInfo/model-info index is authoritative for the model ID.
+    // Atomic +0x1C/+0x20 are target runtime link pointers in retail PS2 Stories
+    // SimpleModels. They are not geometry hashes and must follow the streamed
+    // target resource. Preserve them from the original target whenever that
+    // target can be decoded as a direct PS2 SimpleModel.
+    if (sourceSimple) {
+        if (!write32(size_t(replacementAtomic) + 0x1Cu, sourceHashA) ||
+            !write32(size_t(replacementAtomic) + 0x20u, sourceHashB)) {
+            return false;
+        }
+    }
+
+    uint32_t visibility = (replacementModelVisibility >> 16u) & 0xFFFFu;
+    const uint32_t sourceModelId = sourceModelVisibility & 0xFFFFu;
+    if (sourceSimple && sourceModelId == authoritativeModelId) {
+        visibility = (sourceModelVisibility >> 16u) & 0xFFFFu;
+    }
+    const uint32_t patchedModelVisibility = (visibility << 16u) | (authoritativeModelId & 0xFFFFu);
+    if (!write32(size_t(replacementAtomic) + 0x28u, patchedModelVisibility)) return false;
+
+    std::ostringstream out;
+    out << "Applied authoritative GAME.DTZ PS2 SimpleModel identity: model_info_id=0x"
+        << std::uppercase << std::hex << authoritativeModelId
+        << ", visibility=0x" << visibility
+        << ". Runtime link fields " << (sourceSimple ? "were copied from the original target" : "could not be recovered from the target") ;
+    if (sourceSimple && sourceModelId != authoritativeModelId) {
+        out << " (existing IMG target carried stale model_info_id=0x" << sourceModelId << ")";
+    }
+    out << ".";
+    detail = out.str();
+    return true;
+}
+
 static void replaceSelectedDtzDirEntryFromFile() {
-    if (gMode != StorylandMode::DtzArchive || gSelectedKind != StorylandTreeKind::DtzDirEntry || gSelectedIndex < 0) {
+    const int resolvedEntryIndex = selectedDtzDirEntryIndex();
+    if (gMode != StorylandMode::DtzArchive || resolvedEntryIndex < 0) {
         MessageBoxW(gMainWindow, L"Select a GAME.DTZ internal IMG entry first.", L"Storyland", MB_ICONINFORMATION);
         return;
     }
 
     const auto& entries = gDtzArchive.dirEntries();
-    if (size_t(gSelectedIndex) >= entries.size()) return;
+    if (size_t(resolvedEntryIndex) >= entries.size()) return;
 
-    uint32_t selectedStartSector = entries[size_t(gSelectedIndex)].startSector;
-    std::wstring selectedNameBefore = widen(entries[size_t(gSelectedIndex)].name);
+    uint32_t selectedStartSector = entries[size_t(resolvedEntryIndex)].startSector;
+    std::wstring selectedNameBefore = widen(entries[size_t(resolvedEntryIndex)].name);
+    const int firstVisibleEntryBeforeReplace = firstVisibleDtzDirectoryEntryIndex();
+
+    std::vector<uint8_t> originalTargetBytes;
+    std::string originalTargetReadError;
+    if (!gDtzArchive.extractDirEntryBytes(size_t(resolvedEntryIndex), originalTargetBytes, originalTargetReadError)) {
+        MessageBoxW(gMainWindow, widen(originalTargetReadError).c_str(),
+                    L"Could not read original target resource", MB_ICONERROR);
+        return;
+    }
 
     static const wchar_t replacementFilter[] =
         L"Leeds / Stories resource\0*.mdl;*.dff;*.xtx;*.chk;*.tex;*.txd;*.anim;*.cam;*.cut;*.col;*.col2;*.bin\0"
@@ -14468,6 +14983,8 @@ static void replaceSelectedDtzDirEntryFromFile() {
     const std::vector<uint8_t> replacementBytesFromDisk = replacementBytes;
 
     std::string textureRuntimeRepairDetail;
+    std::string modelIdentityTransferDetail;
+    bool modelIdentityTransferred = false;
     const std::wstring selectedExtension = getExtensionLower(selectedNameBefore);
     const std::wstring replacementExtension = getExtensionLower(replacementPath);
     const bool looksLikeLeedsMdl =
@@ -14525,16 +15042,16 @@ static void replaceSelectedDtzDirEntryFromFile() {
     }
 
     if (selectedExtension == L".mdl" || replacementExtension == L".mdl" || looksLikeLeedsMdl) {
-        // DTZ/IMG replacement is a container operation. The selected MDL must be
-        // inserted byte-for-byte exactly as supplied by the user. Do NOT run any
-        // model "repair", normalization, HAnim remap, material-slot rewrite, DMA
-        // rewrite, or relocation-count rewrite here. Those transformations are
-        // appropriate only for an explicit model-edit/export operation.
-        //
-        // In particular, storylandRepairVcsRetailPlayerHAnimIds() used to permute
-        // the 22 VCS player hierarchy IDs immediately before insertion, meaning a
-        // known-good cjmdl5.mdl was silently changed while GAME.DTZ/IMG sector
-        // repacking itself was correct. Validation below is read-only.
+        // Geometry/material/DMA bytes remain the exporter's responsibility.
+        // Runtime identity belongs to the target streamed resource. For PS2
+        // SimpleModels, copy only the target Atomic runtime identity fields:
+        // hash A (+0x1C), hash B (+0x20), and packed model-info/visibility (+0x28).
+        // No pointer, geometry, material, DMA/VIF, relocation, or size field is
+        // rewritten here.
+        modelIdentityTransferred = storylandApplyPs2SimpleModelTargetIdentity(
+            originalTargetBytes, replacementBytes,
+            entries[size_t(resolvedEntryIndex)].streamingIndex,
+            modelIdentityTransferDetail);
 
         StorylandModelFile candidateModel;
         std::string candidateLoadError;
@@ -14558,14 +15075,52 @@ static void replaceSelectedDtzDirEntryFromFile() {
             return;
         }
 
-        // Hard invariant: model validation is read-only. If a future code change
-        // mutates the candidate bytes, refuse the replacement instead of silently
-        // corrupting a known-good MDL.
-        if (replacementBytes != replacementBytesFromDisk) {
+        // Guard against accidental Storyland model rewriting. If identity was
+        // transferred, the only permitted difference from the selected MDL is
+        // Atomic +0x28 (packed model-info ID / visibility). Renderer callback
+        // fields +0x1C/+0x20 remain byte-identical to the replacement export.
+        if (modelIdentityTransferred) {
+            std::vector<uint8_t> expectedBytes = replacementBytesFromDisk;
+            uint32_t diskAtomic = 0, diskHashA = 0, diskHashB = 0, diskModelVisibility = 0;
+            uint32_t patchedAtomic = 0, patchedHashA = 0, patchedHashB = 0, patchedModelVisibility = 0;
+            const bool diskSimple = storylandReadPs2SimpleModelIdentity(
+                expectedBytes, diskAtomic, diskHashA, diskHashB, diskModelVisibility);
+            const bool patchedSimple = storylandReadPs2SimpleModelIdentity(
+                replacementBytes, patchedAtomic, patchedHashA, patchedHashB, patchedModelVisibility);
+            if (!diskSimple || !patchedSimple || diskAtomic != patchedAtomic ||
+                size_t(diskAtomic) + 0x2Cu > expectedBytes.size()) {
+                MessageBoxW(gMainWindow,
+                            L"Storyland could not verify the SimpleModel identity-only replacement mutation.",
+                            L"MDL identity guard", MB_OK | MB_ICONERROR);
+                return;
+            }
+            auto writeExpected32 = [&](size_t offset, uint32_t value) {
+                expectedBytes[offset + 0u] = uint8_t(value & 0xFFu);
+                expectedBytes[offset + 1u] = uint8_t((value >> 8u) & 0xFFu);
+                expectedBytes[offset + 2u] = uint8_t((value >> 16u) & 0xFFu);
+                expectedBytes[offset + 3u] = uint8_t((value >> 24u) & 0xFFu);
+            };
+            uint32_t sourceAtomicGuard = 0, sourceHashAGuard = 0, sourceHashBGuard = 0, sourceModelVisibilityGuard = 0;
+            const bool sourceSimpleGuard = storylandReadPs2SimpleModelIdentity(
+                originalTargetBytes, sourceAtomicGuard, sourceHashAGuard, sourceHashBGuard, sourceModelVisibilityGuard);
+            if (sourceSimpleGuard) {
+                writeExpected32(size_t(diskAtomic) + 0x1Cu, sourceHashAGuard);
+                writeExpected32(size_t(diskAtomic) + 0x20u, sourceHashBGuard);
+            }
+            writeExpected32(size_t(diskAtomic) + 0x28u, patchedModelVisibility);
+            if (expectedBytes != replacementBytes) {
+                MessageBoxW(
+                    gMainWindow,
+                    L"Storyland attempted to modify MDL data outside the packed SimpleModel model-info/visibility field. "
+                    L"The replacement was cancelled.",
+                    L"MDL identity guard",
+                    MB_OK | MB_ICONERROR);
+                return;
+            }
+        } else if (replacementBytes != replacementBytesFromDisk) {
             MessageBoxW(
                 gMainWindow,
-                L"Storyland attempted to modify the MDL before IMG insertion. The replacement was cancelled. "
-                L"DTZ/IMG replacement must preserve MDL bytes exactly.",
+                L"Storyland attempted to modify a non-SimpleModel MDL before IMG insertion. The replacement was cancelled.",
                 L"MDL byte-preservation guard",
                 MB_OK | MB_ICONERROR);
             return;
@@ -14573,12 +15128,12 @@ static void replaceSelectedDtzDirEntryFromFile() {
     }
 
     std::string report;
-    if (!gDtzArchive.replaceDirEntryBytes(size_t(gSelectedIndex), replacementBytes, true, report, error)) {
+    if (!gDtzArchive.replaceDirEntryBytes(size_t(resolvedEntryIndex), replacementBytes, true, report, error)) {
         MessageBoxW(gMainWindow, widen(error).c_str(), L"DTZ+IMG replacement failed", MB_ICONERROR);
         return;
     }
 
-    clearDtzFindState(true);
+    invalidateDtzDeepTextureFindIndex();
     populateDtzList();
 
 
@@ -14595,9 +15150,14 @@ static void replaceSelectedDtzDirEntryFromFile() {
         report += "\n";
         report += textureRuntimeRepairDetail;
     }
+    if (!modelIdentityTransferDetail.empty()) {
+        report += "\n";
+        report += modelIdentityTransferDetail;
+    }
 
     std::wstring detailText = widen(report);
     if (replacementPreviewIndex >= 0) {
+        restoreDtzDirectoryViewport(firstVisibleEntryBeforeReplace, replacementPreviewIndex);
         selectDtzDirEntry(replacementPreviewIndex);
         detailText += L"\r\n\r\nRe-selected edited entry for preview: ";
         detailText += widen(updatedEntries[size_t(replacementPreviewIndex)].name);
@@ -14648,7 +15208,7 @@ static void renameSelectedDtzDirEntry() {
         }
     }
     if (reselect >= 0) {
-        selectTreePayloadItem(StorylandTreeKind::DtzDirEntry, reselect);
+        selectDtzDirectoryEntryItem(reselect);
         selectDtzDirEntry(reselect);
     }
     setDetails(widen(report));
@@ -16311,6 +16871,18 @@ static void drawModelPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
                 const StorylandModelPoint& normalB = tri.b < gouraudNormals.size() ? gouraudNormals[tri.b] : faceNormal;
                 const StorylandModelPoint& normalC = tri.c < gouraudNormals.size() ? gouraudNormals[tri.c] : faceNormal;
                 int textureRegion = wantsTexture ? chooseModelTextureRegionForTriangle(tri, pts, minX, minY, minZ, spanX, spanY, spanZ) : -1;
+                // Texture enable state cannot change inside glBegin/glEnd.
+                // Keep triangles without a proven material/texture match untextured.
+                if (wantsTexture) {
+                    glEnd();
+                    if (textureRegion >= 0) glEnable(GL_TEXTURE_2D);
+                    else glDisable(GL_TEXTURE_2D);
+                    if (usingStoriesShader) {
+                        stopStoriesShaderProgram();
+                        usingStoriesShader = beginStoriesShaderProgram(textureRegion >= 0);
+                    }
+                    glBegin(GL_TRIANGLES);
+                }
                 setVertexPrelight(tri.a);
                 if (wantsTexture) emitModelPreviewTexcoordInRegion(tri.a, textureRegion, pts, texcoords, hasRealTexcoords, minX, minY, minZ, spanX, spanY, spanZ);
                 emitPreviewVertexWithNormal(a, normalA);
@@ -17776,6 +18348,7 @@ static void layoutChildren(HWND hwnd) {
 
         storylandMoveWindowToRect(gTree, treeRect);
         storylandMoveWindowToRect(gDetails, detailsRect);
+        resizeDetailsGrid();
 
         storylandInvalidatePaneFrame(gTree);
         storylandInvalidatePaneFrame(gDetails);
@@ -17912,6 +18485,7 @@ static void layoutChildren(HWND hwnd) {
         detailsBottom
     };
     storylandMoveWindowToRect(gDetails, detailsRect);
+        resizeDetailsGrid();
     updateArchiveCreateDirInlineButton();
 
     // Repaint only the newly exposed parent background. Child controls repaint
@@ -18082,13 +18656,26 @@ static bool collectCurrentAnalyzeResource(
         return gArchiveBrowser.extractEntryBytes(size_t(gSelectedIndex), bytes, errorMessage);
     }
 
-    if (gMode == StorylandMode::DtzArchive &&
-        gSelectedKind == StorylandTreeKind::DtzDirEntry &&
-        gSelectedIndex >= 0 &&
-        size_t(gSelectedIndex) < gDtzArchive.dirEntries().size()) {
-        const auto& entry = gDtzArchive.dirEntries()[size_t(gSelectedIndex)];
-        displayName = widenResourceName(entry.name);
-        return gDtzArchive.extractDirEntryBytes(size_t(gSelectedIndex), bytes, errorMessage);
+    if (gMode == StorylandMode::ArchiveFile &&
+        (gSelectedKind == StorylandTreeKind::ArchiveMeshResource ||
+         gSelectedKind == StorylandTreeKind::ArchivePlacement)) {
+        uint32_t resourceId = 0;
+        if (!selectedArchiveResourceId(resourceId)) {
+            errorMessage = "Selected model resource is no longer available.";
+            return false;
+        }
+        displayName = widen(gArchiveBrowser.resourceDisplayName(resourceId));
+        if (getExtensionLower(displayName).empty()) displayName += L".mdl";
+        return gArchiveBrowser.extractWorldMeshResourceBytes(resourceId, bytes, errorMessage);
+    }
+
+    if (gMode == StorylandMode::DtzArchive) {
+        const int entryIndex = selectedDtzDirEntryIndex();
+        if (entryIndex >= 0) {
+            const auto& entry = gDtzArchive.dirEntries()[size_t(entryIndex)];
+            displayName = widenResourceName(entry.name);
+            return gDtzArchive.extractDirEntryBytes(size_t(entryIndex), bytes, errorMessage);
+        }
     }
 
     errorMessage = "Select a resource before using Analyze.";
@@ -18445,9 +19032,13 @@ static bool buildTreeContextMenu(HMENU menu) {
 
         if (gSelectedKind == StorylandTreeKind::DtzFindResult && gSelectedIndex >= 0 && size_t(gSelectedIndex) < gDtzFindResults.size()) {
             const StorylandDtzFindResult& result = gDtzFindResults[size_t(gSelectedIndex)];
-            if (result.dirEntryIndex >= 0) {
+            if (result.dirEntryIndex >= 0 && size_t(result.dirEntryIndex) < gDtzArchive.dirEntries().size()) {
                 AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-                specificItems = addContextMenuItem(menu, ID_FILE_OPEN_EMBEDDED, L"Open matched internal resource...") || specificItems;
+                specificItems = addContextMenuItem(menu, ID_FILE_OPEN_EMBEDDED, L"Go to matched resource") || specificItems;
+                specificItems = addContextMenuItem(menu, ID_FILE_EXPORT_SELECTED_RESOURCE, L"Export matched resource...") || specificItems;
+                specificItems = addContextMenuItem(menu, ID_DTZ_REPLACE_SELECTED_ENTRY, L"Replace matched resource...") || specificItems;
+                const std::string& resourceName = gDtzArchive.dirEntries()[size_t(result.dirEntryIndex)].name;
+                specificItems = addAnalyzeSubmenu(menu, resourceNameSupportsAnalyzeGraph(resourceName)) || specificItems;
             }
         } else if (gSelectedKind == StorylandTreeKind::DtzDirEntry) {
             AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -18522,6 +19113,10 @@ static bool buildTreeContextMenu(HMENU menu) {
             hasItems = addContextMenuItem(menu, ID_ARCHIVE_PLACE_RESOURCE, L"Place Resource...") || hasItems;
             hasItems = addContextMenuItem(menu, ID_FILE_EXPORT_SELECTED_RESOURCE, L"Export Model Resource...") || hasItems;
             hasItems = addContextMenuItem(menu, ID_ARCHIVE_REPLACE_SELECTED_RESOURCE, L"Replace Model...") || hasItems;
+            uint32_t analyzeResourceId = 0;
+            if (selectedArchiveResourceId(analyzeResourceId)) {
+                hasItems = addAnalyzeSubmenu(menu, true) || hasItems;
+            }
             AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
             hasItems = addContextMenuItem(menu, ID_ARCHIVE_REPLACE_MESH_WITH_RESOURCE_ID, L"Clone from Resource ID...") || hasItems;
             hasItems = addContextMenuItem(menu, ID_ARCHIVE_CHANGE_SELECTED_MESH_RESOURCE_ID, L"Change Resource ID...") || hasItems;
@@ -18530,6 +19125,10 @@ static bool buildTreeContextMenu(HMENU menu) {
             hasItems = addContextMenuItem(menu, ID_ARCHIVE_PLACE_RESOURCE, L"Place Another...") || hasItems;
             hasItems = addContextMenuItem(menu, ID_ARCHIVE_REPLACE_SELECTED_RESOURCE, L"Replace Model...") || hasItems;
             hasItems = addContextMenuItem(menu, ID_FILE_EXPORT_SELECTED_RESOURCE, L"Export Model Resource...") || hasItems;
+            uint32_t analyzeResourceId = 0;
+            if (selectedArchiveResourceId(analyzeResourceId)) {
+                hasItems = addAnalyzeSubmenu(menu, true) || hasItems;
+            }
         } else if (gSelectedKind == StorylandTreeKind::ArchiveDirectTexture) {
             hasItems = addContextMenuItem(menu, ID_ARCHIVE_EXPORT_DIRECT_TEXTURE, L"Export Texture...") || hasItems;
             hasItems = addContextMenuItem(menu, ID_ARCHIVE_REPLACE_DIRECT_TEXTURE, L"Replace Texture...") || hasItems;
@@ -19665,6 +20264,16 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         initializeOpenGlPreview(gPreview);
         gDetails = CreateWindowExW(0, L"EDIT", nullptr, WS_CHILD | WS_CLIPSIBLINGS | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_NOHIDESEL, 0, 0, 100, 100, hwnd, reinterpret_cast<HMENU>(ID_DETAILS), gInstance, nullptr);
         SendMessageW(gDetails, EM_SETLIMITTEXT, 16 * 1024 * 1024, 0);
+        WNDCLASSW detailsClass{};
+        detailsClass.hInstance = gInstance;
+        detailsClass.lpszClassName = L"StorylandDetailsPanel";
+        detailsClass.lpfnWndProc = detailsPanelProc;
+        detailsClass.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
+        RegisterClassW(&detailsClass);
+        gDetailsGrid = CreateWindowExW(0, detailsClass.lpszClassName, nullptr,
+            WS_CHILD | WS_CLIPSIBLINGS | WS_VSCROLL,
+            0, 0, 100, 100, hwnd, nullptr, gInstance, nullptr);
+
         gActionBar = CreateWindowExW(0, L"STATIC", nullptr, WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN, 0, 0, 100, 36, hwnd, reinterpret_cast<HMENU>(ID_ACTION_BAR), gInstance, nullptr);
         gActionPrimary = CreateWindowExW(0, L"BUTTON", L"Test Model", WS_CHILD | WS_TABSTOP | WS_CLIPSIBLINGS | BS_OWNERDRAW, 0, 0, 118, 28, hwnd, reinterpret_cast<HMENU>(ID_ACTION_PRIMARY), gInstance, nullptr);
         gActionSecondary = CreateWindowExW(0, L"BUTTON", L"Apply Animation...", WS_CHILD | WS_TABSTOP | WS_CLIPSIBLINGS | BS_OWNERDRAW, 0, 0, 118, 28, hwnd, reinterpret_cast<HMENU>(ID_ACTION_SECONDARY), gInstance, nullptr);

@@ -230,6 +230,18 @@ static bool parsePs2Header(const std::vector<uint8_t>& data, uint32_t offset, Le
     uint32_t rasterOffset = readU32(data, offset + 8);
     uint32_t flags = readU32(data, offset + 12);
 
+    // LCS PS2 CHK stores its raster pointer and packed raster flags directly
+    // before the intrusive texture-list links. The node points to this pair.
+    // VCS XTX uses a separate raster header, so only select the CHK layout
+    // when the following two fields identify the owning list node.
+    if (readU32(data, offset + 8) == offset &&
+        readU32(data, offset + 12) == 0x20u) {
+        rasterOffset = readU32(data, offset + 0);
+        flags = readU32(data, offset + 4);
+        reserved0 = 0u;
+        reserved1 = 0u;
+    }
+
     uint32_t swizzle = flags & 0xFF;
     uint32_t mipCount = (flags >> 8) & 0xF;
     uint32_t bpp = (flags >> 14) & 0x3F;

@@ -14,6 +14,7 @@
 #include <iomanip>
 #include <initializer_list>
 #include <utility>
+#include <tuple>
 #include <limits>
 #include <map>
 #include <set>
@@ -396,10 +397,10 @@ bool StorylandDtzArchive::loadFromFile(const std::wstring& filePath, std::string
 
     if (!parse(errorMessage)) return false;
 
-    // Retail LCS/VCS GAME.DTZ contains the authoritative gta3PS*.img stream map.
-    // A nearby .dir may belong to a beta build or an old backup, so never load it implicitly.
-    // Beta DIR files remain available through the explicit Load .dir command.
     tryAutoLoadCompanionImg();
+
+    // Retail DTZ and IMG provide the resource allocations and texture names.
+    // No external DIR is necessary to open either game.
     rebuildDirMatches();
     return true;
 }
@@ -576,8 +577,10 @@ void StorylandDtzArchive::tryAutoLoadCompanionImg() {
         // Primary criterion: how much of the DTZ's own sector map the image actually backs.
         // Payload signatures break ties and prevent a similarly-sized unrelated IMG from
         // winning just because all ranges happen to fit.
-        if (left.backedRanges != right.backedRanges) return left.backedRanges > right.backedRanges;
+        // A large unrelated gta3 IMG can back every numeric sector range.
+        // Prefer actual Leeds payload signatures over accidental size matches.
         if (left.recognizablePayloads != right.recognizablePayloads) return left.recognizablePayloads > right.recognizablePayloads;
+        if (left.backedRanges != right.backedRanges) return left.backedRanges > right.backedRanges;
 
         const uint64_t leftSlack = left.bytes.size() >= left.highestReferencedEnd
             ? uint64_t(left.bytes.size()) - left.highestReferencedEnd
@@ -594,7 +597,7 @@ void StorylandDtzArchive::tryAutoLoadCompanionImg() {
     // fallback is still more useful than refusing to pair the files. Otherwise require the
     // winning IMG to back at least one real DTZ allocation.
     const ScoredImg& best = scored.front();
-    if (!records.empty() && best.backedRanges == 0u) return;
+    if (!records.empty() && (best.backedRanges == 0u || best.recognizablePayloads == 0u)) return;
 
     imgPath = best.path.wstring();
     imgRawData = best.bytes;
@@ -865,6 +868,47 @@ void StorylandDtzArchive::rebuildDirMatches() {
             }
         }
 
+        // LCS TexList is a table of 28-byte records: 8 bytes of metadata,
+        // followed by a 20-byte, NUL-terminated archive name.
+        // Entries 53, 54 and 55 (hud/generic/particle) reside in GAME.DTZ.
+        // The IMG CHK population begins at TexList entry 56 on this build.
+        const uint32_t texListOffset = readU32(unpackedData, 0x60u);
+        const uint32_t texListRowsOffset = texListOffset + 0x00u;
+        const uint32_t texListCountOffset = texListOffset + 0x08u;
+        uint32_t texListRows = 0u;
+        uint32_t texListCount = 0u;
+        if (texListOffset != 0u && uint64_t(texListOffset) + 16ull <= unpackedData.size()) {
+            texListRows = readU32(unpackedData, texListRowsOffset);
+            texListCount = readU32(unpackedData, texListCountOffset);
+        }
+        auto lcsTextureName = [&](uint32_t textureIndex) -> std::string {
+            if (texListRows == 0u || texListCount > 100000u || textureIndex >= texListCount) return {};
+            const uint64_t row = uint64_t(texListRows) + uint64_t(textureIndex) * 28ull;
+            if (row + 28ull > unpackedData.size()) return {};
+            std::string result;
+            for (uint32_t offset = 8u; offset < 28u; ++offset) {
+                const uint8_t character = unpackedData[size_t(row) + offset];
+                if (character == 0u) break;
+                if (!std::isalnum(character) && character != '_') return {};
+                result.push_back(char(character));
+            }
+            return result;
+        };
+        std::map<uint32_t, std::string> lcsModelNamesByHash;
+        for (uint32_t textureIndex = 0u; textureIndex < texListCount && textureIndex < 100000u; ++textureIndex) {
+            const std::string name = lcsTextureName(textureIndex);
+            if (!name.empty()) lcsModelNamesByHash.emplace(nameHash(name), name);
+        }
+        // CHK records and TexList entries are different index spaces.
+        // In LCS PS2 the first three streamed texture archives listed in
+        // TexList (hud, generic, particle) are embedded in GAME.DTZ.
+        // Number IMG CHK allocations separately, starting at TexList 56.
+        uint32_t imageTextureOrdinal = 0u;
+        std::map<std::pair<uint32_t, uint32_t>, std::string> verifiedNames;
+        for (const StorylandDtzDirEntry& named : externalDirMap) {
+            if (named.name.empty()) continue;
+            verifiedNames[{named.startSector, named.sectorCount}] = named.name;
+        }
         for (size_t streamIndex = 0u; streamIndex < lcsStreamRowCount; ++streamIndex) {
             const size_t rowOffset = lcsStreamBase + streamIndex * 0x14u;
             const uint32_t start = readU32(unpackedData, rowOffset + 0x04u);
@@ -882,50 +926,50 @@ void StorylandDtzArchive::rebuildDirMatches() {
             entry.startStorageOffset = uint32_t(rowOffset + 0x04u);
             entry.countStorageOffset = uint32_t(rowOffset + 0x08u);
             populateImageRangeInfo(entry);
+            // LCS retail PS2 texture collections use the xet container signature,
+            // but their resource type is CHK, not VCS XTX.
+            if (entry.detectedExtension == ".xtx") entry.detectedExtension = ".chk";
             attachMatchingRecords(entry);
 
             std::string baseName;
-            if (entry.detectedExtension == ".mdl" || entry.detectedExtension == ".dff") {
-                if (streamIndex < ideCount && modelInfoTable != 0u &&
-                    uint64_t(modelInfoTable) + uint64_t(streamIndex + 1u) * 4ull <= unpackedData.size()) {
-                    const uint32_t modelInfo = readU32(unpackedData, modelInfoTable + streamIndex * 4u);
-                    if (modelInfo != 0u && uint64_t(modelInfo) + 12ull <= unpackedData.size()) {
-                        const uint32_t hash = readU32(unpackedData, modelInfo + 8u);
-                        auto known = nameByHash.find(hash);
-                        if (known != nameByHash.end()) baseName = known->second;
-                        else {
-                            std::ostringstream unknown;
-                            unknown << "model_" << std::setw(4) << std::setfill('0') << streamIndex
-                                    << "_hash_" << std::uppercase << std::hex << std::setw(8)
-                                    << std::setfill('0') << hash;
-                            baseName = unknown.str();
-                        }
-                        entry.nameStorageOffset = modelInfo + 8u;
-                        entry.nameStorageLength = 4u;
-                        entry.nameStoredAsHash = true;
-                    }
+            const auto explicitName = explicitStreamNames.find(uint32_t(streamIndex));
+            if (explicitName != explicitStreamNames.end()) {
+                baseName = explicitName->second;
+            } else if (entry.detectedExtension == ".chk") {
+                baseName = lcsTextureName(56u + imageTextureOrdinal);
+                ++imageTextureOrdinal;
+            } else if (entry.detectedExtension == ".mdl") {
+                // The LCS PS2 ped/vehicle MDL normally follows its CHK.
+                // Use only an adjacent CHK allocation, never the DTZ stream
+                // index as a ModelInfo index.
+                for (const StorylandDtzDirEntry& preceding : dirMap) {
+                    if (preceding.detectedExtension != ".chk" ||
+                        uint64_t(preceding.startSector) + preceding.sectorCount != start)
+                        continue;
+                    baseName = preceding.name;
+                    const size_t dot = baseName.find_last_of('.');
+                    if (dot != std::string::npos) baseName.erase(dot);
+                    break;
                 }
-            } else if ((entry.detectedExtension == ".xtx" || entry.detectedExtension == ".chk" ||
-                        entry.detectedExtension == ".tex" || entry.detectedExtension == ".txd") &&
-                       firstTextureIndex != 0xFFFFFFFFu && streamIndex >= firstTextureIndex) {
-                const uint32_t slot = uint32_t(streamIndex) - firstTextureIndex;
-                if (slot < nameTable.names.size()) {
-                    baseName = nameTable.names[slot];
-                    const uint64_t nameOffset64 = uint64_t(nameTable.offset) + uint64_t(slot) * 28ull;
-                    if (nameOffset64 + 20ull <= unpackedData.size()) {
-                        entry.nameStorageOffset = uint32_t(nameOffset64);
-                        entry.nameStorageLength = 20u;
+            } else {
+                const auto verified = verifiedNames.find(key);
+                if (verified != verifiedNames.end()) {
+                    const std::string verifiedExtension = knownNameExtension(verified->second);
+                    if (verifiedExtension.empty() || verifiedExtension == entry.detectedExtension ||
+                        (entry.detectedExtension == ".chk" && verifiedExtension == ".xtx")) {
+                        baseName = verified->second;
                     }
-                }
-            } else if (entry.detectedExtension == ".anim" && firstAnimIndex != 0xFFFFFFFFu && streamIndex >= firstAnimIndex) {
-                const uint32_t slot = uint32_t(streamIndex) - firstAnimIndex;
-                if (slot < animNames.size()) {
-                    baseName = animNames[slot].name;
-                    entry.nameStorageOffset = animNames[slot].offset;
-                    entry.nameStorageLength = 24u;
                 }
             }
 
+            // Exact verified sector allocation wins over any TexList or IDE index guess.
+            const auto authoritative = verifiedNames.find(key);
+            if (authoritative != verifiedNames.end()) {
+                const std::string verifiedExtension = knownNameExtension(authoritative->second);
+                if (verifiedExtension == entry.detectedExtension ||
+                    (entry.detectedExtension == ".chk" && verifiedExtension == ".xtx"))
+                    baseName = authoritative->second;
+            }
             if (baseName.empty()) entry.name = makeRecoveredName(dirMap.size(), start, count, entry.detectedExtension);
             else entry.name = forceNameExtension(baseName, entry.detectedExtension);
             entryIndexByPair[key] = dirMap.size();
@@ -1754,6 +1798,7 @@ void StorylandDtzArchive::rebuildLeeds2dfxEffects() {
 }
 void StorylandDtzArchive::rebuildSectorRecords() {
     records.clear();
+    detectedGameVariant = StorylandDtzGameVariant::Unknown;
     std::set<std::pair<uint32_t, uint32_t>> seenOffsets;
 
     auto addRecord = [&](uint32_t recordOffset, uint32_t startOffset, uint32_t countOffset, uint32_t start, uint32_t count, const std::string& source) {
@@ -1813,6 +1858,7 @@ void StorylandDtzArchive::rebuildSectorRecords() {
 
         if (structurallyValidRows >= 256u && usefulRows >= 32u) {
             foundLcsStreamingTable = true;
+            detectedGameVariant = StorylandDtzGameVariant::Lcs;
             for (size_t row = 0u; row < rowCount; ++row) {
                 const size_t rowOffset = tableBase + row * 0x14u;
                 const uint32_t start = readU32(unpackedData, rowOffset + 0x04u);
@@ -1848,6 +1894,7 @@ void StorylandDtzArchive::rebuildSectorRecords() {
                       start, count, "VCS 0x18-byte GAME.DTZ gta3PS*.img streaming entry");
             strictCount++;
         }
+        if (strictCount != 0u) detectedGameVariant = StorylandDtzGameVariant::Vcs;
     }
 
     if (!foundLcsStreamingTable && strictCount == 0) {
@@ -3028,6 +3075,26 @@ bool StorylandDtzArchive::replaceDirEntryBytes(size_t dirEntryIndex, const std::
 
 
     StorylandDtzDirEntry selected = dirMap[dirEntryIndex];
+
+    // A replacement is allowed to move/resize allocations, but it must never change
+    // the logical resource directory.  Snapshot the complete resource identity set so
+    // a parser/regeneration bug cannot make neighbouring MDL/XTX/etc. entries vanish.
+    // This intentionally ignores sector positions/counts because those are expected to
+    // change when the selected allocation grows or shrinks.
+    using ResourceIdentity = std::tuple<uint32_t, std::string, std::string>;
+    auto stableResourceName = [](const StorylandDtzDirEntry& entry) -> std::string {
+        // Recovered fallback names encode their current sector (resource_N_sXXXXX_cXXXX),
+        // so sector shifting legitimately changes that text. Retail named resources such
+        // as fire_hydrant.xtx/fire_hydrant.mdl must remain byte-for-byte the same name.
+        if (entry.name.rfind("resource_", 0) == 0) return {};
+        return entry.name;
+    };
+    std::multiset<ResourceIdentity> originalResourceIdentities;
+    for (const StorylandDtzDirEntry& entry : dirMap) {
+        originalResourceIdentities.emplace(entry.streamingIndex, stableResourceName(entry), entry.detectedExtension);
+    }
+    const size_t originalResourceCount = dirMap.size();
+
     if (selected.sectorCount == 0) {
         errorMessage = "Selected internal IMG entry has a zero sector count.";
         return false;
@@ -3211,6 +3278,21 @@ bool StorylandDtzArchive::replaceDirEntryBytes(size_t dirEntryIndex, const std::
         return false;
     }
     rebuildDirMatches();
+
+    std::multiset<ResourceIdentity> rebuiltResourceIdentities;
+    for (const StorylandDtzDirEntry& entry : dirMap) {
+        rebuiltResourceIdentities.emplace(entry.streamingIndex, stableResourceName(entry), entry.detectedExtension);
+    }
+    if (dirMap.size() != originalResourceCount || rebuiltResourceIdentities != originalResourceIdentities) {
+        unpackedData = std::move(originalUnpackedData);
+        imgRawData = std::move(originalImgRawData);
+        externalDirMap = std::move(originalExternalDirMap);
+        std::string ignored;
+        parse(ignored);
+        rebuildDirMatches();
+        errorMessage = "Replacement was rolled back because rebuilding the GAME.DTZ/IMG map changed the resource directory. No neighbouring MDL/XTX/CHK/TEX or other resource is allowed to disappear, appear, or be renamed during a byte replacement.";
+        return false;
+    }
 
     // Postcondition: every browser locator AND every strict physical stream-table row must
     // agree after the transaction.  This is specifically a dual-replacement guard: a second
@@ -3485,3 +3567,7 @@ uint64_t StorylandDtzArchive::companionImgSize() const { return uint64_t(imgRawD
 bool StorylandDtzArchive::wasCompressedInput() const { return compressedInput; }
 bool StorylandDtzArchive::hasCompanionDir() const { return !externalDirMap.empty(); }
 bool StorylandDtzArchive::hasCompanionImg() const { return !imgRawData.empty(); }
+
+StorylandDtzGameVariant StorylandDtzArchive::gameVariant() const {
+    return detectedGameVariant;
+}

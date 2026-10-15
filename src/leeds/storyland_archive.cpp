@@ -3079,6 +3079,7 @@ void StorylandArchiveBrowser::buildWorldMeshes() {
         parsedPayloads.insert({sectorIndex, resourceId, rawOffset});
         mesh.rawOffset = descriptorOffset;
         mesh.textureScopeOffset = textureScopeOffset;
+        mesh.textureScopeInImg = true;
         mesh.textureScopeCellX = scopeCellX;
         mesh.textureScopeCellY = scopeCellY;
         mesh.hasTextureScopeCell = hasScopeCell;
@@ -3520,6 +3521,10 @@ void StorylandArchiveBrowser::buildWorldMeshes() {
                 double radiusRatio = 0.0;
                 double centerError = 0.0;
                 geometryScore = placementFitScore(candidate, placement, radiusRatio, centerError);
+                // The AREA resource id is only local to its streaming cell.
+                // A cell match alone does not prove that a decoded mesh belongs
+                // to this placement; refuse geometry with incompatible bounds.
+                if (!candidateFitsPlacement(candidate, placement)) continue;
                 if (cellDistance < bestCellDistance ||
                     (cellDistance == bestCellDistance && geometryScore < bestGeometryScore)) {
                     best = &candidate;
@@ -3557,12 +3562,19 @@ void StorylandArchiveBrowser::buildWorldMeshes() {
             // trusting the first decoded candidate unconditionally.
             resolution.candidateCount = uint32_t(exact->second.size());
             const CandidateMesh* choice = chooseByPlacement(exact->second);
-            if (choice == nullptr) choice = &exact->second.front();
-            resolution.source = exact->second.size() == 1u ? "same-sector" : "same-sector verified";
-            resolution.payloadOffset = choice->payloadOffset;
-            StorylandWorldMesh linked = choice->mesh;
-            linked.sectorIndex = sectorIndex;
-            worldMeshCache.push_back(std::move(linked));
+            if (choice == nullptr && exact->second.size() == 1u &&
+                scopeMatchesPlacement(exact->second.front())) {
+                choice = &exact->second.front();
+            }
+            if (choice != nullptr) {
+                resolution.source = exact->second.size() == 1u ? "same-sector" : "same-sector verified";
+                resolution.payloadOffset = choice->payloadOffset;
+                StorylandWorldMesh linked = choice->mesh;
+                linked.sectorIndex = sectorIndex;
+                worldMeshCache.push_back(std::move(linked));
+            } else {
+                resolution.source = "conflict";
+            }
         } else if (officialChoice != nullptr) {
             resolution.source = "official AERA";
             resolution.candidateCount = uint32_t(official->second.size());
@@ -3586,16 +3598,9 @@ void StorylandArchiveBrowser::buildWorldMeshes() {
                 linked.sectorIndex = sectorIndex;
                 worldMeshCache.push_back(std::move(linked));
             } else {
-                choice = chooseBestExactByPlacement(rowCandidates->second);
-                if (choice != nullptr) {
-                    resolution.source = "same-row fit fallback";
-                    resolution.payloadOffset = choice->payloadOffset;
-                    StorylandWorldMesh linkedMesh = choice->mesh;
-                    linkedMesh.sectorIndex = sectorIndex;
-                    worldMeshCache.push_back(std::move(linkedMesh));
-                } else {
-                    resolution.source = "conflict";
-                }
+                // Same-row resource ids can be reused by different streamed
+                // sectors. Do not substitute geometry with an invalid fit.
+                resolution.source = "conflict";
             }
         } else if (master != masterLvzMeshes.end() && !master->second.empty()) {
             resolution.candidateCount = uint32_t(master->second.size());
@@ -3613,16 +3618,9 @@ void StorylandArchiveBrowser::buildWorldMeshes() {
                 linked.sectorIndex = sectorIndex;
                 worldMeshCache.push_back(std::move(linked));
             } else {
-                choice = chooseBestExactByPlacement(master->second);
-                if (choice != nullptr) {
-                    resolution.source = "master LVZ fit fallback";
-                    resolution.payloadOffset = choice->payloadOffset;
-                    StorylandWorldMesh linkedMesh = choice->mesh;
-                    linkedMesh.sectorIndex = sectorIndex;
-                    worldMeshCache.push_back(std::move(linkedMesh));
-                } else {
-                    resolution.source = "conflict";
-                }
+                // Multiple master candidates without a valid placement match
+                // are ambiguous; selecting one at random distorts the world.
+                resolution.source = "conflict";
             }
         } else if (continuation != continuationMeshes.end() && !continuation->second.empty()) {
             resolution.candidateCount = uint32_t(continuation->second.size());

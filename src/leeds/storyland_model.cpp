@@ -6293,8 +6293,27 @@ void StorylandModelFile::parse() {
             addField(fieldRows, group.str(), "filler_or_flags", uint32_t(offset + 0x10), modelReadU32(data, offset + 0x10), "Often AAAAAAAA or runtime filler");
             addPointerField(data, fieldRows, group.str(), "geometry_ptr", uint32_t(offset + 0x14), "Pointer to Leeds geometry wrapper/header");
             addPointerField(data, fieldRows, group.str(), "clump_ptr", uint32_t(offset + 0x18), "Back pointer to clump");
-            addPointerField(data, fieldRows, group.str(), "clump_atomic_cycle_next", uint32_t(offset + 0x1C), "Clump atomic cycle next");
-            addPointerField(data, fieldRows, group.str(), "clump_atomic_cycle_prev", uint32_t(offset + 0x20), "Clump atomic cycle prev");
+
+            // Direct PS2 Stories SimpleModels reuse Atomic +0x1C/+0x20 as
+            // runtime identity/hash values. They are scalar IDs, not file-relative
+            // pointers, and therefore must never be required in the relocation table.
+            // PED/CUT/vehicle atomics keep the normal Clump cycle-link interpretation.
+            const bool directPs2SimpleAtomic =
+                data.size() >= 0x24u &&
+                modelReadU32(data, 0x20u) == uint32_t(offset) &&
+                modelReadU32(data, offset + 0x18u) == 0u &&
+                modelReadU32(data, offset + 0x2Cu) == 0u;
+            if (directPs2SimpleAtomic) {
+                addField(fieldRows, group.str(), "runtime_hash_a", uint32_t(offset + 0x1C),
+                         modelReadU32(data, offset + 0x1C),
+                         "PS2 SimpleModel runtime identity hash A; scalar value, not a relocatable pointer.");
+                addField(fieldRows, group.str(), "runtime_hash_b", uint32_t(offset + 0x20),
+                         modelReadU32(data, offset + 0x20),
+                         "PS2 SimpleModel runtime identity hash B; scalar value, not a relocatable pointer.");
+            } else {
+                addPointerField(data, fieldRows, group.str(), "clump_atomic_cycle_next", uint32_t(offset + 0x1C), "Clump atomic cycle next");
+                addPointerField(data, fieldRows, group.str(), "clump_atomic_cycle_prev", uint32_t(offset + 0x20), "Clump atomic cycle prev");
+            }
             addField(fieldRows, group.str(), "render_callback_or_pipeline", uint32_t(offset + 0x24), modelReadU32(data, offset + 0x24), "Render callback/pipeline id field");
             addU16Field(data, fieldRows, group.str(), "model_info_id", uint32_t(offset + 0x28),
                         "Signed model-info/IDE id field; 0xFFFF commonly means unassigned.");

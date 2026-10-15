@@ -66,27 +66,39 @@ LeedsRelocationLayout leedsRelocationLayout(const std::vector<uint8_t>& bytes) {
     const uint64_t logicalSize = leedsLogicalSize(bytes);
     if (layout.globalTableOffset < 0x20u || layout.globalTableOffset >= logicalSize) return layout;
 
-    // Leeds MDLs use two table placements:
+    // Retail Leeds MDLs place one metadata DWORD at globalTableOffset before
+    // the relocation field-offset rows.  Header +0x18 stores the address of
+    // the final relocation-row DWORD, so the canonical layout is:
     //
-    //  1) local/global table offsets are the same. Relocation field offsets
-    //     begin exactly at globalTable.
+    //   globalTable + 0x00 : ptr2_before_tex / address of final row
+    //   globalTable + 0x04 : relocation row 0
+    //   ...
+    //   globalTable + 4*N  : relocation row N-1
     //
-    //  2) local/global table offsets are split by four bytes. globalTable[0]
-    //     points back to the local table, and relocation field offsets begin
-    //     at globalTable + 4.
-    //
-    // Retail PS2 PED/Clump MDLs use the split-table form. In that layout
-    // headerCount counts DWORDs beginning at globalTableOffset:
-    //
-    //   [0] local-table self pointer
-    //   [1..N] relocation field offsets
-    //
-    // Therefore the number of actual pointer-field rows is headerCount - 1.
-    // This is confirmed by retail IMG models: the DWORD immediately after the
-    // declared split table is string/data, not another relocation entry.
-    if (layout.localTableOffset != layout.globalTableOffset &&
+    // Header +0x14 is N: the number of relocation rows, excluding the prefix.
+    // This is true whether localTable == globalTable (common retail files) or
+    // localTable points earlier to texture/string data (BLeeds SimpleModels).
+    // The previous parser only recognized the prefix when local == global and
+    // therefore dropped the final row (for example Atomic +0x24 at file 0x104).
+    const uint32_t firstTableDword = readU32(bytes, layout.globalTableOffset);
+    const uint32_t ptr2BeforeTex = readU32(bytes, 0x18u);
+
+    const bool hasCanonicalPrefix =
+        layout.headerCount > 0u &&
         uint64_t(layout.globalTableOffset) + 4ull <= logicalSize &&
-        readU32(bytes, layout.globalTableOffset) == layout.localTableOffset) {
+        firstTableDword == ptr2BeforeTex &&
+        uint64_t(layout.globalTableOffset) + uint64_t(layout.headerCount) * 4ull == uint64_t(ptr2BeforeTex);
+
+    if (hasCanonicalPrefix) {
+        layout.prefixedByLocalTablePointer = true;
+        layout.entriesOffset = uint64_t(layout.globalTableOffset) + 4ull;
+        layout.entryCount = layout.headerCount;
+    } else if (layout.localTableOffset != layout.globalTableOffset &&
+               uint64_t(layout.globalTableOffset) + 4ull <= logicalSize &&
+               firstTableDword == layout.localTableOffset) {
+        // Keep support for the older alternate split-table form where the
+        // prefix explicitly points at localTable and the header count includes
+        // that prefix.
         layout.prefixedByLocalTablePointer = true;
         layout.entriesOffset = uint64_t(layout.globalTableOffset) + 4ull;
         layout.entryCount = layout.headerCount > 0u ? layout.headerCount - 1u : 0u;
@@ -404,8 +416,51 @@ void validateRequiredLeedsRelocations(StorylandModelIntegrityReport& report,
 
     std::set<uint32_t> required;
     std::set<uint32_t> nonCriticalTrailing;
+
+    // In direct PS2 Stories SimpleModels, the top-level Atomic reuses +0x1C
+    // and +0x20 for runtime identity hashes. Those DWORDs can numerically look
+    // like valid file offsets, but they are scalar IDs and are intentionally not
+    // relocation-table entries. Keep this protection here as well as in the
+    // model field decoder so validation can never reinterpret them as pointers.
+    uint32_t simpleAtomicOffset = 0u;
+    if (model.modelKind() == StorylandModelKind::SimpleModel && logicalSize >= 0x24u) {
+        const uint32_t candidate = readU32(bytes, 0x20u);
+        if (candidate >= 0x20u && uint64_t(candidate) + 0x34ull <= logicalSize &&
+            readU32(bytes, candidate + 0x00u) == 0x0004AA01u &&
+            readU32(bytes, candidate + 0x18u) == 0u &&
+            readU32(bytes, candidate + 0x2Cu) == 0u) {
+            simpleAtomicOffset = candidate;
+        }
+    }
+
+    // Retail direct PS2 Stories SimpleModels always list Atomic1 + 0x24
+    // in the relocation table even when the stored DWORD is zero.  This is a
+    // runtime relocation/base slot, not an optional null pointer.  Because the
+    // generic pointer scan intentionally skips zero values, require this field
+    // explicitly for SimpleModels.
+    if (simpleAtomicOffset != 0u) {
+        required.insert(simpleAtomicOffset + 0x24u);
+    }
+
     for (const StorylandModelField& field : model.fields()) {
         if (!isTrustedPointerField(field)) continue;
+
+        // The relocation table itself contains DWORDs that intentionally look
+        // like file offsets.  They describe pointer-field locations and must
+        // never recursively require relocation entries of their own.  Include
+        // the optional prefix DWORD in this exclusion.
+        const uint64_t relocationStorageBegin = layout.prefixedByLocalTablePointer
+            ? uint64_t(layout.globalTableOffset)
+            : layout.entriesOffset;
+        if (uint64_t(field.offset) >= relocationStorageBegin &&
+            uint64_t(field.offset) < layout.entriesEnd) {
+            continue;
+        }
+
+        if (simpleAtomicOffset != 0u &&
+            (field.offset == simpleAtomicOffset + 0x1Cu || field.offset == simpleAtomicOffset + 0x20u)) {
+            continue;
+        }
         if ((field.offset & 3u) != 0u || uint64_t(field.offset) + 4ull > logicalSize) continue;
         const uint32_t value = readU32(bytes, field.offset);
         if (value == 0u || value == 0xFFFFFFFFu || value < 0x20u || uint64_t(value) >= logicalSize) continue;
@@ -440,6 +495,23 @@ void validateRequiredLeedsRelocations(StorylandModelIntegrityReport& report,
 
     for (uint32_t fieldOffset : required) {
         if (declared.find(fieldOffset) != declared.end()) continue;
+
+        // Direct PS2 SimpleModels use header +0x18 as a pointer to the final
+        // relocation-row DWORD.  Some older validator paths can still lose that
+        // last row while decoding split local/global relocation tables.  Treat
+        // the row referenced by +0x18 as authoritative before reporting a
+        // missing relocation.  This is intentionally narrow: it only accepts
+        // the exact DWORD stored at ptr2_before_tex, and only when that address
+        // lies inside the declared logical MDL size.
+        if (simpleAtomicOffset != 0u && fieldOffset == simpleAtomicOffset + 0x24u) {
+            const uint32_t finalRowOffset = readU32(bytes, 0x18u);
+            if ((finalRowOffset & 3u) == 0u &&
+                uint64_t(finalRowOffset) + 4ull <= logicalSize &&
+                readU32(bytes, finalRowOffset) == fieldOffset) {
+                continue;
+            }
+        }
+
         ++report.missingRequiredRelocations;
 
         const bool isTrailing = trailingSet.find(fieldOffset) != trailingSet.end();
