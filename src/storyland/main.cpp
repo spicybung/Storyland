@@ -53,9 +53,11 @@
 #include "storyland_model_validator.h"
 #include "storyland_media.h"
 #include "storyland_anim.h"
+#include "storyland_mobile_animation.h"
 #include "storyland_sky.h"
 #include "storyland_scm.h"
 #include "storyland_gxt.h"
+#include "storyland_data.h"
 #include "wic_image.h"
 #include "resource.h"
 
@@ -190,6 +192,15 @@ typedef void (APIENTRY *PFNGLACTIVETEXTUREPROC)(GLenum texture);
 #define ID_VIEW_FLIP_MODEL_TEXTURE_V 1010
 #define ID_FILE_OPEN_EMBEDDED 1011
 #define ID_VIEW_FLIP_TEXTURE_PREVIEW_V 1014
+#define ID_VIEW_TEXTURE_MIP_PREVIOUS 30901
+#define ID_VIEW_TEXTURE_MIP_NEXT 30902
+#define ID_VIEW_TEXTURE_ORDER_AUTO 30903
+#define ID_VIEW_TEXTURE_ORDER_STORED 30904
+#define ID_VIEW_TEXTURE_ORDER_PS2 30905
+#define ID_VIEW_TEXTURE_ORDER_PSP 30906
+static MobileTextureLayout gMobileTextureLayout = MobileTextureLayout::Automatic;
+static int gTextureLayoutIndex = -1;
+static uint32_t gTextureMipLevel = 0u;
 #define ID_ARCHIVE_REPLACE_SELECTED_RESOURCE 1015
 #define ID_ARCHIVE_REPLACE_MESH_WITH_RESOURCE_ID 1018
 #define ID_ARCHIVE_CHANGE_SELECTED_MESH_RESOURCE_ID 1019
@@ -487,7 +498,7 @@ static bool gAnimPlaying = false;
 static float gAnimCurrentTime = 0.0f;
 static DWORD gAnimLastTick = 0;
 static bool gModelAnimLoaded = false;
-static bool gApproximateAnimMeshPreview = true;
+static bool gApproximateAnimMeshPreview = false;
 static bool gLockAnimRootPreview = true;
 static bool gLockWeaponLowerBodyPreview = true;
 static bool gWeaponUpperBodyLayerMaskPreview = true;
@@ -760,7 +771,7 @@ enum class StorylandPrelightViewMode { Combined, Raw, Off };
 static StorylandPrelightViewMode gPrelightViewMode = StorylandPrelightViewMode::Combined;
 static int gSelectedPrelightVertex = -1;
 
-static enum class StorylandMode { Empty, TextureArchive, DtzArchive, ModelFile, WblFile, ArchiveFile, AnimFile, ScmFile, MediaFile, GxtFile } gMode = StorylandMode::Empty;
+static enum class StorylandMode { Empty, TextureArchive, DtzArchive, ModelFile, WblFile, ArchiveFile, AnimFile, ScmFile, MediaFile, GxtFile, DataFile } gMode = StorylandMode::Empty;
 static int gSelectedIndex = -1;
 
 
@@ -797,6 +808,9 @@ enum class StorylandTreeKind {
     AnimTrack,
     AnimField,
     AnimString,
+    DataOverview,
+    DataRow,
+    DataField,
     GxtOverview,
     GxtTable,
     GxtEntry,
@@ -809,6 +823,23 @@ enum class StorylandTreeKind {
     AnalyzeGraphBack,
     ModelDffGraphNode
 };
+
+#define ID_DATA_SAVE 4500
+#define ID_DATA_SAVE_AS 4501
+#define ID_DATA_EDIT 4502
+#define ID_DATA_ADD 4503
+#define ID_DATA_DELETE 4504
+#define ID_DATA_UP 4505
+#define ID_DATA_DOWN 4506
+#define ID_DATA_TOGGLE 4507
+#define ID_DATA_OPEN_REFERENCE 4508
+#define ID_DATA_FIND 4509
+#define ID_DATA_VALIDATE 4510
+static StorylandDataFile gDataFile;
+static std::vector<std::pair<size_t, size_t>> gDataFieldTargets;
+static int gDataDetailsRow = -1;
+static void editDataGridField(size_t field);
+static void openStorylandFile(const std::wstring& path);
 
 static StorylandTreeKind gSelectedKind = StorylandTreeKind::None;
 
@@ -1227,6 +1258,7 @@ static std::wstring archiveExtensionForIdent(uint32_t ident) {
     case 0x41455241u:                   // AREA
     case 0x41524541u: return L".area";  // AERA
     case 0x47544147u: return L".dtz";   // GTAG
+    case 0x4B504E41u: return L".ifp";
     case 0x6D696E61u: return L".anim";  // anim
     case 0x636F6C32u: return L".col";   // col2
     default: return L".bin";
@@ -1293,7 +1325,7 @@ static std::wstring canonicalDtzImgResourceName(const std::wstring& displayName)
     std::transform(lower.begin(), lower.end(), lower.begin(), [](wchar_t c) { return wchar_t(towlower(c)); });
 
     const wchar_t* knownExtensions[] = {
-        L".mdl", L".dff", L".wbl", L".xtx", L".chk", L".tex", L".txd", L".anim", L".col", L".col2", L".dat", L".ipl", L".ide", L".cut", L".dir", L".bin", L".dtz", L".zmg", L".gxt"
+        L".mdl", L".dff", L".wbl", L".xtx", L".chk", L".tex", L".txd", L".anim", L".ifp", L".col", L".col2", L".dat", L".cfg", L".zon", L".ipl", L".ide", L".cut", L".dir", L".bin", L".dtz", L".zmg", L".gxt"
     };
 
     size_t bestPos = std::wstring::npos;
@@ -1860,6 +1892,12 @@ static void updateDetailsScroll(HWND window) {
 
 static LRESULT CALLBACK detailsPanelProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
+    case WM_LBUTTONDBLCLK:
+        if (gMode == StorylandMode::DataFile && GET_Y_LPARAM(lParam) + gDetailsScroll >= kDetailsHeaderHeight) {
+            editDataGridField(size_t((GET_Y_LPARAM(lParam) + gDetailsScroll - kDetailsHeaderHeight) / kDetailsRowHeight));
+            return 0;
+        }
+        break;
     case WM_ERASEBKGND:
         return 1;
     case WM_SIZE:
@@ -2046,7 +2084,7 @@ static void clearView();
 static void resetModelViewport();
 static void populateModelList();
 static void populateTextureList();
-static void selectTexture(int index);
+static void selectTexture(int index, uint32_t mipLevel = 0u);
 
 static std::wstring saveNewTypedResourceDialog(const wchar_t* filter, const wchar_t* defaultExt) {
     wchar_t fileName[MAX_PATH] = {};
@@ -4679,7 +4717,8 @@ static void populateTextureList() {
     const std::wstring archiveExtension =
         getExtensionLower(gTextureArchive.sourcePath());
     const wchar_t* archiveLabel =
-        archiveExtension == L".txd" ? L"LCS Beta RenderWare TXD" :
+        gTextureArchive.isMobileLcs() ? L"LCS Mobile TXD" :
+        archiveExtension == L".txd" ? L"RenderWare TXD" :
         archiveExtension == L".chk" ? L"Stories CHK Texture Archive" :
         archiveExtension == L".xtx" ? L"Stories XTX Texture Archive" :
         archiveExtension == L".tex" ? L"CTW TEX Texture" :
@@ -5798,7 +5837,7 @@ static void populateModelList() {
 
     if (gModelAnimLoaded) {
         std::wstringstream animTitle;
-        animTitle << L"Loaded .anim applied to this MDL  tracks=" << gAnimFile.tracks().size();
+        animTitle << L"Attached animation  tracks=" << gAnimFile.tracks().size();
         HTREEITEM animRoot = addTreeItem(root, animTitle.str(), StorylandTreeKind::AnimOverview, 0);
 
         const auto& animClips = gAnimFile.clips();
@@ -6123,6 +6162,7 @@ static void populateArchiveList() {
     }
     const wchar_t* archiveRootLabel = gArchiveBrowser.hasLvzContext() ? L"LVZ + IMG" :
         gArchiveBrowser.isPs2StoriesRawImg() ? L"PS2 Stories raw IMG diagnostic browse" :
+        gArchiveBrowser.isMobileLcsRawImg() ? L"LCS Mobile IMG" :
         gArchiveBrowser.hasClassicDirContext() ? L"Classic IMG + DIR browse" :
         L"Mobile LCS raw gta3.img browse";
     HTREEITEM root = addTreeItem(TVI_ROOT, archiveRootLabel);
@@ -6170,12 +6210,12 @@ static void populateArchiveList() {
         }
 
         if (gArchiveBrowser.hasClassicDirContext()) {
-            HTREEITEM entriesRoot = addTreeItem(root, L"Classic IMG directory entries");
+            HTREEITEM entriesRoot = addTreeItem(root, gArchiveBrowser.isMobileLcsRawImg() ? L"LCS Mobile files" : L"Classic IMG directory entries");
             for (size_t entryIndex = 0; entryIndex < entries.size(); ++entryIndex) {
                 addArchiveEntryTreeItem(entriesRoot, entries[entryIndex], entryIndex);
             }
             std::wstringstream details;
-            details << L"Classic GTA IMG + DIR archive\r\n\r\n"
+            details << (gArchiveBrowser.isMobileLcsRawImg() ? L"LCS Mobile IMG + DIR archive\r\n\r\n" : L"Classic GTA IMG + DIR archive\r\n\r\n")
                     << L"IMG: " << gArchiveBrowser.imgPath() << L"\r\n"
                     << L"IMG bytes: " << gArchiveBrowser.imgFileSize() << L"\r\n"
                     << L"Directory entries: " << entries.size() << L"\r\n\r\n"
@@ -6186,14 +6226,15 @@ static void populateArchiveList() {
             gSelectedIndex = -1;
             gSelectedKind = StorylandTreeKind::None;
             InvalidateRect(gPreview, nullptr, TRUE);
-            setStatus(std::to_wstring(entries.size()) + L" classic IMG directory entries loaded.");
+            setStatus(std::to_wstring(entries.size()) + L" archive files loaded.");
             return;
         }
 
         // Mobile LCS raw RenderWare archive.  This branch is entered only after
         // PS2 Stories MDL/XTX classification has been ruled out.
         HTREEITEM modelRoot = addTreeItem(root, L"Mobile LCS RenderWare DFF clumps");
-        HTREEITEM textureRoot = addTreeItem(root, L"Mobile LCS RenderWare PSP texture dictionaries");
+        HTREEITEM textureRoot = addTreeItem(root, L"LCS Mobile textures");
+        HTREEITEM animationRoot = addTreeItem(root, L"LCS Mobile animations");
         size_t modelCount = 0u;
         size_t textureDictionaryCount = 0u;
         size_t namedTextureCount = 0u;
@@ -6201,6 +6242,8 @@ static void populateArchiveList() {
             if (entries[entryIndex].chunkIdent == 0x10u) {
                 addArchiveEntryTreeItem(modelRoot, entries[entryIndex], entryIndex);
                 modelCount++;
+            } else if (entries[entryIndex].chunkIdent == 0x4B504E41u) {
+                addArchiveEntryTreeItem(animationRoot, entries[entryIndex], entryIndex);
             } else if (entries[entryIndex].chunkIdent == 0x16u) {
                 addArchiveEntryTreeItem(textureRoot, entries[entryIndex], entryIndex);
                 textureDictionaryCount++;
@@ -6489,7 +6532,7 @@ static void selectArchiveRoot() {
         }
         if (gArchiveBrowser.hasClassicDirContext()) {
             std::wstringstream ss;
-            ss << L"Classic GTA IMG + DIR archive\r\n\r\n"
+            ss << (gArchiveBrowser.isMobileLcsRawImg() ? L"LCS Mobile IMG + DIR archive\r\n\r\n" : L"Classic GTA IMG + DIR archive\r\n\r\n")
                << L"IMG: " << gArchiveBrowser.imgPath() << L"\r\n"
                << L"IMG bytes: " << gArchiveBrowser.imgFileSize() << L"\r\n"
                << L"Directory entries: " << entries.size() << L"\r\n";
@@ -6756,7 +6799,7 @@ static void selectAnimOverview() {
     gSelectedIndex = 0;
 
     std::wstringstream ss;
-    ss << L"Storyland .anim player / scanner\r\n\r\n"
+    ss << (gAnimFile.isIfp() ? L"LCS Mobile IFP player\r\n\r\n" : L"Storyland ANIM player\r\n\r\n")
        << L"Path: " << gAnimFile.sourcePath() << L"\r\n"
        << L"Raw size: " << gAnimFile.rawBytes().size() << L" bytes\r\n"
        << L"Tracks: " << gAnimFile.tracks().size() << L"\r\n"
@@ -6765,8 +6808,8 @@ static void selectAnimOverview() {
        << L"Duration: " << gAnimFile.durationSeconds() << L" seconds\r\n"
        << L"Current time: " << gAnimCurrentTime << L" seconds\r\n"
        << L"Playback: " << (gAnimPlaying ? L"playing" : L"paused") << L"\r\n"
-       << L"Attached to MDL: " << (gMode == StorylandMode::ModelFile && gModelAnimLoaded ? L"yes" : L"no") << L"\r\n"
-       << L"Keyframe scan: " << (gAnimFile.hasKeyframeCandidates() ? L"Leeds compressed transform channels decoded" : L"no Leeds clip/channel descriptors decoded yet; static inspection only") << L"\r\n";
+       << L"Attached to model: " << (gMode == StorylandMode::ModelFile && gModelAnimLoaded ? L"yes" : L"no") << L"\r\n"
+       << L"Motion: " << (gAnimFile.hasDecodedMotion() ? L"available" : L"no animated tracks") << L"\r\n";
     if (!gAnimFile.clips().empty()) {
         const StorylandAnimClip& clip = gAnimFile.clips()[gAnimFile.activeClipIndex()];
         ss << L"Active clip: #" << clip.index << L" " << widen(clip.name)
@@ -6775,6 +6818,9 @@ static void selectAnimOverview() {
            << L" duration=" << clip.duration << L"\r\n";
     }
     ss << L"\r\n";
+
+    if (gMode == StorylandMode::AnimFile)
+        ss << L"Reference skeleton. Open a model to keep this animation playing on it.\r\n\r\n";
 
     ss << L"Viewer keys:\r\n"
        << L"  + / Page Up zoom in, - / Page Down zoom out, F fit closer, R or 0 reset.\r\n"
@@ -6810,7 +6856,7 @@ static void selectAnimClip(int index) {
     const StorylandAnimClip& clip = gAnimFile.clips()[clipIndex];
 
     std::wstringstream ss;
-    ss << L".anim clip selected\r\n\r\n"
+    ss << L"Animation clip selected\r\n\r\n"
        << L"Clip index: " << clip.index << L"\r\n"
        << L"Name: " << widen(clip.name) << L"\r\n"
        << L"Entry offset: " << hexWide(clip.entryOffset, 6) << L"\r\n"
@@ -6842,7 +6888,7 @@ static void selectAnimTrack(int index) {
 
     const auto& track = tracks[size_t(index)];
     std::wstringstream ss;
-    ss << L".anim track\r\n\r\n"
+    ss << L"Animation track\r\n\r\n"
        << L"Track index: " << track.index << L"\r\n"
        << L"Name: " << widen(track.name) << L"\r\n"
        << L"Clip index: " << track.clipIndex << L"\r\n"
@@ -7935,7 +7981,23 @@ static std::vector<StorylandModelPoint> buildLcsStrictLocalHierarchyAnimatedBone
 }
 
 
+static bool currentModelUsesNativeAnimationMatrices() {
+    const auto& bytes = gModelFile.rawBytes();
+    return gModelFile.isMobileLcsDff() ||
+        (bytes.size() >= 4u && bytes[0] == 'l' && bytes[1] == 'd' && bytes[2] == 'm' && bytes[3] == 0u);
+}
+
 static std::vector<StorylandModelPoint> buildAnimatedModelBonePositions() {
+    if (currentModelUsesNativeAnimationMatrices()) {
+        std::vector<StorylandModelPoint> points, bones;
+        std::string error;
+        StorylandAnimFile restPose;
+        const auto& animation = gModelAnimLoaded ? gAnimFile : restPose;
+        if (storylandSampleModelAnimation(gModelFile, animation, gAnimCurrentTime,
+                gLockAnimRootPreview, {}, points, bones, error)) return bones;
+        gModelAnimStatus = widen(error);
+        return {};
+    }
     const auto& bones = gModelFile.armatureBones();
     const auto& sourcePoints = gModelFile.previewPoints();
 
@@ -8070,7 +8132,7 @@ static StorylandModelPoint displayAnimatedModelBonePosition(size_t boneIndex) {
     const auto& bones = gModelFile.armatureBones();
     if (boneIndex >= bones.size()) return StorylandModelPoint{};
 
-    if (!gModelAnimLoaded || !gAnimFile.hasDecodedMotion()) {
+    if (!currentModelUsesNativeAnimationMatrices() && (!gModelAnimLoaded || !gAnimFile.hasDecodedMotion())) {
         return displayBonePosition(bones[boneIndex]);
     }
 
@@ -9347,6 +9409,15 @@ static std::vector<StorylandModelPoint> buildAnimatedModelPreviewPoints(const st
         return sourcePoints;
     }
 
+    if (currentModelUsesNativeAnimationMatrices()) {
+        std::vector<StorylandModelPoint> points, bones;
+        std::string error;
+        if (storylandSampleModelAnimation(gModelFile, gAnimFile, gAnimCurrentTime,
+                gLockAnimRootPreview, sourcePoints, points, bones, error)) return points;
+        gModelAnimStatus = widen(error);
+        return sourcePoints;
+    }
+
     if (modelHasUsableTrueSkinWeights(sourcePoints)) {
         return buildTrueSkinnedAnimatedPreviewPoints(sourcePoints);
     }
@@ -9464,7 +9535,7 @@ static void selectAnimPayload(const StorylandTreePayload& payload);
 
 static bool currentModelCanUsePedCutsceneAnimation() {
     StorylandModelKind kind = gModelFile.modelKind();
-    return (kind == StorylandModelKind::PedModel || kind == StorylandModelKind::CutsceneModel) &&
+    return (gModelFile.isMobileLcsDff() || kind == StorylandModelKind::PedModel || kind == StorylandModelKind::CutsceneModel) &&
            !gModelFile.armatureBones().empty();
 }
 
@@ -9753,15 +9824,22 @@ static void selectArchivePayload(const StorylandTreePayload& payload) {
     updateActionBar();
 }
 
-static void selectTexture(int index) {
+static void selectTexture(int index, uint32_t mipLevel) {
+    if (gTextureLayoutIndex != index) {
+        gTextureLayoutIndex = index;
+        gMobileTextureLayout = MobileTextureLayout::Automatic;
+    }
     const auto& textures = gTextureArchive.textures();
     if (index < 0 || size_t(index) >= textures.size()) return;
     gSelectedIndex = index;
     std::string error;
-    if (!gTextureArchive.decodeTexture(size_t(index), gCurrentImage, error)) {
+    if (!gTextureArchive.decodeTextureMip(size_t(index), mipLevel, gCurrentImage, error, gMobileTextureLayout)) {
+        deleteTextureBitmap();
+        gCurrentImage = {};
         setDetails(L"Decode failed: " + widen(error));
         return;
     }
+    gTextureMipLevel = mipLevel;
     createTextureBitmapFromImage();
 
     const auto& e = textures[size_t(index)];
@@ -9772,16 +9850,29 @@ static void selectTexture(int index) {
         maxAlpha = std::max<uint8_t>(maxAlpha, gCurrentImage.rgba[p]);
         if (gCurrentImage.rgba[p] != 255u) anyAlpha = true;
     }
+    if (e.kind == TextureKind::RwMobile) {
+        std::wstringstream details;
+        details << L"LCS Mobile texture: " << widen(e.name) << L"\r\n\r\n"
+                << L"Full size: " << e.width << L" x " << e.height << L"\r\n"
+                << L"Available sizes: " << int(e.mipCount) << L"\r\n"
+                << L"Viewing size " << mipLevel + 1u << L": " << gCurrentImage.width << L" x " << gCurrentImage.height << L"\r\n"
+                << L"Transparency: " << (anyAlpha ? L"yes" : L"no") << L"\r\n\r\n"
+                << L"Use View > Texture, or right-click, to choose a size or pixel order.\r\n";
+        setDetails(details.str());
+        InvalidateRect(gPreview, nullptr, TRUE);
+        return;
+    }
     std::wstringstream ss;
     ss << L"Texture: " << widen(e.name) << L"\r\n"
        << L"Kind: " << (e.kind == TextureKind::CtwTex ? L"CTW TEX" :
                            e.kind == TextureKind::Dds ? L"DDS" :
                            e.kind == TextureKind::Ps2 ? L"PS2" :
                            e.kind == TextureKind::Psp ? L"PSP" :
+                           e.kind == TextureKind::RwMobile ? L"LCS Mobile" :
                            e.kind == TextureKind::RwPsp ? L"PSP RenderWare" : L"Unknown") << L"\r\n"
        << L"Size: " << e.width << L" x " << e.height << L"\r\n"
        << L"BPP: " << int(e.bpp) << L"\r\n"
-       << L"Mip count: " << int(e.mipCount) << L"\r\n"
+       << L"Mip count: " << int(e.mipCount) << L"  |  viewing level " << mipLevel << L" (" << gCurrentImage.width << L" x " << gCurrentImage.height << L")\r\n"
        << L"Swizzle field: " << int(e.swizzleMask) << (e.swizzleMask ? L" (encoded/swizzled)" : L" (linear)") << L"\r\n"
        << L"PS2 flags: " << hexWide(e.flags, 8) << L"\r\n"
        << L"Alpha: " << (anyAlpha ? L"present" : L"opaque") << L"  range=" << int(minAlpha) << L".." << int(maxAlpha) << L"\r\n"
@@ -12032,6 +12123,167 @@ static bool confirmGxtChanges() {
     if (choice == IDCANCEL) return false;
     return choice == IDNO || saveGxt(false);
 }
+
+static void selectDataPayload(const StorylandTreePayload& payload) {
+    gSelectedKind = payload.kind;
+    gSelectedIndex = payload.index;
+    gDataDetailsRow = -1;
+    if (payload.kind == StorylandTreeKind::DataRow) gDataDetailsRow = payload.index;
+    if (payload.kind == StorylandTreeKind::DataField && payload.index >= 0 && size_t(payload.index) < gDataFieldTargets.size())
+        gDataDetailsRow = int(gDataFieldTargets[size_t(payload.index)].first);
+    setDetails(L"");
+    gDetailsRows.clear();
+    if (gDataDetailsRow >= 0 && size_t(gDataDetailsRow) < gDataFile.rows().size()) {
+        const auto& row = gDataFile.rows()[size_t(gDataDetailsRow)];
+        for (const auto& field : row.fields) gDetailsRows.emplace_back(widen(field.name), widen(field.value));
+        if (row.fields.empty()) gDetailsRows.emplace_back(L"Text", widen(row.text));
+        setStatus(L"Line " + std::to_wstring(gDataDetailsRow + 1) + L" | " + widen(row.section) +
+            (row.disabled ? L" | disabled" : L"") + L" | Double-click a field to edit");
+    } else {
+        gDetailsRows.emplace_back(L"File", gDataFile.sourcePath().filename().wstring());
+        gDetailsRows.emplace_back(L"Rows", std::to_wstring(gDataFile.rows().size()));
+        gDetailsRows.emplace_back(L"Format", gDataFile.binaryWater() ? L"Binary water" : gDataFile.manifest() ? L"Ordered load list" : L"Text table");
+        gDetailsRows.emplace_back(L"Modified", gDataFile.dirty() ? L"Yes" : L"No");
+    }
+    gDetailsScroll = 0;
+    resizeDetailsGrid();
+    InvalidateRect(gDetailsGrid, nullptr, FALSE);
+    updateActionBar();
+}
+static void populateDataList(int selectedRow = -1) {
+    clearView();
+    gDataFieldTargets.clear();
+    SendMessageW(gTree, WM_SETREDRAW, FALSE, 0);
+    HTREEITEM root = addTreeItem(TVI_ROOT, widen(gDataFile.summary()), StorylandTreeKind::DataOverview, 0);
+    HTREEITEM sectionItem = root;
+    std::string section;
+    for (size_t index = 0; index < gDataFile.rows().size(); ++index) {
+        const auto& row = gDataFile.rows()[index];
+        if (row.section != section) {
+            section = row.section;
+            sectionItem = section.empty() ? root : addTreeItem(root, widen(section), StorylandTreeKind::DataOverview, -1);
+        }
+        std::string preview = row.text;
+        std::replace(preview.begin(), preview.end(), '\t', ' ');
+        if (preview.size() > 110) preview = preview.substr(0, 110) + "...";
+        if (preview.empty()) preview = "[blank]";
+        HTREEITEM item = addTreeItem(sectionItem, std::to_wstring(index + 1) + L"  " + widen(preview), StorylandTreeKind::DataRow, int(index));
+        for (size_t field = 0; field < row.fields.size(); ++field) {
+            const int target = int(gDataFieldTargets.size());
+            gDataFieldTargets.emplace_back(index, field);
+            addTreeItem(item, widen(row.fields[field].name + ": " + row.fields[field].value), StorylandTreeKind::DataField, target);
+        }
+    }
+    expandTreeItem(root);
+    SendMessageW(gTree, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(gTree, nullptr, TRUE);
+    if (selectedRow >= 0 && size_t(selectedRow) < gDataFile.rows().size()) selectTreePayloadItem(StorylandTreeKind::DataRow, selectedRow);
+    else selectDataPayload({StorylandTreeKind::DataOverview, 0});
+    setStatus(widen(gDataFile.summary()));
+}
+static void editDataGridField(size_t field) {
+    if (gMode != StorylandMode::DataFile || gDataDetailsRow < 0) return;
+    const size_t row = size_t(gDataDetailsRow);
+    if (row >= gDataFile.rows().size() || field >= gDataFile.rows()[row].fields.size()) return;
+    const auto target = gDataFile.rows()[row].fields[field];
+    std::wstring value = widen(target.value);
+    if (!askString(L"Edit data field", widen(target.name).c_str(), value, value)) return;
+    std::string error;
+    if (!gDataFile.setField(row, field, narrow(value), error)) MessageBoxW(gMainWindow, widen(error).c_str(), L"Data edit failed", MB_ICONERROR);
+    else populateDataList(int(row));
+}
+static void editDataSelection() {
+    if (gMode != StorylandMode::DataFile) return;
+    if (gSelectedKind == StorylandTreeKind::DataField && gSelectedIndex >= 0 && size_t(gSelectedIndex) < gDataFieldTargets.size()) {
+        const auto target = gDataFieldTargets[size_t(gSelectedIndex)];
+        gDataDetailsRow = int(target.first);
+        editDataGridField(target.second);
+        return;
+    }
+    if (gDataDetailsRow < 0) return;
+    const int row = gDataDetailsRow;
+    if (gDataFile.binaryWater()) { setStatus(L"Double-click a field in the table to edit it."); return; }
+    std::wstring value = widen(gDataFile.rows()[size_t(row)].text);
+    if (!askString(L"Edit data row", L"Row text", value, value)) return;
+    std::string error;
+    if (!gDataFile.setRow(size_t(row), narrow(value), error)) MessageBoxW(gMainWindow, widen(error).c_str(), L"Data edit failed", MB_ICONERROR);
+    else populateDataList(row);
+}
+static bool saveDataFile(bool saveAs) {
+    std::wstring path = gDataFile.sourcePath().wstring();
+    const std::wstring extension = gDataFile.sourcePath().extension().wstring();
+    if (saveAs) path = saveFileDialogWithInitial(L"Data files\0*.dat;*.cfg;*.ide;*.ipl;*.zon\0All files\0*.*\0", extension.size() > 1 ? extension.c_str() + 1 : L"dat", gDataFile.sourcePath().filename().wstring());
+    if (path.empty()) return false;
+    std::string error;
+    if (!gDataFile.saveToFile(std::filesystem::path(path), error)) {
+        MessageBoxW(gMainWindow, widen(error).c_str(), L"Data save failed", MB_ICONERROR); return false;
+    }
+    const int row = gDataDetailsRow;
+    populateDataList(row);
+    setStatus(L"Saved and verified: " + path);
+    return true;
+}
+static bool confirmDataChanges() {
+    if (gMode != StorylandMode::DataFile || !gDataFile.dirty()) return true;
+    const int choice = MessageBoxW(gMainWindow, L"Save changes to the current data file?", L"Unsaved data", MB_YESNOCANCEL | MB_ICONQUESTION);
+    return choice == IDNO || (choice == IDYES && saveDataFile(false));
+}
+static void runDataCommand(int id) {
+    if (gMode != StorylandMode::DataFile) return;
+    if (id == ID_DATA_SAVE) { saveDataFile(false); return; }
+    if (id == ID_DATA_SAVE_AS) { saveDataFile(true); return; }
+    if (id == ID_DATA_EDIT) { editDataSelection(); return; }
+    if (id == ID_DATA_FIND) {
+        static std::wstring query;
+        if (!askString(L"Find data", L"Find text", query, query) || query.empty()) return;
+        auto lower = [](std::wstring text) { for (auto& c : text) c = wchar_t(towlower(c)); return text; };
+        const auto needle = lower(query);
+        const auto& rows = gDataFile.rows();
+        for (size_t count = 0; count < rows.size(); ++count) {
+            const size_t index = (size_t(std::max(-1, gDataDetailsRow) + 1) + count) % rows.size();
+            std::wstring text = widen(rows[index].text);
+            for (const auto& field : rows[index].fields) text += L" " + widen(field.value);
+            if (lower(text).find(needle) != std::wstring::npos) { selectTreePayloadItem(StorylandTreeKind::DataRow, int(index)); return; }
+        }
+        setStatus(L"No matching row."); return;
+    }
+    if (id == ID_DATA_VALIDATE) {
+        const auto warnings = gDataFile.warnings();
+        setDetails(L""); gDetailsRows.clear();
+        for (size_t i = 0; i < warnings.size(); ++i) gDetailsRows.emplace_back(L"Check " + std::to_wstring(i + 1), widen(warnings[i]));
+        if (warnings.empty()) gDetailsRows.emplace_back(L"Checks", L"Passed");
+        gDataDetailsRow = -1;
+        resizeDetailsGrid(); InvalidateRect(gDetailsGrid, nullptr, FALSE); return;
+    }
+    int row = gDataDetailsRow;
+    if (id == ID_DATA_OPEN_REFERENCE && row >= 0) {
+        const auto reference = gDataFile.referencedPath(size_t(row));
+        if (reference.empty()) { setStatus(L"This row has no file reference."); return; }
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(reference, ec)) { MessageBoxW(gMainWindow, reference.wstring().c_str(), L"Referenced file not found", MB_ICONERROR); return; }
+        openStorylandFile(reference.wstring()); return;
+    }
+    std::string error;
+    bool changed = false;
+    if (id == ID_DATA_ADD) {
+        if (gDataFile.binaryWater()) return;
+        std::wstring value;
+        if (!askString(L"Add data row", L"Insert before the selected row", L"", value)) return;
+        if (row < 0) row = int(gDataFile.rows().size());
+        changed = gDataFile.insertRow(size_t(row), narrow(value), error);
+    } else if (row >= 0) {
+        if (id == ID_DATA_DELETE) changed = gDataFile.removeRow(size_t(row), error);
+        else if (id == ID_DATA_TOGGLE) changed = gDataFile.toggleRow(size_t(row), error);
+        else if (id == ID_DATA_UP || id == ID_DATA_DOWN) {
+            const int direction = id == ID_DATA_UP ? -1 : 1;
+            changed = gDataFile.moveRow(size_t(row), direction, error);
+            if (changed) row += direction;
+        }
+    }
+    if (!error.empty()) MessageBoxW(gMainWindow, widen(error).c_str(), L"Data edit failed", MB_ICONERROR);
+    if (changed) populateDataList(std::min(row, int(gDataFile.rows().size()) - 1));
+}
+
 static void openStorylandFile(const std::wstring& path) {
     if (gAnalyzeGraphActive) {
         gAnalyzeGraphActive = false;
@@ -12040,7 +12292,7 @@ static void openStorylandFile(const std::wstring& path) {
         ShowWindow(gPreview, SW_SHOW);
     }
     if (path.empty()) return;
-    if (!confirmGxtChanges()) return;
+    if (!confirmGxtChanges() || !confirmDataChanges()) return;
     if (!gOpeningDtzStandaloneChild) {
         gDtzReturnAvailable = false;
         gDtzReturnSelectedIndex = -1;
@@ -12062,11 +12314,29 @@ static void openStorylandFile(const std::wstring& path) {
     }
 
     if (!gOpeningDtzStandaloneChild &&
-        (ext == L".anim" || ext == L".chk" || ext == L".xtx" || ext == L".tex" || ext == L".txd" ||
+        (ext == L".anim" || ext == L".ifp" || ext == L".chk" || ext == L".xtx" || ext == L".tex" || ext == L".txd" ||
          ext == L".img" || ext == L".lvz" || ext == L".wbl" || ext == L".dir" || ext == L".scm" ||
          ext == L".gxt" || ext == L".dtz" || ext == L".bin" || ext == L".mdl" || ext == L".dff" ||
          isStorylandMediaExtension(ext))) {
         addRecentFile(path);
+    }
+
+    if (ext == L".dat" || ext == L".cfg" || ext == L".ide" || ext == L".ipl" || ext == L".zon") {
+        StorylandDataFile opened;
+        if (!opened.loadFromFile(std::filesystem::path(path), error)) {
+            MessageBoxW(gMainWindow, widen(error).c_str(), L"Data open failed", MB_ICONERROR);
+            return;
+        }
+        clearView();
+        gAnimPlaying = false;
+        gModelAnimLoaded = false;
+        gDataFile = std::move(opened);
+        gMode = StorylandMode::DataFile;
+        addRecentFile(path);
+        populateDataList();
+        SetWindowTextW(gMainWindow, (L"Storyland - " + std::filesystem::path(path).filename().wstring()).c_str());
+        refreshModeUi();
+        return;
     }
 
     if (ext == L".gxt") {
@@ -12103,7 +12373,7 @@ static void openStorylandFile(const std::wstring& path) {
         return;
     }
 
-    if (ext == L".anim") {
+    if (ext == L".anim" || ext == L".ifp") {
         if (!gAnimFile.loadFromFile(path, error)) {
             MessageBoxW(gMainWindow, widen(error).c_str(), L"Storyland ANIM open failed", MB_ICONERROR);
             return;
@@ -12124,9 +12394,9 @@ static void openStorylandFile(const std::wstring& path) {
 
             selectModelField(0);
             startAnimationPlaybackTimer();
-            SetWindowTextW(gMainWindow, L"Storyland - MDL Viewer + ANIM");
+            SetWindowTextW(gMainWindow, L"Storyland - Model + Animation");
             applyStorylandTitleTintForPath(path);
-            setStatus(L"Attached ANIM to current MDL: " + gModelAnimStatus);
+            setStatus(L"Attached animation: " + gModelAnimStatus);
             InvalidateRect(gPreview, nullptr, FALSE);
 
             return;
@@ -12145,7 +12415,7 @@ static void openStorylandFile(const std::wstring& path) {
         gModelDistance = 3.0f;
         populateAnimList();
         startAnimationPlaybackTimer();
-        SetWindowTextW(gMainWindow, L"Storyland - ANIM Player");
+        SetWindowTextW(gMainWindow, gAnimFile.isIfp() ? L"Storyland - LCS Mobile IFP Player" : L"Storyland - ANIM Player");
         applyStorylandTitleTintForPath(path);
         refreshModeUi();
         return;
@@ -12191,14 +12461,17 @@ static void openStorylandFile(const std::wstring& path) {
         }
 
         gMode = StorylandMode::TextureArchive;
+        gTextureLayoutIndex = -1;
         populateTextureList();
 
+        const bool mobileTxd = gTextureArchive.isMobileLcs();
         const bool desktopTxd = ext == L".txd" &&
             (!gTextureArchive.textures().empty()
                 ? gTextureArchive.textures().front().kind == TextureKind::RwPc
                 : storylandRwStamp(gTextureArchive.rawBytes()) != 0x1003FFFFu &&
                   storylandRwStamp(gTextureArchive.rawBytes()) != 0x00000310u);
         SetWindowTextW(gMainWindow,
+            mobileTxd ? L"Storyland - LCS Mobile TXD Viewer" :
             desktopTxd ? L"Storyland - RenderWare TXD Viewer" :
             ext == L".txd" ? L"Storyland - LCS Beta TXD Editor" :
             ext == L".chk" ? L"Storyland - CHK Editor" :
@@ -12243,8 +12516,8 @@ static void openStorylandFile(const std::wstring& path) {
             resetModelViewport();
             gModelDistance = 8.0f;
             populateArchiveList();
-            SetWindowTextW(gMainWindow, L"Storyland - IMG Browser");
-            applyStorylandTitleTint(titleTintFromPath(path));
+            SetWindowTextW(gMainWindow, gArchiveBrowser.isMobileLcsRawImg() ? L"Storyland - LCS Mobile IMG Browser" : L"Storyland - IMG Browser");
+            applyStorylandTitleTint(gArchiveBrowser.isMobileLcsRawImg() ? StorylandTitleTint::LCS : titleTintFromPath(path));
             refreshModeUi();
             return;
         }
@@ -12317,17 +12590,17 @@ static void openStorylandFile(const std::wstring& path) {
         }
 
         if (!gArchiveBrowser.loadDirWithCompanionImg(path, error)) {
-            MessageBoxW(gMainWindow, widen(error).c_str(), L"Storyland beta IMG/DIR open failed", MB_ICONERROR);
+            MessageBoxW(gMainWindow, widen(error).c_str(), L"Storyland IMG/DIR open failed", MB_ICONERROR);
             return;
         }
         gActiveAreaArchive = -1;
         gMode = StorylandMode::ArchiveFile;
         resetModelViewport();
         populateArchiveList();
-        SetWindowTextW(gMainWindow, L"Storyland - LCS Beta IMG/DIR Browser");
+        SetWindowTextW(gMainWindow, gArchiveBrowser.isMobileLcsRawImg() ? L"Storyland - LCS Mobile IMG Browser" : L"Storyland - IMG/DIR Browser");
         applyStorylandTitleTint(StorylandTitleTint::LCS);
         refreshModeUi();
-        setStatus(L"Opened LCS beta/classic IMG/DIR | " + widen(gArchiveBrowser.levelSummary()));
+        setStatus(L"Opened IMG/DIR | " + widen(gArchiveBrowser.levelSummary()));
         return;
     }
 
@@ -12350,6 +12623,9 @@ static void openStorylandFile(const std::wstring& path) {
     }
 
     if (ext == L".mdl" || ext == L".dff") {
+        const bool retainAnimation = gAnimFile.hasDecodedMotion() &&
+            (gMode == StorylandMode::AnimFile || (gMode == StorylandMode::ModelFile && gModelAnimLoaded));
+        const std::wstring retainedAnimationPath = gAnimFile.sourcePath();
         // A standalone model opened from File > Open must completely replace any
         // GAME.DTZ/IMG embedded-resource selection.  Otherwise the details pane
         // and renderer label can continue to describe the previously selected
@@ -12376,6 +12652,12 @@ static void openStorylandFile(const std::wstring& path) {
             return;
         }
         gMode = StorylandMode::ModelFile;
+        if (retainAnimation && currentModelCanUsePedCutsceneAnimation()) {
+            gModelAnimLoaded = true;
+            gModelAnimPath = retainedAnimationPath;
+            gModelAnimStatus = widen(gAnimFile.summaryLine());
+            startAnimationPlaybackTimer();
+        }
         resetModelViewport();
         populateModelList();
         selectModelField(0);
@@ -12384,7 +12666,7 @@ static void openStorylandFile(const std::wstring& path) {
         loadCompanionTextureForCurrentModel(path, textureStatus);
 
         std::wstring companionAnim = getDirectoryPart(path) + getFileStemPart(path) + L".anim";
-        if (currentModelCanUsePedCutsceneAnimation() && fileExists(companionAnim)) {
+        if (!gModelAnimLoaded && currentModelCanUsePedCutsceneAnimation() && fileExists(companionAnim)) {
             std::string animError;
             if (gAnimFile.loadFromFile(companionAnim, animError)) {
                 gModelAnimLoaded = true;
@@ -12403,7 +12685,7 @@ static void openStorylandFile(const std::wstring& path) {
         if (gModelFile.isMobileLcsDff()) SetWindowTextW(gMainWindow, L"Storyland - Mobile LCS DFF Viewer");
         else if (gModelFile.isPspNativeDff()) SetWindowTextW(gMainWindow, L"Storyland - LCS PSP DFF Viewer");
         else if (gModelFile.isDesktopRwDff()) SetWindowTextW(gMainWindow, L"Storyland - RenderWare DFF Viewer");
-        else SetWindowTextW(gMainWindow, gModelAnimLoaded ? L"Storyland - MDL Viewer + ANIM" : L"Storyland - MDL Viewer");
+        else SetWindowTextW(gMainWindow, gModelAnimLoaded ? L"Storyland - Model + Animation" : L"Storyland - MDL Viewer");
 
         StorylandTitleTint modelTint =
             gModelFile.isDesktopRwDff()
@@ -12480,9 +12762,9 @@ static void openSelectedArchiveEntry() {
         setStatus(L"WRLD/AREA sector is shown alone in the LVZ/IMG OpenGL preview.");
         return;
     }
-    if (!(ext == L".mdl" || ext == L".dff" || ext == L".xtx" || ext == L".chk" || ext == L".tex" || ext == L".txd" || ext == L".dtz" || ext == L".gxt")) {
+    if (!(ext == L".mdl" || ext == L".dff" || ext == L".xtx" || ext == L".chk" || ext == L".tex" || ext == L".txd" || ext == L".dtz" || ext == L".gxt" || ext == L".ifp" || ext == L".anim")) {
         selectArchiveEntry(gSelectedIndex);
-        setStatus(L"Selected embedded resource is listed but not directly openable. Recognized model, texture, DTZ, and GXT entries can be opened.");
+        setStatus(L"Selected embedded resource is listed but not directly openable. Model, texture, animation, DTZ, and GXT entries can be opened.");
         return;
     }
 
@@ -13641,7 +13923,7 @@ static void exportSelectedResourceBytes() {
 
     if (suggestedName.empty()) suggestedName = L"storyland_resource.bin";
     std::wstring outputPath = saveFileDialogWithInitial(
-        L"Leeds resource\0*.mdl;*.dff;*.wbl;*.xtx;*.chk;*.tex;*.txd;*.wrld;*.area;*.anim;*.bin\0All files\0*.*\0",
+        L"Leeds resource\0*.mdl;*.dff;*.wbl;*.xtx;*.chk;*.tex;*.txd;*.wrld;*.area;*.anim;*.ifp;*.bin\0All files\0*.*\0",
         L"bin",
         suggestedName
     );
@@ -14279,10 +14561,10 @@ static void applyAnimationToCurrentModel() {
     if (!(gMode == StorylandMode::ModelFile ||
           (gMode == StorylandMode::DtzArchive && gDtzEmbeddedPreviewKind == DtzEmbeddedPreviewKind::ModelFile))) return;
     if (!currentModelCanUsePedCutsceneAnimation()) {
-        MessageBoxW(gMainWindow, L"This MDL does not expose a ped/cutscene armature that can accept Leeds ANIM data.", L"Apply Animation", MB_ICONINFORMATION);
+        MessageBoxW(gMainWindow, L"This model has no skeleton for animation playback.", L"Apply Animation", MB_ICONINFORMATION);
         return;
     }
-    std::wstring path = openFileDialog(L"Rockstar Leeds ANIM\0*.anim\0All files\0*.*\0");
+    std::wstring path = openFileDialog(L"Animation (ANIM / IFP)\0*.anim;*.ifp\0All files\0*.*\0");
     if (path.empty()) return;
     std::string error;
     if (!gAnimFile.loadFromFile(path, error)) {
@@ -14297,7 +14579,7 @@ static void applyAnimationToCurrentModel() {
     gAnimLastTick = GetTickCount();
     startAnimationPlaybackTimer();
     if (gMode == StorylandMode::ModelFile) populateModelList();
-    setStatus(L"Applied ANIM to current armature MDL: " + gModelAnimStatus);
+    setStatus(L"Applied animation: " + gModelAnimStatus);
     if (gPreview) InvalidateRect(gPreview, nullptr, FALSE);
 }
 
@@ -14603,6 +14885,7 @@ static const wchar_t* textureKindLabel(TextureKind kind) {
     case TextureKind::Psp: return L"PSP";
     case TextureKind::RwPsp: return L"PSP RenderWare";
     case TextureKind::RwPc: return L"PC RenderWare";
+    case TextureKind::RwMobile: return L"LCS Mobile";
     default: return L"Unknown";
     }
 }
@@ -14801,7 +15084,7 @@ static void createNewStorylandResource() {
 static void showAboutDialog() {
     MessageBoxW(
         gMainWindow,
-        L"Storyland 1.1.7\r\n\r\nauthor: spicybung\r\nhttps://github.com/spicybung/BLeeds\r\nReigns Studios\r\n\r\nAn analyzer, editor, and viewer for Grand Theft Auto Stories file formats.",
+        L"Storyland 1.1.9\r\n\r\nauthor: spicybung\r\nhttps://github.com/spicybung/BLeeds\r\nReigns Studios\r\n\r\nAn analyzer, editor, and viewer for Grand Theft Auto Stories file formats.",
         L"About Storyland",
         MB_OK | MB_ICONINFORMATION
     );
@@ -14816,7 +15099,7 @@ static bool selectedDtzEntryLooksReplaceable() {
     std::wstring ext = getExtensionLower(name);
     return ext == L".mdl" || ext == L".dff" ||
            ext == L".xtx" || ext == L".chk" || ext == L".tex" ||
-           ext == L".anim" || ext == L".cam" || ext == L".cut" ||
+           ext == L".anim" || ext == L".ifp" || ext == L".cam" || ext == L".cut" ||
            ext == L".col" || ext == L".bin";
 }
 
@@ -14963,10 +15246,10 @@ static void replaceSelectedDtzDirEntryFromFile() {
     }
 
     static const wchar_t replacementFilter[] =
-        L"Leeds / Stories resource\0*.mdl;*.dff;*.xtx;*.chk;*.tex;*.txd;*.anim;*.cam;*.cut;*.col;*.col2;*.bin\0"
+        L"Leeds / Stories resource\0*.mdl;*.dff;*.xtx;*.chk;*.tex;*.txd;*.anim;*.ifp;*.cam;*.cut;*.col;*.col2;*.bin\0"
         L"Model files\0*.mdl;*.dff\0"
         L"Texture archives\0*.xtx;*.chk;*.tex;*.txd\0"
-        L"Animation / cutscene / collision\0*.anim;*.cam;*.cut;*.col;*.col2\0"
+        L"Animation / cutscene / collision\0*.anim;*.ifp;*.cam;*.cut;*.col;*.col2\0"
         L"All files\0*.*\0";
     std::wstring replacementPath = openFileDialog(replacementFilter);
     if (replacementPath.empty()) return;
@@ -18149,6 +18432,8 @@ static void updateActionBar() {
             gSelectedIndex >= 0 && size_t(gSelectedIndex) < gTextureArchive.textures().size();
         enableTertiary = haveMaterialSelection;
         enableQuaternary = haveMaterialSelection;
+        if (gTextureArchive.isMobileLcs())
+            showSecondary = showTertiary = showQuaternary = false;
     } else if (gMode == StorylandMode::DtzArchive &&
                gDtzEmbeddedPreviewKind == DtzEmbeddedPreviewKind::TextureArchive) {
         showBar = true;
@@ -18355,7 +18640,7 @@ static void layoutChildren(HWND hwnd) {
         return;
     }
 
-    if (gPreview) ShowWindow(gPreview, gMode == StorylandMode::GxtFile ? SW_HIDE : SW_SHOW);
+    if (gPreview) ShowWindow(gPreview, (gMode == StorylandMode::GxtFile || gMode == StorylandMode::DataFile) ? SW_HIDE : SW_SHOW);
 
     // One canonical set of pane rectangles drives both child placement and
     // border painting. No control is allowed to extend beyond its pane.
@@ -18381,7 +18666,7 @@ static void layoutChildren(HWND hwnd) {
 
     const bool videoFrameViewer = gMode == StorylandMode::MediaFile &&
         gMediaFile.kind() == StorylandMediaKind::Video;
-    const int detailsH = gMode == StorylandMode::GxtFile ? usableRightH : videoFrameViewer && usableRightH > 240
+    const int detailsH = (gMode == StorylandMode::GxtFile || gMode == StorylandMode::DataFile) ? usableRightH : videoFrameViewer && usableRightH > 240
         ? std::clamp(usableRightH / 5, 100, 180)
         : usableRightH > 240
             ? std::clamp(usableRightH * 28 / 100, 140, 260)
@@ -18412,7 +18697,7 @@ static void layoutChildren(HWND hwnd) {
         }
     }
 
-    int cursorY = gMode == StorylandMode::GxtFile ? contentTop : previewRect.bottom + gutter;
+    int cursorY = (gMode == StorylandMode::GxtFile || gMode == StorylandMode::DataFile) ? contentTop : previewRect.bottom + gutter;
 
     if (gActionBar) {
         const StorylandUiRect actionRect{
@@ -18524,6 +18809,7 @@ static void selectPayloadForCurrentMode(const StorylandTreePayload& payload) {
     else if (gMode == StorylandMode::ScmFile) selectScmPayload(payload);
     else if (gMode == StorylandMode::MediaFile) selectMediaPayload(payload);
     else if (gMode == StorylandMode::GxtFile) selectGxtPayload(payload);
+    else if (gMode == StorylandMode::DataFile) selectDataPayload(payload);
 }
 
 static bool selectTreeItemAtScreenPoint(POINT screenPoint) {
@@ -18589,7 +18875,7 @@ static bool resourceNameSupportsAnalyzeGraph(const std::string& name) {
         return lower.size() >= length && lower.compare(lower.size() - length, length, suffix) == 0;
     };
     return endsWith(".dff") || endsWith(".txd") || endsWith(".mdl") ||
-           endsWith(".xtx") || endsWith(".chk") || endsWith(".anim");
+           endsWith(".xtx") || endsWith(".chk") || endsWith(".anim") || endsWith(".ifp");
 }
 
 static std::string analyzeExtensionLower(const std::wstring& name) {
@@ -18756,6 +19042,7 @@ static void restoreTreeAfterAnalyzeGraph() {
     case StorylandMode::WblFile: populateWblList(); break;
     case StorylandMode::ScmFile: populateScmList(); break;
     case StorylandMode::GxtFile: populateGxtList(); break;
+    case StorylandMode::DataFile: populateDataList(gDataDetailsRow); break;
     case StorylandMode::MediaFile: populateMediaList(); break;
     default: break;
     }
@@ -19021,6 +19308,22 @@ static bool buildTreeContextMenu(HMENU menu) {
         return hasItems;
     }
 
+    if (gMode == StorylandMode::DataFile) {
+        addContextMenuItem(menu, ID_DATA_EDIT, L"Edit row / field...");
+        addContextMenuItem(menu, ID_DATA_FIND, L"Find...");
+        if (!gDataFile.binaryWater()) {
+            addContextMenuItem(menu, ID_DATA_ADD, L"Add row...");
+            addContextMenuItem(menu, ID_DATA_DELETE, L"Remove row");
+            addContextMenuItem(menu, ID_DATA_UP, L"Move up");
+            addContextMenuItem(menu, ID_DATA_DOWN, L"Move down");
+        }
+        if (gDataFile.manifest()) {
+            addContextMenuItem(menu, ID_DATA_TOGGLE, L"Enable / disable");
+            addContextMenuItem(menu, ID_DATA_OPEN_REFERENCE, L"Open referenced file");
+            addContextMenuItem(menu, ID_DATA_VALIDATE, L"Check file references");
+        }
+        return true;
+    }
     if (gMode == StorylandMode::GxtFile) {
         addContextMenuItem(menu, ID_GXT_FIND, L"Find text...");
         if (gSelectedKind == StorylandTreeKind::GxtEntry) addContextMenuItem(menu, ID_GXT_EDIT, L"Edit string...");
@@ -19070,16 +19373,28 @@ static bool buildTreeContextMenu(HMENU menu) {
         }
         hasItems = hasItems || specificItems;
     } else if (gMode == StorylandMode::TextureArchive) {
-        hasItems = addContextMenuItem(menu, ID_TEXTURE_ADD, L"Add material...") || hasItems;
+        const bool mobileTexture = gTextureArchive.isMobileLcs();
+        if (!mobileTexture) hasItems = addContextMenuItem(menu, ID_TEXTURE_ADD, L"Add material...") || hasItems;
         hasItems = addContextMenuItem(menu, ID_TEXTURE_VALIDATE, L"Validate texture archive") || hasItems;
         if (gSelectedIndex >= 0) {
             AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-            hasItems = addContextMenuItem(menu, ID_FILE_REPLACE_TEXTURE, L"Edit material...") || hasItems;
-            if (gTextureArchive.textures().size() > 1u) hasItems = addContextMenuItem(menu, ID_TEXTURE_SWAP, L"Swap texture data with...") || hasItems;
-            hasItems = addContextMenuItem(menu, ID_TEXTURE_DUPLICATE, L"Duplicate material...") || hasItems;
-            hasItems = addContextMenuItem(menu, ID_FILE_RENAME_TEXTURE, L"Rename texture...") || hasItems;
+            if (!mobileTexture) {
+                hasItems = addContextMenuItem(menu, ID_FILE_REPLACE_TEXTURE, L"Edit material...") || hasItems;
+                if (gTextureArchive.textures().size() > 1u) hasItems = addContextMenuItem(menu, ID_TEXTURE_SWAP, L"Swap texture data with...") || hasItems;
+                hasItems = addContextMenuItem(menu, ID_TEXTURE_DUPLICATE, L"Duplicate material...") || hasItems;
+                hasItems = addContextMenuItem(menu, ID_FILE_RENAME_TEXTURE, L"Rename texture...") || hasItems;
+                hasItems = addContextMenuItem(menu, ID_TEXTURE_REMOVE, L"Remove material...") || hasItems;
+            }
             hasItems = addContextMenuItem(menu, ID_FILE_EXPORT_TEXTURE, L"Export texture PNG...") || hasItems;
-            hasItems = addContextMenuItem(menu, ID_TEXTURE_REMOVE, L"Remove material...") || hasItems;
+            if (mobileTexture) {
+                hasItems = addContextMenuItem(menu, ID_VIEW_TEXTURE_MIP_PREVIOUS, L"Larger texture size") || hasItems;
+                hasItems = addContextMenuItem(menu, ID_VIEW_TEXTURE_MIP_NEXT, L"Smaller texture size") || hasItems;
+                AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+                hasItems = addContextMenuItem(menu, ID_VIEW_TEXTURE_ORDER_AUTO, L"Automatic pixel order") || hasItems;
+                hasItems = addContextMenuItem(menu, ID_VIEW_TEXTURE_ORDER_STORED, L"Pixels as stored") || hasItems;
+                hasItems = addContextMenuItem(menu, ID_VIEW_TEXTURE_ORDER_PS2, L"PS2 pixel order") || hasItems;
+                hasItems = addContextMenuItem(menu, ID_VIEW_TEXTURE_ORDER_PSP, L"PSP pixel order") || hasItems;
+            }
         }
         if (hasItems) AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         hasItems = addAnalyzeSubmenu(
@@ -19480,6 +19795,25 @@ static void rebuildFileMenu() {
         AppendMenuW(gScmMenu, MF_STRING, ID_SCM_EXPORT_SOURCE, L"Export Source...");
         AppendMenuW(gScmMenu, MF_STRING, ID_SCM_COMPILE, L"Compile SCM...");
         AppendMenuW(gFileMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(gScmMenu), L"VCS SCM missions");
+    }
+
+    if (gMode == StorylandMode::DataFile) {
+        AppendMenuW(gFileMenu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(gFileMenu, MF_STRING, ID_DATA_SAVE, L"Save data");
+        AppendMenuW(gFileMenu, MF_STRING, ID_DATA_SAVE_AS, L"Save data As...");
+        AppendMenuW(gFileMenu, MF_STRING, ID_DATA_FIND, L"Find data...");
+        AppendMenuW(gFileMenu, MF_STRING, ID_DATA_EDIT, L"Edit selected row / field...");
+        if (!gDataFile.binaryWater()) {
+            AppendMenuW(gFileMenu, MF_STRING, ID_DATA_ADD, L"Add row...");
+            AppendMenuW(gFileMenu, MF_STRING, ID_DATA_DELETE, L"Remove row");
+            AppendMenuW(gFileMenu, MF_STRING, ID_DATA_UP, L"Move row up");
+            AppendMenuW(gFileMenu, MF_STRING, ID_DATA_DOWN, L"Move row down");
+        }
+        if (gDataFile.manifest()) {
+            AppendMenuW(gFileMenu, MF_STRING, ID_DATA_TOGGLE, L"Enable / disable command");
+            AppendMenuW(gFileMenu, MF_STRING, ID_DATA_OPEN_REFERENCE, L"Open referenced file");
+        }
+        AppendMenuW(gFileMenu, MF_STRING, ID_DATA_VALIDATE, gDataFile.manifest() ? L"Check file references" : L"Check data");
     }
 
     if (gMode == StorylandMode::GxtFile) {
@@ -20054,6 +20388,20 @@ static void rebuildViewMenu() {
     if (gMode == StorylandMode::TextureArchive) {
         gTexturePreviewMenu = CreatePopupMenu();
         AppendMenuW(gTexturePreviewMenu, MF_STRING, ID_VIEW_FLIP_TEXTURE_PREVIEW_V, L"Flip vertically");
+        const bool mobileMips = gSelectedIndex >= 0 && size_t(gSelectedIndex) < gTextureArchive.textures().size() &&
+            gTextureArchive.textures()[size_t(gSelectedIndex)].kind == TextureKind::RwMobile;
+        AppendMenuW(gTexturePreviewMenu, MF_STRING | (mobileMips ? 0 : MF_GRAYED), ID_VIEW_TEXTURE_MIP_PREVIOUS, L"Larger texture size");
+        AppendMenuW(gTexturePreviewMenu, MF_STRING | (mobileMips ? 0 : MF_GRAYED), ID_VIEW_TEXTURE_MIP_NEXT, L"Smaller texture size");
+        if (mobileMips) {
+            HMENU orderMenu = CreatePopupMenu();
+            AppendMenuW(orderMenu, MF_STRING, ID_VIEW_TEXTURE_ORDER_AUTO, L"Automatic");
+            AppendMenuW(orderMenu, MF_STRING, ID_VIEW_TEXTURE_ORDER_STORED, L"As stored");
+            AppendMenuW(orderMenu, MF_STRING, ID_VIEW_TEXTURE_ORDER_PS2, L"PS2 order");
+            AppendMenuW(orderMenu, MF_STRING, ID_VIEW_TEXTURE_ORDER_PSP, L"PSP order");
+            CheckMenuRadioItem(orderMenu, ID_VIEW_TEXTURE_ORDER_AUTO, ID_VIEW_TEXTURE_ORDER_PSP,
+                ID_VIEW_TEXTURE_ORDER_AUTO + static_cast<UINT>(gMobileTextureLayout), MF_BYCOMMAND);
+            AppendMenuW(gTexturePreviewMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(orderMenu), L"Pixel order");
+        }
         CheckMenuItem(gTexturePreviewMenu, ID_VIEW_FLIP_TEXTURE_PREVIEW_V,
                       MF_BYCOMMAND | (gTexturePreviewFlipV ? MF_CHECKED : MF_UNCHECKED));
         AppendMenuW(gViewMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(gTexturePreviewMenu), L"Texture");
@@ -20268,6 +20616,7 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         detailsClass.hInstance = gInstance;
         detailsClass.lpszClassName = L"StorylandDetailsPanel";
         detailsClass.lpfnWndProc = detailsPanelProc;
+        detailsClass.style = CS_DBLCLKS;
         detailsClass.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
         RegisterClassW(&detailsClass);
         gDetailsGrid = CreateWindowExW(0, detailsClass.lpszClassName, nullptr,
@@ -20592,6 +20941,9 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 
     case WM_COMMAND: {
         const UINT commandId = LOWORD(wParam);
+        const bool createsResource = commandId == ID_FILE_NEW || commandId == ID_FILE_NEW_MODEL ||
+            commandId == ID_FILE_NEW_TEXTURE || (commandId >= ID_FILE_NEW_TEXTURE_XTX && commandId <= ID_FILE_NEW_TEXTURE_PSP_CHK);
+        if (createsResource && !confirmDataChanges()) return 0;
         if (commandId >= ID_FILE_RECENT_BASE &&
             commandId < ID_FILE_RECENT_BASE + STORYLAND_MAX_RECENT_FILES) {
             const size_t recentIndex = size_t(commandId - ID_FILE_RECENT_BASE);
@@ -20684,6 +21036,7 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 case StorylandMode::AnimFile: reloadPath = gAnimFile.sourcePath(); break;
                 case StorylandMode::ScmFile: reloadPath = gScmFile.sourcePath(); break;
                 case StorylandMode::GxtFile: reloadPath = gGxtFile.sourcePath(); break;
+                case StorylandMode::DataFile: reloadPath = gDataFile.sourcePath().wstring(); break;
                 case StorylandMode::MediaFile: reloadPath = gMediaFile.sourcePath(); break;
                 case StorylandMode::ArchiveFile:
                     reloadPath = !gArchiveBrowser.lvzPath().empty() ? gArchiveBrowser.lvzPath() : gArchiveBrowser.imgPath();
@@ -20706,7 +21059,7 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         }
 
         case ID_FILE_OPEN: {
-            std::wstring path = openFileDialog(L"Storyland files\0*.gxt;*.scm;*.dtz;*.bin;*.img;*.dir;*.lvz;*.zmg;*.area;*.wbl;*.mdl;*.dff;*.anim;*.chk;*.xtx;*.tex;*.txd;*.sdt;*.raw;*.vag;*.vb;*.wav;*.at3;*.aa3;*.oma;*.mp3;*.ogg;*.flac;*.aac;*.m4a;*.wma;*.ac3;*.aif;*.aiff;*.adx;*.pss;*.pmf;*.mpg;*.mpeg;*.mp4;*.m4v;*.wmv;*.avi;*.mov;*.mkv;*.ts;*.m2ts;*.mts;*.vob;*.3gp;*.3g2;*.webm;*.ogv;*.flv\0Game text\0*.gxt\0Models\0*.mdl;*.dff;*.wbl\0Textures\0*.chk;*.xtx;*.tex;*.txd\0Audio\0*.sdt;*.raw;*.vag;*.vb;*.wav;*.at3;*.aa3;*.oma;*.mp3;*.ogg;*.flac;*.aac;*.m4a;*.wma;*.ac3;*.aif;*.aiff;*.adx\0Video\0*.pss;*.pmf;*.mpg;*.mpeg;*.mp4;*.m4v;*.wmv;*.avi;*.mov;*.mkv;*.ts;*.m2ts;*.mts;*.vob;*.3gp;*.3g2;*.webm;*.ogv;*.flv\0All files\0*.*\0");
+            std::wstring path = openFileDialog(L"Storyland files\0*.dat;*.cfg;*.ide;*.ipl;*.zon;*.gxt;*.scm;*.dtz;*.bin;*.img;*.dir;*.lvz;*.zmg;*.area;*.wbl;*.mdl;*.dff;*.anim;*.ifp;*.chk;*.xtx;*.tex;*.txd;*.sdt;*.raw;*.vag;*.vb;*.wav;*.at3;*.aa3;*.oma;*.mp3;*.ogg;*.flac;*.aac;*.m4a;*.wma;*.ac3;*.aif;*.aiff;*.adx;*.pss;*.pmf;*.mpg;*.mpeg;*.mp4;*.m4v;*.wmv;*.avi;*.mov;*.mkv;*.ts;*.m2ts;*.mts;*.vob;*.3gp;*.3g2;*.webm;*.ogv;*.flv\0Game data\0*.dat;*.cfg;*.ide;*.ipl;*.zon\0Game text\0*.gxt\0Models\0*.mdl;*.dff;*.wbl\0Textures\0*.chk;*.xtx;*.tex;*.txd\0Audio\0*.sdt;*.raw;*.vag;*.vb;*.wav;*.at3;*.aa3;*.oma;*.mp3;*.ogg;*.flac;*.aac;*.m4a;*.wma;*.ac3;*.aif;*.aiff;*.adx\0Video\0*.pss;*.pmf;*.mpg;*.mpeg;*.mp4;*.m4v;*.wmv;*.avi;*.mov;*.mkv;*.ts;*.m2ts;*.mts;*.vob;*.3gp;*.3g2;*.webm;*.ogv;*.flv\0All files\0*.*\0");
             openStorylandFile(path);
             break;
         }
@@ -20732,6 +21085,10 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         case ID_SCM_REFRESH_MISSIONS: refreshScmMissionTree(); break;
         case ID_SCM_EXPORT_SOURCE: exportCurrentScmSource(); break;
         case ID_SCM_COMPILE: compileCurrentScm(); break;
+        case ID_DATA_SAVE: case ID_DATA_SAVE_AS: case ID_DATA_EDIT: case ID_DATA_ADD:
+        case ID_DATA_DELETE: case ID_DATA_UP: case ID_DATA_DOWN: case ID_DATA_TOGGLE:
+        case ID_DATA_OPEN_REFERENCE: case ID_DATA_FIND: case ID_DATA_VALIDATE:
+            runDataCommand(LOWORD(wParam)); break;
         case ID_GXT_EDIT: editGxtEntry(); break;
         case ID_GXT_FIND: findGxtText(); break;
         case ID_GXT_SAVE: saveGxt(false); break;
@@ -20886,6 +21243,29 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             applyStorylandPaneBackground(hwnd);
             applyStorylandTitleTint(gTitleTint);
             setStatus(gStatusText);
+            break;
+        case ID_VIEW_TEXTURE_ORDER_AUTO:
+        case ID_VIEW_TEXTURE_ORDER_STORED:
+        case ID_VIEW_TEXTURE_ORDER_PS2:
+        case ID_VIEW_TEXTURE_ORDER_PSP:
+            if (gMode == StorylandMode::TextureArchive && gTextureArchive.isMobileLcs() && gSelectedIndex >= 0) {
+                gMobileTextureLayout = static_cast<MobileTextureLayout>(LOWORD(wParam) - ID_VIEW_TEXTURE_ORDER_AUTO);
+                selectTexture(gSelectedIndex, gTextureMipLevel);
+                rebuildViewMenu();
+            }
+            break;
+        case ID_VIEW_TEXTURE_MIP_PREVIOUS:
+        case ID_VIEW_TEXTURE_MIP_NEXT:
+            if (gMode == StorylandMode::TextureArchive && gSelectedIndex >= 0 &&
+                size_t(gSelectedIndex) < gTextureArchive.textures().size()) {
+                const auto& texture = gTextureArchive.textures()[size_t(gSelectedIndex)];
+                if (texture.kind == TextureKind::RwMobile && texture.mipCount) {
+                    uint32_t level = std::min<uint32_t>(gTextureMipLevel, texture.mipCount - 1u);
+                    if (LOWORD(wParam) == ID_VIEW_TEXTURE_MIP_PREVIOUS && level) --level;
+                    if (LOWORD(wParam) == ID_VIEW_TEXTURE_MIP_NEXT && level + 1u < texture.mipCount) ++level;
+                    selectTexture(gSelectedIndex, level);
+                }
+            }
             break;
         case ID_VIEW_FLIP_TEXTURE_PREVIEW_V:
             gTexturePreviewFlipV = !gTexturePreviewFlipV;
@@ -21058,6 +21438,7 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         }
         if (header && header->idFrom == ID_TREE && header->code == NM_DBLCLK) {
             if (gMode == StorylandMode::GxtFile) { editGxtEntry(); return 0; }
+            if (gMode == StorylandMode::DataFile) { editDataSelection(); return 0; }
             if (gMode == StorylandMode::ModelFile && gSelectedKind == StorylandTreeKind::ModelPrelight) {
                 editSelectedModelPrelight();
                 return 0;
@@ -21094,7 +21475,7 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         break;
     }
     case WM_CLOSE:
-        if (!confirmGxtChanges()) return 0;
+        if (!confirmGxtChanges() || !confirmDataChanges()) return 0;
         DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
@@ -22015,6 +22396,16 @@ static int runStorylandApplication(HINSTANCE hInstance, HINSTANCE, LPWSTR comman
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
+        if (msg.message == WM_KEYDOWN && gMode == StorylandMode::DataFile) {
+            const bool control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+            if (control && msg.wParam == 'S') { saveDataFile((GetKeyState(VK_SHIFT) & 0x8000) != 0); continue; }
+            if (control && msg.wParam == 'F') { runDataCommand(ID_DATA_FIND); continue; }
+            if (msg.hwnd == gTree && msg.wParam == VK_F2) { editDataSelection(); continue; }
+            if (msg.hwnd == gTree && msg.wParam == VK_RETURN && gDataFile.manifest()) { runDataCommand(ID_DATA_OPEN_REFERENCE); continue; }
+            if (msg.hwnd == gTree && (GetKeyState(VK_MENU) & 0x8000) != 0 && (msg.wParam == VK_UP || msg.wParam == VK_DOWN)) {
+                runDataCommand(msg.wParam == VK_UP ? ID_DATA_UP : ID_DATA_DOWN); continue;
+            }
+        }
         if (msg.message == WM_KEYDOWN && msg.hwnd == gScriptEditor && msg.wParam == VK_RETURN &&
             (GetKeyState(VK_CONTROL) & 0x8000) != 0) {
             runStorylandScriptEditor();

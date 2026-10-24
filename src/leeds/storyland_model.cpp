@@ -2762,7 +2762,8 @@ void StorylandModelFile::collectArmatureBones() {
         for (uint32_t relative : {0xA8u, 0xA4u}) {
             if (size_t(node.offset) + relative + 4u > data.size()) continue;
             uint32_t namePtr = modelReadU32(data, size_t(node.offset) + relative);
-            if (!modelPointerLooksValid(data, namePtr)) continue;
+            // Frame names are packed strings, not aligned structure pointers.
+            if (namePtr < 0x20u || namePtr >= data.size()) continue;
             std::string candidate = readModelCStringAt(data, namePtr);
             if (!candidate.empty()) { frameName = candidate; break; }
         }
@@ -2943,7 +2944,10 @@ void StorylandModelFile::collectArmatureBones() {
             bool vcsStyleEntry = packedHigh == 0xAAu || packedHigh == 0x09u || packedHigh == 0x0Au;
             bool lcsStyleEntry = candidateNodeIndex < hierarchy.count && !hierarchyNameForDirectBoneId(candidateBoneId).empty();
 
-            if (!vcsStyleEntry && !lcsStyleEntry) continue;
+            // HAnim's upper flag byte can contain runtime data. The bounded
+            // node index and the frame name identify a row, including 0xFF
+            // finger/toe IDs and the retail jaw alias 6.
+            if (candidateNodeIndex >= hierarchy.count) continue;
 
             HierarchyEntry entry;
             entry.packed = packed;
@@ -2955,8 +2959,12 @@ void StorylandModelFile::collectArmatureBones() {
             // PS2 PLR, +0x9C is zero for the named frames, while the HAnim table
             // still contains the correct direct IDs.  Allocation-order fallback
             // is only for stripped files without usable names.
-            auto namedFrameIt = namedDirectBoneIdToNodeOffset.find(entry.boneId);
-            if (namedFrameIt != namedDirectBoneIdToNodeOffset.end()) {
+            const uint32_t namedId = bleedsDirectIdForHierarchyName(
+                hierarchyNameForNodeIndex(entry.nodeIndex, entry.boneId));
+            auto namedFrameIt = namedDirectBoneIdToNodeOffset.find(namedId);
+            if (namedId == 0u && entry.nodeIndex == 0u) {
+                entry.frameOffset = hierarchy.anchorFrame;
+            } else if (namedFrameIt != namedDirectBoneIdToNodeOffset.end()) {
                 entry.frameOffset = namedFrameIt->second;
             } else {
                 auto directFrameIt = directBoneIdToNodeOffset.find(entry.boneId);
@@ -2986,9 +2994,7 @@ void StorylandModelFile::collectArmatureBones() {
             bone.sectionKind = node.kind;
             bone.nodeId = entry.nodeIndex;
             bone.name = hierarchyNameForNodeIndex(entry.nodeIndex, entry.boneId);
-            bone.boneId = !hierarchyNameForDirectBoneId(entry.boneId).empty()
-                ? entry.boneId
-                : bleedsDirectIdForHierarchyName(bone.name);
+            bone.boneId = bleedsDirectIdForHierarchyName(bone.name);
             // Do not fall back to invalid raw hierarchy bytes as ANIM/direct ids.
             // On retail peds it can make r_toe0 inherit 6 and l_toe0 inherit 34,
             // which contaminates animation matching and skin-palette fallback.
@@ -3064,18 +3070,21 @@ void StorylandModelFile::collectArmatureBones() {
         }
 
         for (auto& bone : bones) {
-            // Retail PSP RslNode link fields are not the PS2 frame-parent
-            // pointers.  Reading them as such can reverse whole chains and, in
-            // plr.mdl, creates a false r_calf <-> r_foot cycle.  PSP PEDs carry
-            // a complete RslTAnim direct-id/name hierarchy, so use that
-            // authoritative relationship for the decoded armature.
-            if (previewUsesPspNativeSkinPalette) {
-                std::string parentName = canonicalPedParentName(bone.name);
-                auto canonicalParentIt = canonicalNameToBone.find(parentName);
-                if (canonicalParentIt != canonicalNameToBone.end() && canonicalParentIt->second != bone.index) {
-                    bone.parentIndex = canonicalParentIt->second;
-                    bone.parentOffset = bones[canonicalParentIt->second].offset;
-                }
+            // Native frame links retain joints between neck and shoulders.
+            // Replacing these with an assumed human hierarchy changes the bind
+            // pose and stretches every vertex using that branch.
+            const NodeCandidate& actualNode = nodes[offsetToNode[bone.offset]];
+            const auto actualParent = offsetToBone.find(actualNode.parentPtr);
+            bool parentCycle = false;
+            std::set<uint32_t> ancestors{bone.offset};
+            uint32_t ancestor = actualNode.parentPtr;
+            while (offsetToBone.find(ancestor) != offsetToBone.end()) {
+                if (!ancestors.insert(ancestor).second) { parentCycle = true; break; }
+                ancestor = nodes[offsetToNode[ancestor]].parentPtr;
+            }
+            if (!parentCycle && actualParent != offsetToBone.end() && actualParent->second != bone.index) {
+                bone.parentIndex = actualParent->second;
+                bone.parentOffset = actualNode.parentPtr;
                 continue;
             }
 
@@ -3859,6 +3868,7 @@ static bool appendMobileLcsF00dMeshPacket(
     std::vector<StorylandModelTriangle>& triangles,
     std::vector<StorylandModelTexcoord>& texcoords,
     std::vector<StorylandModelSkinWeights>& skinWeights,
+    std::vector<StorylandModelPrelight>& prelights,
     uint32_t& batchCountOut
 ) {
     batchCountOut = 0u;
@@ -3908,6 +3918,7 @@ static bool appendMobileLcsF00dMeshPacket(
     std::vector<StorylandModelPoint> packetPoints;
     std::vector<StorylandModelTexcoord> packetTexcoords;
     std::vector<StorylandModelSkinWeights> packetSkinWeights;
+    std::vector<StorylandModelPrelight> packetPrelights;
 
     size_t cursor = packetOffset + 16u;
     bool firstBatch = true;
@@ -3935,9 +3946,9 @@ static bool appendMobileLcsF00dMeshPacket(
         if (!skipUnpack(cursor, uvCommand, uvPayload) ||
             (uvCommand & 0xFF004000u) != 0x76004000u) return false;
 
+        size_t colorPayload = 0u;
         if (storiesFlags & 0x08u) {
             uint32_t colorCommand = 0u;
-            size_t colorPayload = 0u;
             if (!skipUnpack(cursor, colorCommand, colorPayload) ||
                 (colorCommand & 0xFF004000u) != 0x6F000000u) return false;
         }
@@ -3996,6 +4007,20 @@ static bool appendMobileLcsF00dMeshPacket(
             float v = (float(bytes[textureOffset + 1u]) / 127.5f) * uvScaleV;
             packetTexcoords.push_back({u, 1.0f - v});
             packetSkinWeights.push_back(batchSkinWeights[vertexIndex]);
+            StorylandModelPrelight color;
+            if (colorPayload) {
+                const size_t offset = colorPayload + size_t(skippedVertices + vertexIndex) * 2u;
+                if (offset + 2u > packetEnd) return false;
+                const uint16_t packed = modelReadU16(bytes, offset);
+                color.red = uint8_t((packed & 31u) * 255u / 31u);
+                color.green = uint8_t(((packed >> 5u) & 31u) * 255u / 31u);
+                color.blue = uint8_t(((packed >> 10u) & 31u) * 255u / 31u);
+                color.alpha = (packed & 0x8000u) ? 255u : 0u;
+                color.fileOffset = uint32_t(offset);
+                color.encoding = StorylandPrelightEncoding::Ps2Vif5551;
+                color.valid = true;
+            }
+            packetPrelights.push_back(color);
         }
 
         firstBatch = false;
@@ -4003,12 +4028,13 @@ static bool appendMobileLcsF00dMeshPacket(
     }
 
     if (packetPoints.size() < 3u || packetTexcoords.size() != packetPoints.size() ||
-        packetSkinWeights.size() != packetPoints.size() || !blockHasShape(packetPoints)) return false;
+        packetSkinWeights.size() != packetPoints.size()) return false;
 
     uint32_t baseVertex = uint32_t(points.size());
     points.insert(points.end(), packetPoints.begin(), packetPoints.end());
     texcoords.insert(texcoords.end(), packetTexcoords.begin(), packetTexcoords.end());
     skinWeights.insert(skinWeights.end(), packetSkinWeights.begin(), packetSkinWeights.end());
+    prelights.insert(prelights.end(), packetPrelights.begin(), packetPrelights.end());
     appendTriangleStripPreview(baseVertex, packetPoints.size(), materialIndex, points, triangles);
     return true;
 }
@@ -4022,6 +4048,7 @@ bool StorylandModelFile::parseMobileLcsDff() {
     texcoords.clear();
     skinWeights.clear();
     bones.clear();
+    prelights.clear();
     materialTextureNames.clear();
     textureHints.clear();
     fieldRows.clear();
@@ -4033,6 +4060,7 @@ bool StorylandModelFile::parseMobileLcsDff() {
     // beyond the top-level Clump's declared size. The sector allocation or the
     // standalone file length is authoritative for preview decoding.
     const size_t clumpEnd = data.size();
+    pointFrameIndices.clear();
     const size_t frameListOffset = 28u;
     size_t frameStructOffset = frameListOffset + 12u;
     uint32_t frameCount = 0u;
@@ -4040,6 +4068,8 @@ bool StorylandModelFile::parseMobileLcsDff() {
     std::vector<MobileLcsRwMatrix> worldMatrices;
     std::vector<int32_t> parents;
     std::vector<std::string> frameNames;
+    std::vector<uint32_t> frameBoneIds;
+    std::map<uint32_t, uint32_t> skinNodes;
 
     if (mobileRwHeaderValid(data, frameStructOffset, clumpEnd, 0x01u, 0x00000310u)) {
         size_t frameStructSize = modelReadU32(data, frameStructOffset + 4u);
@@ -4050,6 +4080,7 @@ bool StorylandModelFile::parseMobileLcsDff() {
             worldMatrices.resize(frameCount);
             parents.resize(frameCount, -1);
             frameNames.resize(frameCount);
+            frameBoneIds.resize(frameCount, 0xFFFFFFFFu);
             for (uint32_t frameIndex = 0u; frameIndex < frameCount; ++frameIndex) {
                 size_t row = framePayload + 4u + size_t(frameIndex) * 56u;
                 MobileLcsRwMatrix matrix;
@@ -4065,11 +4096,23 @@ bool StorylandModelFile::parseMobileLcsDff() {
             for (uint32_t frameIndex = 0u; frameIndex < frameCount && extensionCursor + 12u <= clumpEnd; ++frameIndex) {
                 if (!mobileRwHeaderValid(data, extensionCursor, clumpEnd, 0x03u, 0x00000310u)) break;
                 size_t extensionEnd = extensionCursor + 12u + size_t(modelReadU32(data, extensionCursor + 4u));
-                for (size_t probe = extensionCursor + 12u; probe + 12u <= extensionEnd; ++probe) {
-                    if (modelReadU32(data, probe) != 0x0253F2FEu || modelReadU32(data, probe + 8u) != 0x00000310u) continue;
-                    uint32_t nameSize = modelReadU32(data, probe + 4u);
-                    if (nameSize > 0u && nameSize <= 128u && probe + 12u + nameSize <= extensionEnd) frameNames[frameIndex] = mobileRwString(data, probe + 12u, nameSize);
-                    break;
+                for (size_t probe = extensionCursor + 12u; probe + 12u <= extensionEnd;) {
+                    const uint32_t type = modelReadU32(data, probe);
+                    const uint32_t length = modelReadU32(data, probe + 4u);
+                    if (length > extensionEnd - probe - 12u) break;
+                    if (type == 0x0253F2FEu && length > 0u && length <= 128u)
+                        frameNames[frameIndex] = mobileRwString(data, probe + 12u, length);
+                    if (type == 0x11Eu && length >= 12u) {
+                        frameBoneIds[frameIndex] = modelReadU32(data, probe + 16u);
+                        const uint32_t count = modelReadU32(data, probe + 20u);
+                        if (count && uint64_t(count) * 12u + 20u <= length) {
+                            for (uint32_t node = 0u; node < count; ++node) {
+                                const size_t entry = probe + 32u + size_t(node) * 12u;
+                                skinNodes[modelReadU32(data, entry)] = modelReadU32(data, entry + 4u);
+                            }
+                        }
+                    }
+                    probe += 12u + size_t(length);
                 }
                 extensionCursor = extensionEnd;
             }
@@ -4097,7 +4140,16 @@ bool StorylandModelFile::parseMobileLcsDff() {
                 bone.offset = uint32_t(framePayload + 4u + size_t(frameIndex) * 56u);
                 bone.parentIndex = parents[frameIndex] >= 0 ? uint32_t(parents[frameIndex]) : 0xFFFFFFFFu;
                 bone.name = frameNames[frameIndex].empty() ? ("frame_" + std::to_string(frameIndex)) : frameNames[frameIndex];
-                bone.sectionKind = "Mobile LCS RenderWare frame";
+                bone.sectionKind = "LCS Mobile frame";
+                bone.boneId = frameBoneIds[frameIndex];
+                auto skinNode = skinNodes.find(bone.boneId);
+                if (skinNode != skinNodes.end()) bone.nodeId = skinNode->second;
+                StorylandModelMatrix localRotation, worldRotation;
+                localRotation.valid = true; worldRotation.valid = true;
+                std::copy_n(localMatrices[frameIndex].m, 16u, localRotation.m.begin());
+                std::copy_n(worldMatrices[frameIndex].m, 16u, worldRotation.m.begin());
+                bone.hasLocalRotation = matrixModelRotationToQuat(localRotation, bone.localRotationX, bone.localRotationY, bone.localRotationZ, bone.localRotationW);
+                bone.hasWorldRotation = matrixModelRotationToQuat(worldRotation, bone.worldRotationX, bone.worldRotationY, bone.worldRotationZ, bone.worldRotationW);
                 bone.hasLocalPosition = true;
                 bone.localPosition = {localMatrices[frameIndex].m[12], localMatrices[frameIndex].m[13], localMatrices[frameIndex].m[14]};
                 bone.hasWorldPosition = true;
@@ -4139,7 +4191,6 @@ bool StorylandModelFile::parseMobileLcsDff() {
         float ty = modelReadF32(data, geometryBody + 0x38u);
         float tz = modelReadF32(data, geometryBody + 0x3Cu);
         if (previewFiniteReasonable(sx, 4096.0f) && previewFiniteReasonable(sy, 4096.0f) && previewFiniteReasonable(sz, 4096.0f) &&
-            std::fabs(sx) > 0.000001f && std::fabs(sy) > 0.000001f && std::fabs(sz) > 0.000001f &&
             previewFiniteReasonable(tx, 4096.0f) && previewFiniteReasonable(ty, 4096.0f) && previewFiniteReasonable(tz, 4096.0f)) {
             packedTransform.valid = true;
             packedTransform.sx = sx; packedTransform.sy = sy; packedTransform.sz = sz;
@@ -4178,6 +4229,7 @@ bool StorylandModelFile::parseMobileLcsDff() {
             std::vector<StorylandModelTriangle> atomicTriangles;
             std::vector<StorylandModelTexcoord> atomicTexcoords;
             std::vector<StorylandModelSkinWeights> atomicSkinWeights;
+            std::vector<StorylandModelPrelight> atomicPrelights;
             uint32_t atomicBatchCount = 0u;
             bool allMeshesDecoded = true;
 
@@ -4219,6 +4271,7 @@ bool StorylandModelFile::parseMobileLcsDff() {
                         atomicTriangles,
                         atomicTexcoords,
                         atomicSkinWeights,
+                        atomicPrelights,
                         meshBatchCount)) {
                     allMeshesDecoded = false;
                     break;
@@ -4243,6 +4296,7 @@ bool StorylandModelFile::parseMobileLcsDff() {
                 points.insert(points.end(), atomicPoints.begin(), atomicPoints.end());
                 texcoords.insert(texcoords.end(), atomicTexcoords.begin(), atomicTexcoords.end());
                 skinWeights.insert(skinWeights.end(), atomicSkinWeights.begin(), atomicSkinWeights.end());
+                prelights.insert(prelights.end(), atomicPrelights.begin(), atomicPrelights.end());
                 for (StorylandModelTriangle triangle : atomicTriangles) {
                     triangle.a += globalBase;
                     triangle.b += globalBase;
@@ -4285,10 +4339,22 @@ bool StorylandModelFile::parseMobileLcsDff() {
             addField(fieldRows, group.str(), "declared_vertex_count", uint32_t(geometryBody + 0x18u), declaredVertexCount,
                      "Exact combined F00D mesh vertex count; continuation batches repeat two strip vertices that are removed during decode.");
         }
+        pointFrameIndices.resize(points.size(), frameIndex);
+        prelights.resize(points.size());
         ++atomicCount;
         atomicOffset = geometryEnd > atomicOffset ? geometryEnd - 1u : atomicOffset;
     }
 
+    std::map<uint32_t, uint32_t> frameBySkinNode;
+    for (uint32_t index = 0u; index < bones.size(); ++index)
+        if (bones[index].nodeId != 0xFFFFFFFFu) frameBySkinNode[bones[index].nodeId] = index;
+    for (auto& weights : skinWeights) {
+        for (uint32_t influence = 0u; influence < weights.influenceCount; ++influence) {
+            auto& item = weights.influences[influence];
+            auto found = frameBySkinNode.find(item.boneIndex);
+            item.boneIndex = found == frameBySkinNode.end() ? 0xFFFFFFFFu : found->second;
+        }
+    }
     bool vehicle = false;
     bool ped = false;
     for (const std::string& name : frameNames) {
@@ -4302,7 +4368,7 @@ bool StorylandModelFile::parseMobileLcsDff() {
     outputLines.push_back({hasF00dGeometry
         ? "Format: Mobile LCS RenderWare 3.1 DFF (War Drum F00D native geometry)."
         : "Format: Mobile LCS RenderWare 3.1 frame-only DFF (no atomic or Geometry chunk)."});
-    outputLines.push_back({"Writer policy: lossless Mobile LCS DFF export enabled; III/VC/SA desktop Geometry variants are deliberately rejected."});
+
     outputLines.push_back({"Frames: " + std::to_string(frameCount) + ", atomics: " + std::to_string(atomicCount) + ", native strips: " + std::to_string(stripCount) + "."});
     outputLines.push_back({"Geometry: " + std::to_string(points.size()) + " vertices, " + std::to_string(triangles.size()) + " triangles."});
     outputLines.push_back({"RenderWare 2DFX lights: " + std::to_string(lights2dfx.size()) + "."});
@@ -5742,7 +5808,7 @@ static uint8_t expand5To8(uint32_t value) {
 }
 
 void StorylandModelFile::collectPreviewPrelights() {
-    if (desktopRwDff && prelights.size() == points.size()) return;
+    if ((desktopRwDff || mobileLcsDff) && prelights.size() == points.size()) return;
     prelights.clear();
     if (points.empty()) return;
 
@@ -5876,7 +5942,7 @@ bool StorylandModelFile::setPreviewPrelightColor(size_t vertexIndex, uint8_t red
     if (c.encoding == StorylandPrelightEncoding::Rgba8888 || c.encoding == StorylandPrelightEncoding::Ps2VifRgba8888) {
         if (!modelRangeFits(off, 4u, data.size())) { errorMessage = "Prelight source offset is outside the model."; return false; }
         data[off+0u]=red; data[off+1u]=green; data[off+2u]=blue; data[off+3u]=alpha;
-    } else if (c.encoding == StorylandPrelightEncoding::Psp5551) {
+    } else if ((c.encoding == StorylandPrelightEncoding::Psp5551 || c.encoding == StorylandPrelightEncoding::Ps2Vif5551)) {
         if (!modelRangeFits(off, 2u, data.size())) { errorMessage = "PSP prelight source offset is outside the model."; return false; }
         uint16_t packed = uint16_t((red >> 3u) | ((green >> 3u) << 5u) | ((blue >> 3u) << 10u) | (alpha >= 128u ? 0x8000u : 0u));
         data[off+0u]=uint8_t(packed & 0xFFu); data[off+1u]=uint8_t(packed >> 8u);
@@ -6601,4 +6667,10 @@ std::string StorylandModelFile::modelKindName() const {
     case StorylandModelKind::WorldModel: return "WorldModel";
     default: return "Unknown";
     }
+}
+
+const std::vector<uint32_t>& StorylandModelFile::previewFrameIndices() const { return pointFrameIndices; }
+
+bool StorylandModelFile::skinWeightsUseBoneIndices() const {
+    return previewUsesPspNativeSkinPalette || mobileLcsDff || desktopRwDff;
 }

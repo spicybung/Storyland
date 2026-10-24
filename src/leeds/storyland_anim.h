@@ -20,6 +20,9 @@ struct StorylandAnimKey {
     float qy = 0.0f;
     float qz = 0.0f;
     float qw = 1.0f;
+    float sx = 1.0f;
+    float sy = 1.0f;
+    float sz = 1.0f;
     uint32_t offset = 0;
 };
 
@@ -80,6 +83,7 @@ public:
     bool setActiveClipIndex(uint32_t clipIndex);
     bool hasKeyframeCandidates() const;
     bool hasDecodedMotion() const;
+    bool isIfp() const;
 
     std::vector<StorylandAnimPoseBone> poseAt(float seconds) const;
     std::string summaryLine() const;
@@ -97,6 +101,9 @@ private:
     uint32_t activeClip = 0;
     bool hasCandidates = false;
 
+    bool ifpFormat = false;
+    std::vector<std::vector<StorylandAnimTrack>> ifpClipTracks;
+    bool parseIfp(std::string& errorMessage);
     void parse();
     void collectStrings();
     void collectHeaderFields();

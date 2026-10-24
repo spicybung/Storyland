@@ -30,6 +30,7 @@ enum class TextureKind {
     Psp,
     RwPsp,
     RwPc,
+    RwMobile,
     Ps2,
     CtwTex,
     Dds
@@ -57,7 +58,13 @@ struct LeedsTextureEntry {
     uint32_t alphaMask = 0;
     int width = 0;
     int height = 0;
+    uint32_t mobilePaletteOffset = 0;
+    uint32_t mobilePaletteBytes = 0;
+    std::vector<uint32_t> mobileMipOffsets;
+    std::vector<uint32_t> mobileMipSizes;
 };
+
+enum class MobileTextureLayout { Automatic, Stored, Ps2, Psp };
 
 class LeedsTextureArchive {
 public:
@@ -66,6 +73,8 @@ public:
     bool saveToFile(const std::wstring& path, std::string& errorMessage) const;
     const std::vector<LeedsTextureEntry>& textures() const;
     bool decodeTexture(size_t textureIndex, RgbaImage& image, std::string& errorMessage) const;
+    bool isMobileLcs() const;
+    bool decodeTextureMip(size_t textureIndex, uint32_t mipLevel, RgbaImage& image, std::string& errorMessage, MobileTextureLayout layout = MobileTextureLayout::Automatic) const;
     bool replaceTexture(size_t textureIndex, const RgbaImage& image, std::string& errorMessage);
     bool replaceTextureAsBpp(size_t textureIndex, const RgbaImage& image, uint8_t targetBpp, std::string& errorMessage);
     bool renameTexture(size_t textureIndex, const std::string& newName, std::string& errorMessage);
@@ -85,6 +94,7 @@ private:
     std::vector<LeedsTextureEntry> entries;
     std::wstring path;
     LeedsPlatform loadedPlatform = LeedsPlatform::Auto;
+    mutable std::vector<MobileTextureLayout> mobileLayoutCache;
 
     bool parse(LeedsPlatform platform, std::string& errorMessage);
 };

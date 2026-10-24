@@ -45,6 +45,7 @@ struct StorylandModelTexcoord {
 enum class StorylandPrelightEncoding {
     None,
     Rgba8888,
+    Ps2Vif5551,
     Psp5551,
     Ps2VifRgba8888
 };
@@ -138,6 +139,8 @@ public:
     const std::vector<StorylandModelPrelight>& previewPrelights() const;
     bool setPreviewPrelightColor(size_t vertexIndex, uint8_t red, uint8_t green, uint8_t blue, uint8_t alpha, std::string& errorMessage);
     const std::vector<StorylandModelSkinWeights>& previewSkinWeights() const;
+    const std::vector<uint32_t>& previewFrameIndices() const;
+    bool skinWeightsUseBoneIndices() const;
     const std::vector<StorylandModelBone>& armatureBones() const;
     const std::vector<StorylandModelLight2dfx>& preview2dfxLights() const;
     const std::vector<std::string>& previewMaterialTextureNames() const;
@@ -177,6 +180,7 @@ private:
     std::vector<StorylandModelPrelight> prelights;
     std::vector<StorylandModelSkinWeights> skinWeights;
     std::vector<StorylandModelBone> bones;
+    std::vector<uint32_t> pointFrameIndices;
     std::vector<StorylandModelLight2dfx> lights2dfx;
     std::vector<std::string> materialTextureNames;
     std::vector<std::string> textureHints;

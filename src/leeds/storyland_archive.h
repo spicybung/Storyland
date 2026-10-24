@@ -144,7 +144,8 @@ enum class StorylandImgKind {
     LvzPair,
     ClassicDir,
     Ps2StoriesRaw,
-    MobileLcsRaw
+    MobileLcsRaw,
+    MobileLcsDir
 };
 
 class StorylandArchiveBrowser {

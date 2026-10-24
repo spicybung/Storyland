@@ -1131,138 +1131,113 @@ static bool parseDesktopRwTxd(
     return true;
 }
 
-static bool parseMobileLcsRwTxd(
-    const std::vector<uint8_t>& data,
-    std::vector<LeedsTextureEntry>& entriesOut,
-    std::string& errorMessage
-) {
+static bool parseMobileGifImages(const std::vector<uint8_t>& data, size_t begin, size_t size,
+                                std::vector<uint32_t>& offsets, std::vector<uint32_t>& sizes) {
+    const size_t end = begin + size;
+    if (end > data.size()) return false;
+    while (begin < end) {
+        if (end - begin < 16u) return false;
+        const uint32_t low = readU32(data, begin);
+        const uint32_t high = readU32(data, begin + 4u);
+        const uint32_t count = low & 0x7FFFu;
+        const uint32_t mode = (high >> 26u) & 3u;
+        const uint32_t registers = ((high >> 28u) & 15u) ? ((high >> 28u) & 15u) : 16u;
+        begin += 16u;
+        uint64_t bytes = 0u;
+        if (mode == 0u) bytes = uint64_t(count) * registers * 16u;
+        else if (mode == 1u) bytes = ((uint64_t(count) * registers + 1u) / 2u) * 16u;
+        else if (mode == 2u) { bytes = uint64_t(count) * 16u; offsets.push_back(uint32_t(begin)); sizes.push_back(uint32_t(bytes)); }
+        else return false;
+        if (bytes > end - begin) return false;
+        begin += size_t(bytes);
+    }
+    return !offsets.empty();
+}
+
+static bool parseMobileLcsRwTxd(const std::vector<uint8_t>& data,
+                              std::vector<LeedsTextureEntry>& entriesOut, std::string& errorMessage) {
     entriesOut.clear();
-    if (data.size() < 32u || readU32(data, 0u) != 0x16u || readU32(data, 8u) != 0x00000310u) return false;
-
-    size_t limit = data.size();
-    size_t cursor = 12u;
-    if (!rwChunkHeaderValid(data, cursor, limit, 0x01u)) {
-        errorMessage = "Mobile LCS RenderWare TXD has an invalid dictionary Struct chunk.";
-        return false;
-    }
-
-    uint32_t dictionaryStructSize = readU32(data, cursor + 4u);
-    if (dictionaryStructSize < 4u || dictionaryStructSize > 32u) {
-        errorMessage = "Mobile LCS RenderWare TXD has an invalid dictionary Struct size.";
-        return false;
-    }
-    uint32_t textureCount = readU16(data, cursor + 12u);
-    if (textureCount > 4096u) {
-        errorMessage = "Mobile LCS RenderWare TXD has an invalid texture count.";
-        return false;
-    }
-    cursor += 12u + size_t(dictionaryStructSize);
-    if (textureCount == 0u) {
-        errorMessage.clear();
-        return true;
-    }
-
-    entriesOut.reserve(textureCount);
-    for (uint32_t textureIndex = 0u; textureIndex < textureCount; ++textureIndex) {
-        if (cursor + 12u > limit || readU32(data, cursor + 0u) != 0x15u || readU32(data, cursor + 8u) != 0x00000310u) {
-            errorMessage = "Mobile LCS RenderWare TXD ended before all native textures were parsed.";
-            entriesOut.clear();
-            return false;
-        }
-
-        size_t nativeOffset = cursor;
-        size_t child = cursor + 12u;
-        if (!rwChunkHeaderValid(data, child, limit, 0x01u)) {
-            errorMessage = "Mobile LCS RenderWare native texture has an invalid platform Struct chunk.";
-            entriesOut.clear();
-            return false;
-        }
-        uint32_t platformStructSize = readU32(data, child + 4u);
-        if (platformStructSize < 8u || platformStructSize > 64u || readU32(data, child + 12u) != 0x00505350u) {
-            errorMessage = "RenderWare TXD is not the supported Mobile LCS PSP-native texture layout.";
-            entriesOut.clear();
-            return false;
-        }
-        child += 12u + size_t(platformStructSize);
-
-        std::string textureName;
-        size_t nextChild = child;
-        if (!parseRwStringChunk(data, child, limit, textureName, nextChild)) {
-            errorMessage = "Mobile LCS RenderWare native texture has an invalid name chunk.";
-            entriesOut.clear();
-            return false;
-        }
-        child = nextChild;
-
-        std::string maskName;
-        if (!parseRwStringChunk(data, child, limit, maskName, nextChild)) {
-            errorMessage = "Mobile LCS RenderWare native texture has an invalid mask-name chunk.";
-            entriesOut.clear();
-            return false;
-        }
-        child = nextChild;
-
-        if (!rwChunkHeaderValid(data, child, limit, 0x01u)) {
-            errorMessage = "Mobile LCS RenderWare native texture has an invalid raster container.";
-            entriesOut.clear();
-            return false;
-        }
-        size_t rasterContainerEnd = child + 12u + size_t(readU32(data, child + 4u));
-        size_t rasterChild = child + 12u;
-        if (!rwChunkHeaderValid(data, rasterChild, rasterContainerEnd, 0x01u) || readU32(data, rasterChild + 4u) < 20u) {
-            errorMessage = "Mobile LCS RenderWare native texture has an invalid raster header.";
-            entriesOut.clear();
-            return false;
-        }
-
-        size_t rasterHeaderPayload = rasterChild + 12u;
-        uint32_t width = readU32(data, rasterHeaderPayload + 0u);
-        uint32_t height = readU32(data, rasterHeaderPayload + 4u);
-        uint32_t bpp = readU32(data, rasterHeaderPayload + 8u);
-        uint32_t mipCount = readU32(data, rasterHeaderPayload + 12u);
-        uint32_t rasterFlags = readU32(data, rasterHeaderPayload + 16u);
-        if (!dimensionsReasonable(int(width), int(height)) || !bppReasonablePsp(bpp) || mipCount == 0u || mipCount > 16u) {
-            errorMessage = "Mobile LCS RenderWare native texture has unsupported dimensions, BPP, or mip count.";
-            entriesOut.clear();
-            return false;
-        }
-
-        rasterChild += 12u + size_t(readU32(data, rasterChild + 4u));
-        if (!rwChunkHeaderValid(data, rasterChild, rasterContainerEnd, 0x01u)) {
-            errorMessage = "Mobile LCS RenderWare native texture has no raster payload chunk.";
-            entriesOut.clear();
-            return false;
-        }
-
+    auto fail = [&](const char* message) { errorMessage = message; entriesOut.clear(); return false; };
+    if (data.size() < 28u || readU32(data, 0u) != 0x16u ||
+        !rwChunkHeaderValid(data, 12u, data.size(), 1u) || readU32(data, 16u) != 4u)
+        return fail("Invalid mobile TXD dictionary header.");
+    const uint32_t count = readU16(data, 24u);
+    if (count > 16384u) return fail("Mobile TXD has too many textures.");
+    size_t cursor = 28u;
+    for (uint32_t index = 0u; index < count; ++index) {
+        const size_t native = cursor;
+        if (!rwChunkHeaderValid(data, cursor, data.size(), 0x15u)) return fail("Mobile TXD texture header is incomplete.");
+        cursor += 12u;
+        if (!rwChunkHeaderValid(data, cursor, data.size(), 1u) || readU32(data, cursor + 4u) != 8u)
+            return fail("Mobile TXD platform header is invalid.");
+        const uint32_t platform = readU32(data, cursor + 12u);
+        const bool transfers = platform == 0x00325350u;
+        if (!transfers && platform != 0x00505350u) return fail("Unsupported mobile TXD platform.");
+        cursor += 20u;
+        std::string name, mask;
+        size_t next = cursor;
+        if (!parseRwStringChunk(data, cursor, data.size(), name, next)) return fail("Invalid mobile texture name.");
+        cursor = next;
+        if (!parseRwStringChunk(data, cursor, data.size(), mask, next)) return fail("Invalid mobile texture mask name.");
+        cursor = next;
+        if (!rwChunkHeaderValid(data, cursor, data.size(), 1u)) return fail("Invalid mobile raster container.");
+        cursor += 12u;
+        if (!rwChunkHeaderValid(data, cursor, data.size(), 1u)) return fail("Invalid mobile raster header.");
+        const uint32_t headerSize = readU32(data, cursor + 4u);
+        if (headerSize != (transfers ? 64u : 20u)) return fail("Unsupported mobile raster header size.");
         LeedsTextureEntry entry;
-        entry.name = textureName.empty() ? ("texture_" + std::to_string(textureIndex)) : textureName;
-        entry.kind = TextureKind::RwPsp;
-        entry.containerBase = uint32_t(nativeOffset);
-        entry.textureHeaderOffset = uint32_t(rasterHeaderPayload);
-        entry.rasterOffset = uint32_t(rasterChild + 12u);
-        entry.blockSize = readU32(data, rasterChild + 4u);
-        entry.flags = rasterFlags;
-        entry.width = int(width);
-        entry.height = int(height);
-        entry.widthPow2 = isPowerOfTwoInt(int(width)) ? log2ExactInt(int(width)) : 0u;
-        entry.heightPow2 = isPowerOfTwoInt(int(height)) ? log2ExactInt(int(height)) : 0u;
-        entry.bpp = uint8_t(bpp);
-        entry.mipCount = uint8_t(mipCount);
-        // Mobile LCS RenderWare PSP dictionaries use the native 16-byte by
-        // 8-row PSP raster swizzle even though the compact RW raster flags are
-        // zero.  Preserve the derived byte width so the existing PSP decoder
-        // unswizzles the base level before palette lookup.
-        entry.swizzleWidth = uint16_t(bpp == 4u ? std::max<uint32_t>(1u, width / 2u) : width);
-        entriesOut.push_back(entry);
-
-        cursor = rasterContainerEnd;
-        if (rwChunkHeaderValid(data, cursor, limit, 0x03u)) {
-            cursor += 12u + size_t(readU32(data, cursor + 4u));
+        entry.name = name.empty() ? "texture" + std::to_string(index) : name;
+        entry.kind = TextureKind::RwMobile;
+        entry.containerBase = uint32_t(native);
+        entry.textureHeaderOffset = uint32_t(cursor + 12u);
+        entry.width = int(readU32(data, cursor + 12u));
+        entry.height = int(readU32(data, cursor + 16u));
+        const uint32_t depth = readU32(data, cursor + 20u);
+        if (!dimensionsReasonable(entry.width, entry.height) || (depth != 4u && depth != 8u && depth != 16u && depth != 32u))
+            return fail("Invalid mobile texture dimensions or depth.");
+        entry.bpp = uint8_t(depth);
+        const uint32_t mipCount = transfers ? 0u : readU32(data, cursor + 24u);
+        entry.flags = transfers ? 0u : readU32(data, cursor + 28u);
+        cursor += 12u + headerSize;
+        if (!rwChunkHeaderValid(data, cursor, data.size(), 1u)) return fail("Mobile raster pixels are incomplete.");
+        entry.rasterOffset = uint32_t(cursor + 12u);
+        entry.blockSize = readU32(data, cursor + 4u);
+        if (transfers) {
+            if ((depth != 4u && depth != 8u) || !parseMobileGifImages(data, entry.rasterOffset, entry.blockSize,
+                    entry.mobileMipOffsets, entry.mobileMipSizes) || entry.mobileMipOffsets.size() < 2u)
+                return fail("Invalid mobile PS2 raster uploads.");
+            entry.mobilePaletteOffset = entry.mobileMipOffsets.back();
+            entry.mobilePaletteBytes = entry.mobileMipSizes.back();
+            entry.mobileMipOffsets.pop_back(); entry.mobileMipSizes.pop_back();
+            if (entry.mobilePaletteBytes < (depth == 4u ? 96u : 1024u)) return fail("Mobile palette upload is incomplete.");
+            entry.mipCount = uint8_t(entry.mobileMipOffsets.size());
+            entry.reserved1 = 1u;
+        } else {
+            if (mipCount == 0u || mipCount > 16u || entry.flags != 0u) return fail("Unsupported mobile mipmap count or layout flags.");
+            entry.mipCount = uint8_t(mipCount);
+            uint64_t offset = entry.rasterOffset;
+            for (uint32_t level = 0u; level < mipCount; ++level) {
+                const uint64_t width = std::max(1, entry.width >> level), height = std::max(1, entry.height >> level);
+                const uint64_t bytes = (width * height * depth + 7u) / 8u;
+                if (offset + bytes > uint64_t(entry.rasterOffset) + entry.blockSize) return fail("Mobile mipmap pixels are incomplete.");
+                entry.mobileMipOffsets.push_back(uint32_t(offset)); entry.mobileMipSizes.push_back(uint32_t(bytes)); offset += bytes;
+            }
+            entry.mobilePaletteOffset = uint32_t(offset);
+            entry.mobilePaletteBytes = depth == 4u ? 64u : depth == 8u ? 1024u : 0u;
+            const uint64_t expected = offset - entry.rasterOffset + entry.mobilePaletteBytes;
+            if (entry.blockSize != expected && !(depth == 32u && entry.blockSize == expected + 4u))
+                return fail("Mobile raster size does not match its mipmaps and palette.");
         }
+        entry.widthPow2 = isPowerOfTwoInt(entry.width) ? log2ExactInt(entry.width) : 0u;
+        entry.heightPow2 = isPowerOfTwoInt(entry.height) ? log2ExactInt(entry.height) : 0u;
+        entriesOut.push_back(std::move(entry));
+        cursor += 12u + readU32(data, cursor + 4u);
+        if (!rwChunkHeaderValid(data, cursor, data.size(), 3u)) return fail("Mobile texture extension is incomplete.");
+        cursor += 12u + readU32(data, cursor + 4u);
     }
-
+    if (!rwChunkHeaderValid(data, cursor, data.size(), 3u)) return fail("Mobile dictionary extension is incomplete.");
     errorMessage.clear();
-    return !entriesOut.empty();
+    return true;
 }
 
 static uint32_t ctwPart1By1(uint32_t value) {
@@ -2809,9 +2784,19 @@ bool LeedsTextureArchive::saveToFile(const std::wstring& filePath, std::string& 
 
 bool LeedsTextureArchive::parse(LeedsPlatform platform, std::string& errorMessage) {
     entries.clear();
+    mobileLayoutCache.clear();
 
     if (dataBytes.size() >= 12u && readU32(dataBytes, 0u) == 0x16u) {
         const uint32_t rwVersion = readU32(dataBytes, 8u);
+        if (dataBytes.size() >= 60u && readU32(dataBytes, 12u) == 1u) {
+            const size_t native = 24u + size_t(readU32(dataBytes, 16u));
+            if (native + 32u <= dataBytes.size() && readU32(dataBytes, native) == 0x15u &&
+                readU32(dataBytes, native + 12u) == 1u) {
+                const uint32_t platform = readU32(dataBytes, native + 24u);
+                if (platform == 0x00505350u || platform == 0x00325350u)
+                    return parseMobileLcsRwTxd(dataBytes, entries, errorMessage);
+            }
+        }
         // LCS beta reuses platform 8 with a PSP raster payload. Preserve its
         // verified decoder rather than identifying it from that number alone.
         if (rwVersion == 0x1003FFFFu && storylandRwPathGame(path) == StorylandRwGame::Unknown)
@@ -3111,6 +3096,7 @@ bool LeedsTextureArchive::decodeTexture(size_t textureIndex, RgbaImage& image, s
         return false;
     }
     const LeedsTextureEntry& entry = entries[textureIndex];
+    if (entry.kind == TextureKind::RwMobile) return decodeTextureMip(textureIndex, 0u, image, errorMessage);
     size_t pixelCount = size_t(entry.width) * size_t(entry.height);
 
     if (entry.kind == TextureKind::CtwTex) {
@@ -3223,6 +3209,11 @@ bool LeedsTextureArchive::replaceTexture(size_t textureIndex, const RgbaImage& i
 }
 
 bool LeedsTextureArchive::replaceTextureAsBpp(size_t textureIndex, const RgbaImage& image, uint8_t targetBpp, std::string& errorMessage) {
+    if (isMobileLcs()) {
+        errorMessage = "LCS Mobile textures can be viewed and exported. Editing this format is not available.";
+        return false;
+    }
+
     if (textureIndex >= entries.size()) {
         errorMessage = "Texture index is out of range.";
         return false;
@@ -4138,6 +4129,11 @@ bool LeedsTextureArchive::createLcsBetaTxd(
 }
 
 bool LeedsTextureArchive::addTexture(const std::string& name, const RgbaImage& image, uint8_t bpp, std::string& errorMessage) {
+    if (isMobileLcs()) {
+        errorMessage = "LCS Mobile textures can be viewed and exported. Editing this format is not available.";
+        return false;
+    }
+
     if (bpp != 4u && bpp != 8u) {
         errorMessage = "New CHK/XTX/TXD materials currently support 4bpp or 8bpp.";
         return false;
@@ -4261,6 +4257,11 @@ bool LeedsTextureArchive::addTexture(const std::string& name, const RgbaImage& i
 }
 
 bool LeedsTextureArchive::swapTextureData(size_t firstTextureIndex, size_t secondTextureIndex, std::string& errorMessage) {
+    if (isMobileLcs()) {
+        errorMessage = "LCS Mobile textures can be viewed and exported. Editing this format is not available.";
+        return false;
+    }
+
     if (firstTextureIndex >= entries.size() || secondTextureIndex >= entries.size()) {
         errorMessage = "Texture swap index is out of range.";
         return false;
@@ -4336,6 +4337,11 @@ bool LeedsTextureArchive::swapTextureData(size_t firstTextureIndex, size_t secon
 }
 
 bool LeedsTextureArchive::duplicateTexture(size_t textureIndex, const std::string& newName, std::string& errorMessage) {
+    if (isMobileLcs()) {
+        errorMessage = "LCS Mobile textures can be viewed and exported. Editing this format is not available.";
+        return false;
+    }
+
     if (textureIndex >= entries.size()) {
         errorMessage = "Texture duplicate index is out of range.";
         return false;
@@ -4413,6 +4419,11 @@ bool LeedsTextureArchive::duplicateTexture(size_t textureIndex, const std::strin
 }
 
 bool LeedsTextureArchive::removeTexture(size_t textureIndex, std::string& errorMessage) {
+    if (isMobileLcs()) {
+        errorMessage = "LCS Mobile textures can be viewed and exported. Editing this format is not available.";
+        return false;
+    }
+
     if (textureIndex >= entries.size()) {
         errorMessage = "Texture remove index is out of range.";
         return false;
@@ -4832,6 +4843,11 @@ bool LeedsTextureArchive::validateStructure(std::string& report, std::string& er
 }
 
 bool LeedsTextureArchive::renameTexture(size_t textureIndex, const std::string& newName, std::string& errorMessage) {
+    if (isMobileLcs()) {
+        errorMessage = "LCS Mobile textures can be viewed and exported. Editing this format is not available.";
+        return false;
+    }
+
     if (textureIndex >= entries.size()) {
         errorMessage = "Texture index is out of range.";
         return false;
@@ -4921,5 +4937,111 @@ bool LeedsTextureArchive::renameTexture(size_t textureIndex, const std::string& 
     // Renaming must never mutate PS2 transfer metadata. In particular, player
     // texture names do not imply reserved1 == 0.
 
+    return true;
+}
+
+bool LeedsTextureArchive::isMobileLcs() const {
+    if (!entries.empty()) return entries.front().kind == TextureKind::RwMobile;
+    return dataBytes.size() >= 40u && readU32(dataBytes, 0u) == 0x16u &&
+        readU32(dataBytes, 8u) == 0x310u && readU32(dataBytes, 12u) == 1u &&
+        readU32(dataBytes, 16u) == 4u && readU16(dataBytes, 24u) == 0u &&
+        readU32(dataBytes, 28u) == 3u && readU32(dataBytes, 32u) == 0u;
+}
+
+bool LeedsTextureArchive::decodeTextureMip(size_t textureIndex, uint32_t level, RgbaImage& image, std::string& errorMessage, MobileTextureLayout layout) const {
+    if (textureIndex >= entries.size()) { errorMessage = "Texture index is out of range."; return false; }
+    const auto& entry = entries[textureIndex];
+    if (entry.kind != TextureKind::RwMobile) {
+        if (level == 0u) return decodeTexture(textureIndex, image, errorMessage);
+        errorMessage = "Mipmap selection is available for LCS mobile textures."; return false;
+    }
+    if (level >= entry.mobileMipOffsets.size()) { errorMessage = "Mipmap level is out of range."; return false; }
+    if (layout == MobileTextureLayout::Automatic) {
+        if (entry.reserved1) layout = MobileTextureLayout::Ps2;
+        else if (entry.bpp > 8u) layout = MobileTextureLayout::Stored;
+        else {
+            if (mobileLayoutCache.size() != entries.size())
+                mobileLayoutCache.assign(entries.size(), MobileTextureLayout::Automatic);
+            if (mobileLayoutCache[textureIndex] == MobileTextureLayout::Automatic) {
+                // Retail mobile dictionaries can mix direct pixels with retained
+                // console rasters without a distinguishing header flag. Compare
+                // neighboring decoded colors, and keep a manual UI override.
+                uint64_t bestScore = std::numeric_limits<uint64_t>::max();
+                MobileTextureLayout bestLayout = MobileTextureLayout::Stored;
+                for (auto candidate : {MobileTextureLayout::Stored, MobileTextureLayout::Ps2, MobileTextureLayout::Psp}) {
+                    RgbaImage decoded;
+                    std::string candidateError;
+                    if (!decodeTextureMip(textureIndex, 0u, decoded, candidateError, candidate)) continue;
+                    uint64_t score = 0u;
+                    const int stepX = std::max(1, decoded.width / 128);
+                    const int stepY = std::max(1, decoded.height / 128);
+                    for (int y = 0; y < decoded.height; y += stepY) {
+                        for (int x = 0; x < decoded.width; x += stepX) {
+                            const size_t pixel = (size_t(y) * decoded.width + x) * 4u;
+                            for (size_t channel = 0u; channel < 4u; ++channel) {
+                                if (x + 1 < decoded.width) score += std::abs(int(decoded.rgba[pixel + channel]) - int(decoded.rgba[pixel + 4u + channel]));
+                                if (y + 1 < decoded.height) score += std::abs(int(decoded.rgba[pixel + channel]) - int(decoded.rgba[pixel + size_t(decoded.width) * 4u + channel]));
+                            }
+                        }
+                    }
+                    if (score < bestScore) { bestScore = score; bestLayout = candidate; }
+                }
+                mobileLayoutCache[textureIndex] = bestLayout;
+            }
+            layout = mobileLayoutCache[textureIndex];
+        }
+    }
+    image.width = std::max(1, entry.width >> level); image.height = std::max(1, entry.height >> level);
+    const size_t count = size_t(image.width) * image.height;
+    const size_t offset = entry.mobileMipOffsets[level], bytes = entry.mobileMipSizes[level];
+    if (offset > dataBytes.size() || bytes > dataBytes.size() - offset) { errorMessage = "Mipmap pixels are incomplete."; return false; }
+    image.rgba.assign(count * 4u, 255u);
+    if (entry.bpp == 32u) {
+        if (bytes < count * 4u) { errorMessage = "32-bit mipmap is incomplete."; return false; }
+        std::copy_n(dataBytes.begin() + offset, count * 4u, image.rgba.begin());
+        for (size_t i = 3; i < image.rgba.size(); i += 4u) image.rgba[i] = uint8_t(std::min(255u, uint32_t(image.rgba[i]) * 255u / 128u));
+    } else if (entry.bpp == 16u) {
+        if (bytes < count * 2u) { errorMessage = "16-bit mipmap is incomplete."; return false; }
+        for (size_t i = 0; i < count; ++i) {
+            const uint16_t color = readU16(dataBytes, offset + i * 2u);
+            image.rgba[i*4u] = uint8_t((color & 31u) * 255u / 31u);
+            image.rgba[i*4u+1u] = uint8_t(((color >> 5u) & 31u) * 255u / 31u);
+            image.rgba[i*4u+2u] = uint8_t(((color >> 10u) & 31u) * 255u / 31u);
+            image.rgba[i*4u+3u] = (color & 0x8000u) ? 255u : 0u;
+        }
+    } else {
+        std::vector<uint8_t> pixels(dataBytes.begin() + offset, dataBytes.begin() + offset + bytes);
+        const size_t stride = (size_t(image.width) * entry.bpp + 7u) / 8u;
+        // The tightly packed tail levels do not contain a full PSP tile.
+        if (layout == MobileTextureLayout::Psp && (stride < 16u || image.height < 8))
+            layout = MobileTextureLayout::Stored;
+        if (layout == MobileTextureLayout::Psp) {
+            if (stride % 16u || image.height % 8u) {
+                errorMessage = "This size has no complete PSP pixel blocks."; return false;
+            }
+            std::vector<uint8_t> linear(pixels.size());
+            for (int y=0; y<image.height; ++y) for (size_t x=0; x<stride; ++x) {
+                const size_t source = ((size_t(y) / 8u) * (stride / 16u) + x / 16u) * 128u + (size_t(y) % 8u) * 16u + x % 16u;
+                if (source >= pixels.size()) { errorMessage = "PSP pixel block is incomplete."; return false; }
+                linear[size_t(y) * stride + x] = pixels[source];
+            }
+            pixels.swap(linear);
+        }
+        std::vector<uint8_t> indices = entry.bpp == 4u
+            ? expandNibblesLoFirst(pixels.data(), pixels.size(), pixels.size() * 2u) : pixels;
+        if (layout == MobileTextureLayout::Ps2 && image.height >= 4)
+            indices = unswizzlePs2Indices(indices, image.width, image.height);
+        if (indices.size() < count) { errorMessage = "Indexed mipmap is incomplete."; return false; }
+        if ((layout == MobileTextureLayout::Ps2 && entry.bpp == 8u) || entry.reserved1) convertClutPs2(indices);
+        for (size_t i = 0; i < count; ++i) {
+            const size_t palette = size_t(entry.mobilePaletteOffset) + size_t(indices[i]) * 4u;
+            if (palette + 4u > dataBytes.size() || size_t(indices[i]) * 4u + 4u > entry.mobilePaletteBytes) {
+                errorMessage = "Mobile texture references a missing palette color."; return false;
+            }
+            for (size_t channel = 0; channel < 3u; ++channel) image.rgba[i*4u+channel] = dataBytes[palette+channel];
+            image.rgba[i*4u+3u] = uint8_t(std::min(255u, uint32_t(dataBytes[palette+3u]) * 255u / 128u));
+        }
+    }
+    errorMessage.clear();
     return true;
 }

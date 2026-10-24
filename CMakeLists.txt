@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 if(POLICY CMP0091)
     cmake_policy(SET CMP0091 NEW)
 endif()
-project(Storyland VERSION 1.1.7 LANGUAGES CXX)
+project(Storyland VERSION 1.1.9 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -20,6 +20,8 @@ if(STORYLAND_ARCHIVE_TESTS_ONLY)
     enable_testing()
     set(STORYLAND_ARCHIVE_SUPPORT
         src/leeds/storyland_model.cpp
+        src/leeds/storyland_anim.cpp
+        src/leeds/storyland_mobile_animation.cpp
         src/leeds/leeds_texture.cpp
         src/validation/storyland_dma_validator.cpp
     )
@@ -139,6 +141,8 @@ add_executable(Storyland WIN32
     src/storyland/storyland_sky.cpp
     src/storyland/storyland_sky.h
     src/storyland/storyland_scm.cpp
+    src/storyland/storyland_data.cpp
+    src/storyland/storyland_data.h
     src/storyland/storyland_gxt.cpp
     src/storyland/storyland_scm.h
     src/storyland/storyland_media.cpp
@@ -154,6 +158,8 @@ add_executable(Storyland WIN32
     src/leeds/storyland_model.cpp
     src/leeds/storyland_model.h
     src/leeds/storyland_anim.cpp
+    src/leeds/storyland_mobile_animation.cpp
+    src/leeds/storyland_mobile_animation.h
     src/leeds/storyland_anim.h
     src/leeds/storyland_wbl.cpp
     src/leeds/storyland_wbl.h

@@ -2,6 +2,7 @@
 #include "storyland_atomic_io.h"
 #include "storyland_dma_validator.h"
 #include "storyland_model.h"
+#include "storyland_anim.h"
 #include "leeds_texture.h"
 
 #include <algorithm>
@@ -520,7 +521,7 @@ static bool mobileLcsRawTextureDictionaryAt(
     outSize = 0u;
     textureNamesOut.clear();
     if (offset + 12u > bytes.size()) return false;
-    if (readU32(bytes, offset + 0u) != 0x16u || readU32(bytes, offset + 8u) != 0x00000310u) return false;
+    if (!mobileLcsRwChunkHeaderValid(bytes, offset, bytes.size(), 0x16u)) return false;
 
     size_t limit = std::min(bytes.size(), offset + size_t(0x04000000u));
     size_t cursor = offset + 12u;
@@ -528,20 +529,21 @@ static bool mobileLcsRawTextureDictionaryAt(
     uint32_t dictionaryStructSize = readU32(bytes, cursor + 4u);
     if (dictionaryStructSize < 4u || dictionaryStructSize > 32u) return false;
     uint32_t textureCount = readU16(bytes, cursor + 12u);
-    if (textureCount == 0u || textureCount > 4096u) return false;
+    if (textureCount > 4096u) return false;
     cursor += 12u + size_t(dictionaryStructSize);
 
     textureNamesOut.reserve(textureCount);
     for (uint32_t textureIndex = 0u; textureIndex < textureCount; ++textureIndex) {
         if (cursor + 12u > limit) return false;
-        if (readU32(bytes, cursor + 0u) != 0x15u || readU32(bytes, cursor + 8u) != 0x00000310u) return false;
+        if (!mobileLcsRwChunkHeaderValid(bytes, cursor, limit, 0x15u)) return false;
 
         size_t child = cursor + 12u;
         if (!mobileLcsRwChunkHeaderValid(bytes, child, limit, 0x01u)) return false;
         uint32_t platformStructSize = readU32(bytes, child + 4u);
         if (platformStructSize < 8u || platformStructSize > 64u) return false;
         if (child + 12u + 4u > limit) return false;
-        if (readU32(bytes, child + 12u) != 0x00505350u) return false; // "PSP\0"
+        const uint32_t platform = readU32(bytes, child + 12u);
+        if (platform != 0x00505350u && platform != 0x00325350u) return false;
         child += 12u + size_t(platformStructSize);
 
         std::string textureName;
@@ -554,12 +556,12 @@ static bool mobileLcsRawTextureDictionaryAt(
         child = nextChild;
 
         if (!mobileLcsRwChunkHeaderValid(bytes, child, limit, 0x01u)) return false;
-        size_t rasterContainerEnd = child + 12u + size_t(readU32(bytes, child + 4u));
         size_t rasterChild = child + 12u;
-        if (!mobileLcsRwChunkHeaderValid(bytes, rasterChild, rasterContainerEnd, 0x01u)) return false;
+        if (!mobileLcsRwChunkHeaderValid(bytes, rasterChild, limit, 0x01u)) return false;
         if (readU32(bytes, rasterChild + 4u) < 20u) return false;
         rasterChild += 12u + size_t(readU32(bytes, rasterChild + 4u));
-        if (!mobileLcsRwChunkHeaderValid(bytes, rasterChild, rasterContainerEnd, 0x01u)) return false;
+        if (!mobileLcsRwChunkHeaderValid(bytes, rasterChild, limit, 0x01u)) return false;
+        const size_t rasterContainerEnd = rasterChild + 12u + size_t(readU32(bytes, rasterChild + 4u));
 
         textureName = mobileLcsSanitizeEntryStem(textureName);
         if (textureName.empty()) {
@@ -3827,6 +3829,28 @@ bool StorylandArchiveBrowser::buildEntriesFromMobileLcsImg(std::string& errorMes
 
     }
 
+    uint32_t ifpCount = 0u;
+    for (size_t offset = 0u; offset + 8u <= currentImgBytes.size(); offset += 2048u) {
+        if (readU32(currentImgBytes, offset) != 0x4B504E41u) continue;
+        const uint64_t length = uint64_t(readU32(currentImgBytes, offset + 4u)) + 8u;
+        if (length > currentImgBytes.size() - offset || length < 20u) continue;
+        std::vector<uint8_t> bytes(currentImgBytes.begin() + offset, currentImgBytes.begin() + offset + size_t(length));
+        StorylandAnimFile animation;
+        std::string error;
+        if (!animation.loadFromMemory(bytes, L"embedded.ifp", error)) continue;
+        StorylandArchiveEntry entry;
+        entry.startSector = uint32_t(offset / 2048u);
+        entry.sectorCount = uint32_t((length + 2047u) / 2048u);
+        entry.byteOffset = offset;
+        entry.byteSize = std::min<uint64_t>(currentImgBytes.size() - offset, uint64_t(entry.sectorCount) * 2048u);
+        entry.chunkIdent = 0x4B504E41u;
+        entry.usesLvzChunkHeader = false;
+        const std::string stem = animation.stringHints().empty() ? "animation" : mobileLcsSanitizeEntryStem(animation.stringHints().front());
+        entry.name = stem + "_" + std::to_string(entry.startSector) + ".ifp";
+        archiveEntries.push_back(std::move(entry));
+        ++ifpCount;
+    }
+
     if (archiveEntries.empty()) {
         errorMessage = "No sector-aligned RenderWare 3.1 DFF clumps or PSP texture dictionaries were found. This is not the supported Mobile LCS raw gta3.img layout.";
         return false;
@@ -3836,14 +3860,35 @@ bool StorylandArchiveBrowser::buildEntriesFromMobileLcsImg(std::string& errorMes
         if (a.byteOffset != b.byteOffset) return a.byteOffset < b.byteOffset;
         return a.chunkIdent < b.chunkIdent;
     });
-    for (size_t index = 0u; index < archiveEntries.size(); ++index) archiveEntries[index].index = uint32_t(index);
+    // Some native model tails extend past the Clump length. Without a DIR,
+    // retain bytes up to the next recognized sector start instead of cutting
+    // those tails off. Collision files also mark an allocation boundary.
+    std::vector<uint64_t> boundaries;
+    for (const auto& entry : archiveEntries) boundaries.push_back(entry.byteOffset);
+    for (size_t offset = 0u; offset + 32u <= currentImgBytes.size(); offset += 2048u) {
+        if (readU32(currentImgBytes, offset) != 0x4C4C4F43u) continue;
+        const uint32_t length = readU32(currentImgBytes, offset + 4u);
+        if (length >= 24u && uint64_t(length) + 8u <= currentImgBytes.size() - offset)
+            boundaries.push_back(offset);
+    }
+    boundaries.push_back(currentImgBytes.size());
+    std::sort(boundaries.begin(), boundaries.end());
+    for (size_t index = 0u; index < archiveEntries.size(); ++index) {
+        auto& entry = archiveEntries[index];
+        entry.index = uint32_t(index);
+        const auto next = std::upper_bound(boundaries.begin(), boundaries.end(), entry.byteOffset);
+        if (next != boundaries.end() && *next >= entry.byteOffset + entry.byteSize) {
+            entry.byteSize = *next - entry.byteOffset;
+            entry.sectorCount = uint32_t((entry.byteSize + 2047u) / 2048u);
+        }
+    }
 
     currentImgKind = StorylandImgKind::MobileLcsRaw;
     currentLevelSummary = "Mobile LCS raw IMG scan: " + std::to_string(mdlCount) +
         " sector-aligned Leeds MDLs, " + std::to_string(dffCount) +
         " RenderWare DFF clumps, " + std::to_string(txdCount) +
         " PSP RenderWare texture dictionaries, " + std::to_string(textureCount) +
-        " named textures; DIR/LVZ metadata is optional.";
+        " named textures, " + std::to_string(ifpCount) + " IFP animation banks; names from a matching DIR are used when available.";
     currentImgSize = currentImgBytes.size();
     errorMessage.clear();
     return true;
@@ -4131,6 +4176,7 @@ bool StorylandArchiveBrowser::buildEntriesFromClassicDir(
     size_t validRows = 0u;
     size_t mdlRows = 0u;
     size_t rwRows = 0u;
+    bool mobileLayout = false;
 
     for (size_t rowIndex = 0u; rowIndex < rowCount; ++rowIndex) {
         const size_t row = rowIndex * 32u;
@@ -4169,7 +4215,9 @@ bool StorylandArchiveBrowser::buildEntriesFromClassicDir(
             const uint32_t declared = readU32(currentImgBytes, off + 4u);
             const uint32_t version = readU32(currentImgBytes, off + 8u);
 
-            if (magic == 0x006D646Cu) { // "mdl\0"
+            if (magic == 0x4B504E41u && uint64_t(declared) + 8ull <= sectorBytes) {
+                entry.chunkIdent = magic;
+            } else if (magic == 0x006D646Cu) { // "mdl\0"
                 const uint32_t mdlSize = declared;
                 if (mdlSize >= 0x20u && mdlSize <= sectorBytes) {
                     entry.byteSize = mdlSize;
@@ -4182,7 +4230,20 @@ bool StorylandArchiveBrowser::buildEntriesFromClassicDir(
             } else if ((magic == 0x10u || magic == 0x16u) &&
                        (version == 0x00000310u || version == 0x1003FFFFu) &&
                        uint64_t(declared) + 12ull <= sectorBytes) {
-                entry.byteSize = uint64_t(declared) + 12ull;
+                const bool mobileTexture = magic == 0x16u && sectorBytes >= 60u &&
+                    readU32(currentImgBytes, off + 28u) == 0x15u &&
+                    (readU32(currentImgBytes, off + 52u) == 0x00505350u || readU32(currentImgBytes, off + 52u) == 0x00325350u);
+                bool mobileGeometry = false;
+                if (magic == 0x10u && version == 0x310u) {
+                    const size_t limit = off + size_t(sectorBytes);
+                    for (size_t at = off + 28u; at + 12u <= limit; ++at) {
+                        if (readU32(currentImgBytes, at) == 0x0Fu && readU32(currentImgBytes, at + 8u) == 0xF00Du) {
+                            mobileGeometry = true; break;
+                        }
+                    }
+                }
+                mobileLayout = mobileLayout || mobileTexture || mobileGeometry;
+                entry.byteSize = (mobileTexture || mobileGeometry) ? sectorBytes : uint64_t(declared) + 12ull;
                 entry.chunkIdent = magic;
                 ++rwRows;
             }
@@ -4197,9 +4258,12 @@ bool StorylandArchiveBrowser::buildEntriesFromClassicDir(
         return false;
     }
 
-    currentImgKind = StorylandImgKind::ClassicDir;
+    if (mobileLayout) {
+        for (auto& entry : archiveEntries) entry.byteSize = uint64_t(entry.sectorCount) * 2048ull;
+    }
+    currentImgKind = mobileLayout ? StorylandImgKind::MobileLcsDir : StorylandImgKind::ClassicDir;
     currentLevelSummary =
-        "Classic GTA IMG+DIR: " + std::to_string(validRows) +
+        (mobileLayout ? std::string("LCS Mobile IMG + DIR: ") : std::string("Classic GTA IMG + DIR: ")) + std::to_string(validRows) +
         " valid directory entries, " + std::to_string(mdlRows) +
         " MDL payloads, " + std::to_string(rwRows) +
         " RenderWare payloads. DIR sectors use 2048-byte units.";
@@ -4451,8 +4515,8 @@ uint64_t StorylandArchiveBrowser::imgFileSize() const { return currentImgSize; }
 std::string StorylandArchiveBrowser::levelSummary() const { return currentLevelSummary; }
 StorylandImgKind StorylandArchiveBrowser::imgKind() const { return currentImgKind; }
 bool StorylandArchiveBrowser::isPs2StoriesRawImg() const { return currentImgKind == StorylandImgKind::Ps2StoriesRaw; }
-bool StorylandArchiveBrowser::isMobileLcsRawImg() const { return currentImgKind == StorylandImgKind::MobileLcsRaw; }
-bool StorylandArchiveBrowser::hasClassicDirContext() const { return currentImgKind == StorylandImgKind::ClassicDir; }
+bool StorylandArchiveBrowser::isMobileLcsRawImg() const { return currentImgKind == StorylandImgKind::MobileLcsRaw || currentImgKind == StorylandImgKind::MobileLcsDir; }
+bool StorylandArchiveBrowser::hasClassicDirContext() const { return currentImgKind == StorylandImgKind::ClassicDir || currentImgKind == StorylandImgKind::MobileLcsDir; }
 
 std::string StorylandArchiveBrowser::resourceDisplayName(uint32_t resourceId) const {
     auto found = masterResourceNameOverrides.find(resourceId);

@@ -1,6 +1,6 @@
 {
   "name": "storyland",
-  "version-string": "1.1.5.2",
+  "version-string": "1.1.9",
   "description": "Portable LCS/VCS Leeds-engine resource workbench",
   "dependencies": [
     "zlib",

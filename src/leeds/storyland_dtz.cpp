@@ -399,9 +399,79 @@ bool StorylandDtzArchive::loadFromFile(const std::wstring& filePath, std::string
 
     tryAutoLoadCompanionImg();
 
-    // Retail DTZ and IMG provide the resource allocations and texture names.
-    // No external DIR is necessary to open either game.
     rebuildDirMatches();
+
+    // A DIR is optional. Only consult one if GAME.DTZ cannot identify every
+    // resource; never let it change the IMG allocations or the entry order.
+    if (!imgPath.empty()) {
+        bool hasUnresolvedNames = false;
+        for (const StorylandDtzDirEntry& entry : dirMap) {
+            if (entry.name.rfind("model_", 0) == 0 ||
+                entry.name.rfind("texture_", 0) == 0 ||
+                entry.name.rfind("hash_", 0) == 0) {
+                hasUnresolvedNames = true;
+                break;
+            }
+        }
+        if (hasUnresolvedNames) {
+            std::filesystem::path imageFile(imgPath);
+            std::filesystem::path folder = imageFile.parent_path();
+            std::vector<std::filesystem::path> candidates;
+            std::error_code ec;
+            for (const auto& item : std::filesystem::directory_iterator(folder, ec)) {
+                if (ec) break;
+                if (!item.is_regular_file(ec)) continue;
+                std::filesystem::path candidate = item.path();
+                std::wstring extension = candidate.extension().wstring();
+                std::transform(extension.begin(), extension.end(), extension.begin(),
+                    [](wchar_t c) { return wchar_t(std::towlower(c)); });
+                if (extension != L".dir") continue;
+                candidates.push_back(candidate);
+            }
+            std::sort(candidates.begin(), candidates.end(), [&](const auto& left, const auto& right) {
+                const bool leftMatches = left.stem().wstring() == imageFile.stem().wstring();
+                const bool rightMatches = right.stem().wstring() == imageFile.stem().wstring();
+                if (leftMatches != rightMatches) return leftMatches;
+                return left.filename().wstring() < right.filename().wstring();
+            });
+
+            size_t bestMatches = 0;
+            std::filesystem::path bestDir;
+            for (const auto& candidate : candidates) {
+                std::vector<uint8_t> bytes;
+                std::string readError;
+                if (!readWholeFile(candidate.wstring(), bytes, readError) ||
+                    bytes.empty() || bytes.size() % 32u != 0u) continue;
+                size_t matching = 0;
+                for (size_t offset = 0; offset + 32u <= bytes.size(); offset += 32u) {
+                    const uint32_t start = readU32(bytes, offset);
+                    const uint32_t count = readU32(bytes, offset + 4u);
+                    const std::string name = readDirName(bytes, offset + 8u, 24u);
+                    if (!looksLikeDirName(name)) continue;
+                    for (const StorylandDtzDirEntry& entry : dirMap) {
+                        if (entry.startSector != start || entry.sectorCount != count) continue;
+                        std::string extension = std::filesystem::path(name).extension().string();
+                        std::transform(extension.begin(), extension.end(), extension.begin(),
+                            [](unsigned char c) { return char(std::tolower(c)); });
+                        if (extension == entry.detectedExtension ||
+                            (extension == ".chk" && entry.detectedExtension == ".xtx")) ++matching;
+                        break;
+                    }
+                }
+                if (matching > bestMatches) {
+                    bestMatches = matching;
+                    bestDir = candidate;
+                }
+            }
+            // Reject incidental or unrelated DIR files. This is a names-only
+            // fallback, not a separate streaming map.
+            if (!bestDir.empty() && bestMatches >= 8u &&
+                bestMatches * 2u >= dirMap.size()) {
+                std::string dirError;
+                loadCompanionDir(bestDir.wstring(), dirError);
+            }
+        }
+    }
     return true;
 }
 
@@ -1157,9 +1227,15 @@ void StorylandDtzArchive::rebuildDirMatches() {
         auto exact = entryIndexByPair.find(key);
         if (exact != entryIndexByPair.end()) {
             StorylandDtzDirEntry& entry = dirMap[exact->second];
-            entry.name = forceNameExtension(external.name, entry.detectedExtension);
+            const bool unresolved = entry.name.rfind("model_", 0) == 0 ||
+                entry.name.rfind("texture_", 0) == 0 ||
+                entry.name.rfind("hash_", 0) == 0;
+            if (unresolved) entry.name = forceNameExtension(external.name, entry.detectedExtension);
             continue;
         }
+        // External directories may include unrelated allocations. Never add
+        // them to GAME.DTZ's own streaming directory.
+        continue;
         StorylandDtzDirEntry entry;
         entry.startSector = external.startSector;
         entry.sectorCount = external.sectorCount;
@@ -1423,21 +1499,6 @@ bool StorylandDtzArchive::saveToFile(const std::wstring& filePath, bool compress
         }
         std::filesystem::path imgOutput = outputDirectory / std::filesystem::path(imgPath).filename();
         outputs.push_back({imgOutput, &imgRawData});
-    }
-
-    // Retail LCS/VCS do not use a .dir.  Only preserve/write this optional
-    // companion when a beta-build DIR was explicitly loaded with the archive.
-    std::vector<uint8_t> patchedBetaDir;
-    if (!externalDirMap.empty() && !dirRawData.empty() && !dirPath.empty()) {
-        patchedBetaDir = dirRawData;
-        for (const StorylandDtzDirEntry& entry : externalDirMap) {
-            const size_t offset = size_t(entry.dirIndex) * 32u;
-            if (offset + 8 > patchedBetaDir.size()) continue;
-            writeU32(patchedBetaDir, offset + 0, entry.startSector);
-            writeU32(patchedBetaDir, offset + 4, entry.sectorCount);
-        }
-        std::filesystem::path dirOutput = outputDirectory / std::filesystem::path(dirPath).filename();
-        outputs.push_back({dirOutput, &patchedBetaDir});
     }
 
     if (!storylandWriteFilesTransaction(outputs, errorMessage)) {

@@ -1,6 +1,8 @@
 #include "storyland_anim.h"
+#include <stdexcept>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -181,21 +183,21 @@ static uint32_t animCanonicalParent(uint32_t index) {
     case 4: return 3;           // neck -> spine1
     case 5: return 4;           // head -> neck
     case 6: return 5;           // jaw -> head
-    case 7: return 3;           // l clavicle -> spine1
+    case 7: return 4;           // l clavicle -> neck
     case 8: return 7;
     case 9: return 8;
     case 10: return 9;
     case 11: return 10;
-    case 12: return 3;          // r clavicle -> spine1
+    case 12: return 4;          // r clavicle -> neck
     case 13: return 12;
     case 14: return 13;
     case 15: return 14;
     case 16: return 15;
-    case 17: return 1;          // l thigh -> pelvis
+    case 17: return 2;          // l thigh -> spine
     case 18: return 17;
     case 19: return 18;
     case 20: return 19;
-    case 21: return 1;          // r thigh -> pelvis
+    case 21: return 2;          // r thigh -> spine
     case 22: return 21;
     case 23: return 22;
     case 24: return 23;
@@ -222,6 +224,7 @@ static uint32_t animCanonicalIndexForBoneId(uint32_t boneId) {
     }
 
     // VCS display-only toe ids used by some Storyland/BLeeds paths.
+    if (boneId == 6u) return 6u; // retail jaw alias
     if (boneId == 2000u) return 20u;
     if (boneId == 2001u) return 24u;
 
@@ -411,8 +414,9 @@ static StorylandAnimKey decodeAnimKeyWithFlags(const std::vector<uint8_t>& data,
     }
 
     if ((flags & 0x0004u) != 0) {
-        // Scale exists in the documented generic frame layout, but LCS/VCS
-        // retail files normally do not use it. Skip it if encountered.
+        key.sx = animReadHalf(data, offset + cursor);
+        key.sy = animReadHalf(data, offset + cursor + 2u);
+        key.sz = animReadHalf(data, offset + cursor + 4u);
         cursor += 6;
     }
 
@@ -510,12 +514,15 @@ bool StorylandAnimFile::loadFromMemory(
     frames = 30;
     activeClip = 0;
     hasCandidates = false;
+    ifpFormat = false;
+    ifpClipTracks.clear();
 
     if (bytes.size() > kMaximumAnimBytes) {
         errorMessage = ".anim file is too large to load safely.";
         return false;
     }
     data = bytes;
+    if (data.size() >= 8u && animReadU32(data, 0u) == 0x4B504E41u) return parseIfp(errorMessage);
     if (data.size() < 0x20u) {
         errorMessage = ".anim file is too small to contain a Leeds ANIM header.";
         return false;
@@ -715,6 +722,13 @@ void StorylandAnimFile::scanLeedsAnimationClips() {
 }
 
 void StorylandAnimFile::rebuildActiveClipTracks() {
+    if (ifpFormat) {
+        trackRows = ifpClipTracks.at(activeClip);
+        duration = clipRows.at(activeClip).duration;
+        frames = std::max(1u, uint32_t(std::ceil(duration * fps)) + 1u);
+        hasCandidates = !trackRows.empty();
+        return;
+    }
     trackRows.clear();
     hasCandidates = false;
 
@@ -845,18 +859,44 @@ std::vector<StorylandAnimPoseBone> StorylandAnimFile::poseAt(float seconds) cons
     struct PreviewQuat { float x = 0.0f, y = 0.0f, z = 0.0f, w = 1.0f; };
     struct PreviewPoint { float x = 0.0f, y = 0.0f, z = 0.0f; };
     std::vector<PreviewQuat> localRotations(pose.size());
-    std::vector<PreviewQuat> worldRotations(pose.size());
+    std::vector<std::array<double, 16>> worldMatrices(pose.size());
+    std::vector<PreviewPoint> localScales(pose.size(), PreviewPoint{1.0f, 1.0f, 1.0f});
     std::vector<PreviewPoint> localPositions(pose.size());
 
+    // Standalone ANIMs contain motion, not a bind skeleton. Use Leeds local
+    // bone axes for the reference figure; world-axis offsets bend limbs twice.
+    // Attached playback always uses the opened model's own matrices.
+    static const float reference[25][7] = {
+        {0.0f, 0.0f, 0.996275008f, -0.0f, -0.0f, 0.707107246f, 0.707106292f}, // root
+        {0.0f, 0.0f, 0.0f, -0.499999344f, -0.50000006f, -0.50000006f, 0.500000656f}, // pelvis
+        {0.0997361541f, -0.000144563717f, 1.36929302e-07f, -2.08047686e-06f, -6.74260718e-07f, 0.000398115342f, 0.99999994f}, // spine
+        {0.181490004f, -0.000191335945f, 3.46054119e-09f, 0.0f, 4.4408921e-16f, -2.68715085e-12f, 1.0f}, // spine1
+        {0.240297854f, -0.000110077257f, 4.97919261e-09f, 6.98680391e-10f, -1.1470744e-07f, 0.0407894664f, 0.99916774f}, // neck
+        {0.138697043f, -4.07784606e-09f, 1.74053094e-09f, -1.14542664e-09f, 1.09907717e-07f, -0.0411879569f, 0.999151409f}, // head
+        {0.00202305755f, 0.0190426651f, -3.91544961e-15f, -5.057625e-07f, 0.707106292f, 5.05761875e-07f, 0.707107246f}, // jaw
+        {-1.32921514e-08f, 0.000110350884f, 0.0303539988f, 0.713112116f, -0.0293970667f, 0.699839056f, 0.0288479645f}, // bip01_l_clavicle
+        {0.171012834f, 6.4416754e-15f, 1.09085825e-07f, -0.154661447f, 0.522260129f, -0.259252399f, 0.797566533f}, // l_upperarm
+        {0.277749628f, -1.18129577e-08f, -5.88609872e-09f, -2.19996039e-08f, 1.87861193e-08f, -0.0520722792f, 0.998643339f}, // l_forearm
+        {0.265159041f, 2.9482182e-08f, -2.38176625e-08f, -0.705567896f, 0.0421402119f, -0.0421738066f, 0.706129968f}, // l_hand
+        {0.108407989f, 8.66738503e-09f, -1.0962534e-08f, -0.000398128381f, -8.27956637e-09f, 6.8079129e-09f, 0.99999994f}, // l_finger
+        {-1.30179307e-08f, 0.000110519133f, -0.0303539988f, 0.713112056f, -0.0293951277f, -0.699839115f, -0.0288499426f}, // bip01_r_clavicle
+        {0.171012834f, -1.48746067e-14f, -1.09085775e-07f, 0.153556392f, -0.522584975f, -0.261015624f, 0.796992064f}, // r_upperarm
+        {0.277749717f, 2.83983113e-08f, 1.01797273e-08f, 2.04113579e-08f, 1.8643953e-09f, -0.0476318486f, 0.998864949f}, // r_forearm
+        {0.265158951f, -5.28595265e-08f, -3.86160615e-08f, 0.70557183f, -0.0421421267f, -0.0421868227f, 0.70612514f}, // r_hand
+        {0.108408019f, -1.05492832e-08f, -6.67789806e-08f, 0.000398119533f, 8.75291306e-09f, -4.34678213e-08f, 0.99999994f}, // r_finger
+        {-0.0997359753f, 0.00022365326f, 0.100898996f, 0.0231910627f, 0.999731064f, 1.34596974e-06f, 7.46045359e-08f}, // l_thigh
+        {0.439523965f, -3.9995478e-09f, -1.04247295e-08f, 1.4899304e-10f, -8.28144753e-09f, -0.0610453375f, 0.99813503f}, // l_calf
+        {0.480559021f, 2.33855113e-09f, -2.6774222e-08f, -4.72701664e-08f, 1.06456632e-07f, 0.0382789746f, 0.999267101f}, // l_foot
+        {0.0760489926f, 0.125753984f, -5.06143627e-10f, 1.05367519e-08f, 2.10734203e-08f, 0.707106829f, 0.707106829f}, // l_toe0
+        {-0.0997359753f, 0.00022421297f, -0.100898996f, 0.0231910627f, 0.999731064f, 1.43007253e-06f, -1.22240076e-08f}, // r_thigh
+        {0.439523995f, -1.31986122e-09f, -7.61938601e-09f, -8.08841105e-10f, -2.922667e-09f, -0.0610453375f, 0.99813503f}, // r_calf
+        {0.480558991f, 2.1285429e-09f, -2.18545075e-08f, 4.31791563e-08f, 1.95734629e-08f, 0.0382789746f, 0.999267101f}, // r_foot
+        {0.0760489926f, 0.125753984f, -5.0572796e-10f, 1.05367519e-08f, 2.10734203e-08f, 0.707106829f, 0.707106829f}, // r_toe0
+    };
     for (size_t index = 0; index < pose.size(); ++index) {
-        const auto& bone = pose[index];
-        const bool hasParent = bone.parentIndex < index;
-        const auto& parent = hasParent ? pose[bone.parentIndex] : bone;
-        localPositions[index] = {
-            bone.x - (hasParent ? parent.x : 0.0f),
-            bone.y - (hasParent ? parent.y : 0.0f),
-            bone.z - (hasParent ? parent.z : 0.0f)
-        };
+        const auto& bind = reference[index];
+        localPositions[index] = {bind[0], bind[1], bind[2]};
+        localRotations[index] = {bind[3], bind[4], bind[5], bind[6]};
     }
 
     for (const auto& track : trackRows) {
@@ -867,8 +907,8 @@ std::vector<StorylandAnimPoseBone> StorylandAnimFile::poseAt(float seconds) cons
 
         const StorylandAnimKey* a = &track.keys.front();
         const StorylandAnimKey* b = &track.keys.back();
-        auto next = std::lower_bound(track.keys.begin(), track.keys.end(), seconds,
-            [](const StorylandAnimKey& key, float time) { return key.time < time; });
+        auto next = std::upper_bound(track.keys.begin(), track.keys.end(), seconds,
+            [](float time, const StorylandAnimKey& key) { return time < key.time; });
         if (next == track.keys.begin()) {
             b = a;
         } else if (next == track.keys.end()) {
@@ -878,21 +918,37 @@ std::vector<StorylandAnimPoseBone> StorylandAnimFile::poseAt(float seconds) cons
             a = &*(next - 1);
         }
 
-        float span = std::max(0.0001f, b->time - a->time);
-        float factor = std::max(0.0f, std::min(1.0f, (seconds - a->time) / span));
+        const float span = b->time - a->time;
+        const float factor = span > 0.0f ? std::max(0.0f, std::min(1.0f, (seconds - a->time) / span)) : 0.0f;
         PreviewQuat first{a->qx, a->qy, a->qz, a->qw};
         PreviewQuat second{b->qx, b->qy, b->qz, b->qw};
         if (first.x * second.x + first.y * second.y + first.z * second.z + first.w * second.w < 0.0f) {
             second = {-second.x, -second.y, -second.z, -second.w};
         }
+        const float dot = std::max(-1.0f, std::min(1.0f,
+            first.x * second.x + first.y * second.y + first.z * second.z + first.w * second.w));
+        float left = 1.0f - factor, right = factor;
+        if (dot < 0.9995f) {
+            const float angle = std::acos(dot), sine = std::sin(angle);
+            left = std::sin((1.0f - factor) * angle) / sine;
+            right = std::sin(factor * angle) / sine;
+        }
         PreviewQuat& rotation = localRotations[targetIndex];
         rotation = {
-            first.x * (1.0f - factor) + second.x * factor,
-            first.y * (1.0f - factor) + second.y * factor,
-            first.z * (1.0f - factor) + second.z * factor,
-            first.w * (1.0f - factor) + second.w * factor
+            first.x * left + second.x * right,
+            first.y * left + second.y * right,
+            first.z * left + second.z * right,
+            first.w * left + second.w * right
         };
         normalizeQuat(rotation.x, rotation.y, rotation.z, rotation.w);
+
+        if ((track.channelFlags & 0x0004u) != 0u) {
+            localScales[targetIndex] = {
+                a->sx * (1.0f - factor) + b->sx * factor,
+                a->sy * (1.0f - factor) + b->sy * factor,
+                a->sz * (1.0f - factor) + b->sz * factor
+            };
+        }
 
         if ((track.channelFlags & 0x0002u) != 0u) {
             localPositions[targetIndex] = {
@@ -904,38 +960,27 @@ std::vector<StorylandAnimPoseBone> StorylandAnimFile::poseAt(float seconds) cons
     }
 
     for (size_t index = 0; index < pose.size(); ++index) {
-        const PreviewQuat& local = localRotations[index];
-        const uint32_t parentIndex = pose[index].parentIndex;
-        if (parentIndex >= index) {
-            worldRotations[index] = local;
-            pose[index].x = localPositions[index].x;
-            pose[index].y = localPositions[index].y;
-            pose[index].z = localPositions[index].z;
-            continue;
-        }
-
-        const PreviewQuat& parent = worldRotations[parentIndex];
-        worldRotations[index] = {
-            parent.w * local.x + parent.x * local.w + parent.y * local.z - parent.z * local.y,
-            parent.w * local.y - parent.x * local.z + parent.y * local.w + parent.z * local.x,
-            parent.w * local.z + parent.x * local.y - parent.y * local.x + parent.z * local.w,
-            parent.w * local.w - parent.x * local.x - parent.y * local.y - parent.z * local.z
+        const auto& q = localRotations[index];
+        const auto& scale = localScales[index];
+        const auto& position = localPositions[index];
+        const double x=q.x, y=q.y, z=q.z, w=q.w;
+        std::array<double, 16> local{
+            (1-2*(y*y+z*z))*scale.x, 2*(x*y+z*w)*scale.x, 2*(x*z-y*w)*scale.x, 0,
+            2*(x*y-z*w)*scale.y, (1-2*(x*x+z*z))*scale.y, 2*(y*z+x*w)*scale.y, 0,
+            2*(x*z+y*w)*scale.z, 2*(y*z-x*w)*scale.z, (1-2*(x*x+y*y))*scale.z, 0,
+            position.x, position.y, position.z, 1
         };
-        const PreviewPoint& offset = localPositions[index];
-        const PreviewPoint cross{
-            parent.y * offset.z - parent.z * offset.y,
-            parent.z * offset.x - parent.x * offset.z,
-            parent.x * offset.y - parent.y * offset.x
-        };
-        const PreviewPoint twiceCross{2.0f * cross.x, 2.0f * cross.y, 2.0f * cross.z};
-        const PreviewPoint rotated{
-            offset.x + parent.w * twiceCross.x + parent.y * twiceCross.z - parent.z * twiceCross.y,
-            offset.y + parent.w * twiceCross.y + parent.z * twiceCross.x - parent.x * twiceCross.z,
-            offset.z + parent.w * twiceCross.z + parent.x * twiceCross.y - parent.y * twiceCross.x
-        };
-        pose[index].x = pose[parentIndex].x + rotated.x;
-        pose[index].y = pose[parentIndex].y + rotated.y;
-        pose[index].z = pose[parentIndex].z + rotated.z;
+        auto& world = worldMatrices[index];
+        const uint32_t parent = pose[index].parentIndex;
+        if (parent < index) {
+            for (size_t column=0; column<4; ++column)
+                for (size_t row=0; row<4; ++row)
+                    for (size_t k=0; k<4; ++k)
+                        world[column*4+row] += worldMatrices[parent][k*4+row]*local[column*4+k];
+        } else world = local;
+        pose[index].x = float(world[12]);
+        pose[index].y = float(world[13]);
+        pose[index].z = float(world[14]);
     }
 
     return pose;
@@ -976,7 +1021,7 @@ bool StorylandAnimFile::hasDecodedMotion() const { return hasCandidates && !clip
 
 std::string StorylandAnimFile::summaryLine() const {
     std::ostringstream ss;
-    ss << ".anim size=" << data.size()
+    ss << (ifpFormat ? "IFP size=" : "ANIM size=") << data.size()
        << " bytes clips=" << clipRows.size()
        << " tracks=" << trackRows.size()
        << " frames=" << frames
@@ -996,4 +1041,136 @@ std::string StorylandAnimFile::summaryLine() const {
         ss << " transform channels=no, static inspection only";
     }
     return ss.str();
+}
+
+bool StorylandAnimFile::isIfp() const { return ifpFormat; }
+
+bool StorylandAnimFile::parseIfp(std::string& errorMessage) {
+    struct Chunk { size_t header; size_t payload; size_t end; size_t next; uint32_t type; };
+    auto chunkAt = [&](size_t offset, size_t limit, uint32_t expected) -> Chunk {
+        if (limit > data.size() || offset > limit || limit - offset < 8u)
+            throw std::runtime_error("IFP chunk header is incomplete.");
+        const uint32_t type = animReadU32(data, offset);
+        const uint32_t length = animReadU32(data, offset + 4u);
+        if (type != expected || uint64_t(length) > limit - offset - 8u)
+            throw std::runtime_error("IFP chunk type or size is invalid at byte " + std::to_string(offset) + ".");
+        const size_t end = offset + 8u + length;
+        return {offset, offset + 8u, end, (end + 3u) & ~size_t(3u), type};
+    };
+    auto boneIdForName = [&](std::string name) -> uint32_t {
+        name = animLowerAscii(name);
+        if (name.compare(0, 6, "bip01 ") == 0) name.erase(0, 6);
+        for (char& c : name) if (c == ' ' || c == '-' || c == '~') c = '_';
+        if (name == "l_fingers") name = "l_finger";
+        if (name == "r_fingers") name = "r_finger";
+        const auto& names = animCanonicalBoneNames();
+        for (uint32_t i = 0; i < names.size(); ++i) {
+            std::string canonical = names[i];
+            if (canonical.compare(0, 6, "bip01_") == 0) canonical.erase(0, 6);
+            if (name == canonical) return animBoneIdForCanonicalIndex(i);
+        }
+        return 0xFFFFFFFFu;
+    };
+    try {
+        const Chunk bank = chunkAt(0u, data.size(), 0x4B504E41u);
+        const Chunk info = chunkAt(bank.payload, bank.end, 0x4F464E49u);
+        if (info.end - info.payload < 4u) throw std::runtime_error("IFP bank information is incomplete.");
+        const uint32_t clipCount = animReadU32(data, info.payload);
+        if (!clipCount || clipCount > 10000u) throw std::runtime_error("IFP animation count is invalid.");
+        strings.push_back(animReadFixedString(data, info.payload + 4u, info.end - info.payload - 4u));
+        size_t cursor = info.next;
+        for (uint32_t clipIndex = 0; clipIndex < clipCount; ++clipIndex) {
+            const Chunk name = chunkAt(cursor, bank.end, 0x454D414Eu);
+            const Chunk animation = chunkAt(name.next, bank.end, 0x4E414744u);
+            const Chunk animationInfo = chunkAt(animation.payload, animation.end, 0x4F464E49u);
+            if (animationInfo.end - animationInfo.payload < 4u) throw std::runtime_error("IFP animation information is incomplete.");
+            const uint32_t trackCount = animReadU32(data, animationInfo.payload);
+            if (trackCount > 65536u) throw std::runtime_error("IFP track count is invalid.");
+            StorylandAnimClip clip;
+            clip.index = clipIndex;
+            clip.entryOffset = uint32_t(animation.header);
+            clip.channelTableOffset = uint32_t(animationInfo.next);
+            clip.channelCount = trackCount;
+            clip.name = animReadFixedString(data, name.payload, name.end - name.payload);
+            if (clip.name.empty()) throw std::runtime_error("IFP animation has no name.");
+            strings.push_back(clip.name);
+            std::vector<StorylandAnimTrack> tracks;
+            size_t trackCursor = animationInfo.next;
+            for (uint32_t trackIndex = 0; trackIndex < trackCount; ++trackIndex) {
+                const Chunk channel = chunkAt(trackCursor, animation.end, 0x4E415043u);
+                const Chunk descriptor = chunkAt(channel.payload, channel.end, 0x4D494E41u);
+                if (descriptor.end - descriptor.payload < 44u) throw std::runtime_error("IFP bone descriptor is incomplete.");
+                const uint32_t keyCount = animReadU32(data, descriptor.payload + 28u);
+                StorylandAnimTrack track;
+                track.index = trackIndex;
+                track.clipIndex = clipIndex;
+                track.channelIndex = trackIndex;
+                track.offset = uint32_t(descriptor.header);
+                track.name = animReadFixedString(data, descriptor.payload, 28u);
+                track.boneId = boneIdForName(track.name);
+                track.boneIndex = animCanonicalIndexForBoneId(track.boneId);
+                track.parentIndex = animCanonicalParent(track.boneIndex);
+                track.source = "LCS Mobile IFP";
+                if (keyCount) {
+                    if (descriptor.next + 8u > channel.end) throw std::runtime_error("IFP keyframe chunk is missing.");
+                    const uint32_t tag = animReadU32(data, descriptor.next);
+                    const bool translation = tag == 0x3054524Bu || tag == 0x5354524Bu;
+                    const bool scale = tag == 0x5354524Bu;
+                    if (tag != 0x3030524Bu && !translation) throw std::runtime_error("Unsupported IFP keyframe type.");
+                    const Chunk keys = chunkAt(descriptor.next, channel.end, tag);
+                    const uint32_t stride = 20u + (translation ? 12u : 0u) + (scale ? 12u : 0u);
+                    if (uint64_t(keyCount) * stride != keys.end - keys.payload)
+                        throw std::runtime_error("IFP key count does not match its keyframe data.");
+                    track.keyDataOffset = uint32_t(keys.payload);
+                    track.keyStride = stride;
+                    track.channelFlags = 1u | (translation ? 2u : 0u) | (scale ? 4u : 0u);
+                    track.keys.reserve(keyCount);
+                    float previous = -1.0f;
+                    for (uint32_t keyIndex = 0; keyIndex < keyCount; ++keyIndex) {
+                        const size_t offset = keys.payload + size_t(keyIndex) * stride;
+                        StorylandAnimKey key;
+                        key.offset = uint32_t(offset);
+                        key.qx = -animReadF32(data, offset);
+                        key.qy = -animReadF32(data, offset + 4u);
+                        key.qz = -animReadF32(data, offset + 8u);
+                        key.qw = animReadF32(data, offset + 12u);
+                        size_t next = offset + 16u;
+                        if (translation) { key.tx = animReadF32(data, next); key.ty = animReadF32(data, next + 4u); key.tz = animReadF32(data, next + 8u); next += 12u; }
+                        if (scale) { key.sx = animReadF32(data, next); key.sy = animReadF32(data, next + 4u); key.sz = animReadF32(data, next + 8u); next += 12u; }
+                        key.time = animReadF32(data, next);
+                        const float values[] = {key.time,key.qx,key.qy,key.qz,key.qw,key.tx,key.ty,key.tz,key.sx,key.sy,key.sz};
+                        for (float value : values) if (!std::isfinite(value)) throw std::runtime_error("IFP contains a non-finite transform.");
+                        if (key.time < 0.0f || key.time + 0.00001f < previous) throw std::runtime_error("IFP frame times are not ordered.");
+                        const float magnitude = std::sqrt(key.qx*key.qx + key.qy*key.qy + key.qz*key.qz + key.qw*key.qw);
+                        if (magnitude < 0.000001f) throw std::runtime_error("IFP contains an invalid quaternion.");
+                        key.qx /= magnitude; key.qy /= magnitude; key.qz /= magnitude; key.qw /= magnitude;
+                        previous = key.time;
+                        clip.duration = std::max(clip.duration, key.time);
+                        track.keys.push_back(key);
+                    }
+                }
+                tracks.push_back(std::move(track));
+                trackCursor = channel.next;
+            }
+            if (trackCursor != animation.end && trackCursor != animation.next)
+                throw std::runtime_error("IFP animation has unexpected channel data.");
+            clipRows.push_back(std::move(clip));
+            ifpClipTracks.push_back(std::move(tracks));
+            cursor = animation.next;
+        }
+        if (cursor != bank.end && cursor != bank.next) throw std::runtime_error("IFP bank has unexpected animation data.");
+        for (const auto& clip : clipRows)
+            if (double(clip.duration) * fps + 1.0 > double(std::numeric_limits<uint32_t>::max()))
+                throw std::runtime_error("IFP animation is too long for playback.");
+        ifpFormat = true;
+        activeClip = 0u;
+        rebuildActiveClipTracks();
+        errorMessage.clear();
+        return true;
+    } catch (const std::exception& exception) {
+        fieldRows.clear(); trackRows.clear(); clipRows.clear(); ifpClipTracks.clear();
+        hasCandidates = false; ifpFormat = false;
+        errorMessage = exception.what();
+        return false;
+    }
 }
