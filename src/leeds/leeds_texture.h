@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include "storyland_gim.h"
 
 struct RgbaImage {
     int width = 0;
@@ -33,7 +34,8 @@ enum class TextureKind {
     RwMobile,
     Ps2,
     CtwTex,
-    Dds
+    Dds,
+    Gim
 };
 
 struct LeedsTextureEntry {
@@ -95,6 +97,7 @@ private:
     std::wstring path;
     LeedsPlatform loadedPlatform = LeedsPlatform::Auto;
     mutable std::vector<MobileTextureLayout> mobileLayoutCache;
+    std::vector<StorylandGimImage> gimImages;
 
     bool parse(LeedsPlatform platform, std::string& errorMessage);
 };

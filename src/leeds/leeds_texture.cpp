@@ -2785,6 +2785,29 @@ bool LeedsTextureArchive::saveToFile(const std::wstring& filePath, std::string& 
 bool LeedsTextureArchive::parse(LeedsPlatform platform, std::string& errorMessage) {
     entries.clear();
     mobileLayoutCache.clear();
+    gimImages.clear();
+    if (storylandIsGim(dataBytes)) {
+        if (!storylandParseGim(dataBytes, gimImages, errorMessage)) return false;
+        for (size_t index = 0; index < gimImages.size(); ++index) {
+            auto& image = gimImages[index];
+            if (gimImages.size() == 1 && !path.empty()) image.name = std::filesystem::path(path).stem().string();
+            LeedsTextureEntry entry;
+            entry.kind = TextureKind::Gim;
+            entry.name = image.name;
+            entry.textureHeaderOffset = image.headerOffset;
+            entry.rasterOffset = image.levels[0].offset;
+            entry.blockSize = image.levels[0].size;
+            entry.width = int(image.levels[0].width);
+            entry.height = int(image.levels[0].height);
+            const uint8_t depths[] = {16, 16, 16, 32, 4, 8, 16, 32};
+            entry.bpp = depths[image.format];
+            entry.flags = image.format;
+            entry.mipCount = uint8_t(image.levels.size());
+            entry.swizzleMask = image.swizzled ? 1 : 0;
+            entries.push_back(std::move(entry));
+        }
+        return true;
+    }
 
     if (dataBytes.size() >= 12u && readU32(dataBytes, 0u) == 0x16u) {
         const uint32_t rwVersion = readU32(dataBytes, 8u);
@@ -3096,7 +3119,7 @@ bool LeedsTextureArchive::decodeTexture(size_t textureIndex, RgbaImage& image, s
         return false;
     }
     const LeedsTextureEntry& entry = entries[textureIndex];
-    if (entry.kind == TextureKind::RwMobile) return decodeTextureMip(textureIndex, 0u, image, errorMessage);
+    if (entry.kind == TextureKind::RwMobile || entry.kind == TextureKind::Gim) return decodeTextureMip(textureIndex, 0u, image, errorMessage);
     size_t pixelCount = size_t(entry.width) * size_t(entry.height);
 
     if (entry.kind == TextureKind::CtwTex) {
@@ -3218,7 +3241,7 @@ bool LeedsTextureArchive::replaceTextureAsBpp(size_t textureIndex, const RgbaIma
         errorMessage = "Texture index is out of range.";
         return false;
     }
-    if (!isPowerOfTwoInt(image.width) || !isPowerOfTwoInt(image.height)) {
+    if (entries[textureIndex].kind != TextureKind::Gim && (!isPowerOfTwoInt(image.width) || !isPowerOfTwoInt(image.height))) {
         errorMessage = "Replacement image width and height must both be powers of two between 4 and 4096.";
         return false;
     }
@@ -3229,6 +3252,23 @@ bool LeedsTextureArchive::replaceTextureAsBpp(size_t textureIndex, const RgbaIma
 
     LeedsTextureEntry entry = entries[textureIndex];
     LeedsTextureEntry oldEntry = entry;
+    if (entry.kind == TextureKind::Gim) {
+        if (textureIndex >= gimImages.size()) { errorMessage = "GIM image metadata is missing."; return false; }
+        const auto& gim = gimImages[textureIndex];
+        if (image.width != entry.width || image.height != entry.height) { errorMessage = "GIM replacement must match the original dimensions."; return false; }
+        if (targetBpp && targetBpp != entry.bpp) { errorMessage = "GIM replacement keeps the original pixel format."; return false; }
+        std::vector<uint8_t> palette;
+        if (gim.format >= 4) {
+            for (size_t i = 0; i < gimImages.size(); ++i) if (i != textureIndex && gimImages[i].paletteOffset == gim.paletteOffset) {
+                errorMessage = "This GIM shares a palette between images; replacing one would recolor the others."; return false;
+            }
+            if (!gim.paletteCount || gim.paletteCount > 256) { errorMessage = "GIM replacement supports palettes of up to 256 colors."; return false; }
+            const uint32_t usable = gim.format == 4 ? std::min(16u, gim.paletteCount) : gim.paletteCount;
+            palette = buildPaletteFromReplacementImage(image, int(usable), false);
+            palette.resize(size_t(gim.paletteCount) * 4, 0);
+        }
+        return storylandReplaceGim(dataBytes, gim, image, palette, errorMessage);
+    }
 
     if (entry.kind == TextureKind::Dds) {
         errorMessage = "TCDT DDS texture replacement is read-only in this build.";
@@ -4129,6 +4169,10 @@ bool LeedsTextureArchive::createLcsBetaTxd(
 }
 
 bool LeedsTextureArchive::addTexture(const std::string& name, const RgbaImage& image, uint8_t bpp, std::string& errorMessage) {
+    if (storylandIsGim(dataBytes)) {
+        errorMessage = "GIM supports replacing existing images. Adding, removing, duplicating, or swapping image slots is not available.";
+        return false;
+    }
     if (isMobileLcs()) {
         errorMessage = "LCS Mobile textures can be viewed and exported. Editing this format is not available.";
         return false;
@@ -4257,6 +4301,10 @@ bool LeedsTextureArchive::addTexture(const std::string& name, const RgbaImage& i
 }
 
 bool LeedsTextureArchive::swapTextureData(size_t firstTextureIndex, size_t secondTextureIndex, std::string& errorMessage) {
+    if (storylandIsGim(dataBytes)) {
+        errorMessage = "GIM supports replacing existing images. Adding, removing, duplicating, or swapping image slots is not available.";
+        return false;
+    }
     if (isMobileLcs()) {
         errorMessage = "LCS Mobile textures can be viewed and exported. Editing this format is not available.";
         return false;
@@ -4337,6 +4385,10 @@ bool LeedsTextureArchive::swapTextureData(size_t firstTextureIndex, size_t secon
 }
 
 bool LeedsTextureArchive::duplicateTexture(size_t textureIndex, const std::string& newName, std::string& errorMessage) {
+    if (storylandIsGim(dataBytes)) {
+        errorMessage = "GIM supports replacing existing images. Adding, removing, duplicating, or swapping image slots is not available.";
+        return false;
+    }
     if (isMobileLcs()) {
         errorMessage = "LCS Mobile textures can be viewed and exported. Editing this format is not available.";
         return false;
@@ -4419,6 +4471,10 @@ bool LeedsTextureArchive::duplicateTexture(size_t textureIndex, const std::strin
 }
 
 bool LeedsTextureArchive::removeTexture(size_t textureIndex, std::string& errorMessage) {
+    if (storylandIsGim(dataBytes)) {
+        errorMessage = "GIM supports replacing existing images. Adding, removing, duplicating, or swapping image slots is not available.";
+        return false;
+    }
     if (isMobileLcs()) {
         errorMessage = "LCS Mobile textures can be viewed and exported. Editing this format is not available.";
         return false;
@@ -4472,6 +4528,16 @@ bool LeedsTextureArchive::removeTexture(size_t textureIndex, std::string& errorM
 }
 
 bool LeedsTextureArchive::validateStructure(std::string& report, std::string& errorMessage) const {
+    if (storylandIsGim(dataBytes)) {
+        std::vector<StorylandGimImage> images;
+        if (!storylandParseGim(dataBytes, images, errorMessage)) return false;
+        for (const auto& image : images) for (size_t level = 0; level < image.levels.size(); ++level) {
+            RgbaImage decoded;
+            if (!storylandDecodeGim(dataBytes, image, uint32_t(level), decoded, errorMessage)) return false;
+        }
+        report = "PSP GIM: PASS | Images: " + std::to_string(images.size());
+        errorMessage.clear(); return true;
+    }
     if (dataBytes.size() >= 12u && readU32(dataBytes, 0u) == 0x16u &&
         rwBuildStampSupported(readU32(dataBytes, 8u))) {
         LeedsTextureArchive trial;
@@ -4868,6 +4934,9 @@ bool LeedsTextureArchive::renameTexture(size_t textureIndex, const std::string& 
     }
 
     LeedsTextureEntry entry = entries[textureIndex];
+    if (entry.kind == TextureKind::Gim) {
+        errorMessage = "Rename the GIM file to change its texture name."; return false;
+    }
     if (entry.kind == TextureKind::RwPsp) {
         if (!isLcsBetaRwTxdBytes(dataBytes)) {
             errorMessage = "This RenderWare TXD variant is read-only. Editable TXD authoring currently targets the LCS beta 0x1003FFFF layout.";
@@ -4951,6 +5020,10 @@ bool LeedsTextureArchive::isMobileLcs() const {
 bool LeedsTextureArchive::decodeTextureMip(size_t textureIndex, uint32_t level, RgbaImage& image, std::string& errorMessage, MobileTextureLayout layout) const {
     if (textureIndex >= entries.size()) { errorMessage = "Texture index is out of range."; return false; }
     const auto& entry = entries[textureIndex];
+    if (entry.kind == TextureKind::Gim) {
+        if (textureIndex >= gimImages.size()) { errorMessage = "GIM image metadata is missing."; return false; }
+        return storylandDecodeGim(dataBytes, gimImages[textureIndex], level, image, errorMessage);
+    }
     if (entry.kind != TextureKind::RwMobile) {
         if (level == 0u) return decodeTexture(textureIndex, image, errorMessage);
         errorMessage = "Mipmap selection is available for LCS mobile textures."; return false;

@@ -4,6 +4,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "storyland_visibility.h"
 
 struct StorylandArchiveEntry {
     uint32_t index = 0;
@@ -67,6 +68,7 @@ struct StorylandWorldMesh {
     int32_t textureScopeCellY = 0;
     bool hasTextureScopeCell = false;
     bool emptyGeometry = false;
+    StorylandMeshBounds bounds;
     uint32_t materialCount = 0;
     std::vector<StorylandWorldMeshVertex> vertices;
     std::vector<StorylandWorldMeshTriangle> triangles;

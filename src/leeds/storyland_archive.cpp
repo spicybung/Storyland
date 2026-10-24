@@ -1208,6 +1208,7 @@ static bool parseWorldOverlayMesh(
         accumulatedBytes += strip.streamBytes;
     }
 
+    outMesh.bounds = storylandMeshBounds(outMesh.vertices);
     return !outMesh.vertices.empty() && !outMesh.triangles.empty();
 }
 
@@ -1742,6 +1743,7 @@ static bool buildPreviewMeshFromLeedsStrips(
         }
     }
 
+    outMesh.bounds = storylandMeshBounds(outMesh.vertices);
     return !outMesh.vertices.empty() && !outMesh.triangles.empty();
 }
 

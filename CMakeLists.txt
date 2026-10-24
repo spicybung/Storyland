@@ -23,6 +23,7 @@ if(STORYLAND_ARCHIVE_TESTS_ONLY)
         src/leeds/storyland_anim.cpp
         src/leeds/storyland_mobile_animation.cpp
         src/leeds/leeds_texture.cpp
+        src/leeds/storyland_gim.cpp
         src/validation/storyland_dma_validator.cpp
     )
     add_library(storyland_archive_support STATIC ${STORYLAND_ARCHIVE_SUPPORT})
@@ -150,9 +151,12 @@ add_executable(Storyland WIN32
     src/storyland/storyland_atomic_io.h
 
     src/leeds/leeds_texture.cpp
+    src/leeds/storyland_gim.cpp
+    src/leeds/storyland_gim.h
     src/leeds/leeds_texture.h
     src/leeds/storyland_archive.cpp
     src/leeds/storyland_archive.h
+    src/storyland/storyland_visibility.h
     src/leeds/storyland_dtz.cpp
     src/leeds/storyland_dtz.h
     src/leeds/storyland_model.cpp

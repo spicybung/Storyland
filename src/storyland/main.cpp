@@ -1325,7 +1325,7 @@ static std::wstring canonicalDtzImgResourceName(const std::wstring& displayName)
     std::transform(lower.begin(), lower.end(), lower.begin(), [](wchar_t c) { return wchar_t(towlower(c)); });
 
     const wchar_t* knownExtensions[] = {
-        L".mdl", L".dff", L".wbl", L".xtx", L".chk", L".tex", L".txd", L".anim", L".ifp", L".col", L".col2", L".dat", L".cfg", L".zon", L".ipl", L".ide", L".cut", L".dir", L".bin", L".dtz", L".zmg", L".gxt"
+        L".mdl", L".dff", L".wbl", L".xtx", L".chk", L".tex", L".txd", L".gim", L".anim", L".ifp", L".col", L".col2", L".dat", L".cfg", L".zon", L".ipl", L".ide", L".cut", L".dir", L".bin", L".dtz", L".zmg", L".gxt"
     };
 
     size_t bestPos = std::wstring::npos;
@@ -1744,7 +1744,7 @@ static bool sameFilesystemPathNoCase(const std::wstring& a, const std::wstring& 
 
 static bool textureArchiveExtension(const std::wstring& path) {
     std::wstring ext = getExtensionLower(path);
-    return ext == L".xtx" || ext == L".chk" || ext == L".tex" || ext == L".txd";
+    return ext == L".xtx" || ext == L".chk" || ext == L".tex" || ext == L".txd" || ext == L".gim";
 }
 
 static void appendUniquePath(std::vector<std::wstring>& paths, const std::wstring& path) {
@@ -1760,7 +1760,7 @@ static std::vector<std::wstring> collectCompanionTextureCandidates(const std::ws
     std::wstring directory = getDirectoryPart(modelPath);
     std::wstring stem = getFileStemPart(modelPath);
 
-    const wchar_t* directExtensions[] = {L".xtx", L".chk", L".tex", L".txd", L".XTX", L".CHK", L".TEX", L".TXD"};
+    const wchar_t* directExtensions[] = {L".xtx", L".chk", L".tex", L".txd", L".gim", L".XTX", L".CHK", L".TEX", L".TXD", L".GIM"};
     for (const wchar_t* extension : directExtensions) {
         std::wstring candidate = directory + stem + extension;
         if (fileExists(candidate)) appendUniquePath(paths, candidate);
@@ -1779,7 +1779,7 @@ static std::vector<std::wstring> collectCompanionTextureCandidates(const std::ws
         FindClose(find);
     }
 
-    const wchar_t* patterns[] = {L"*.xtx", L"*.chk", L"*.tex", L"*.txd", L"*.XTX", L"*.CHK", L"*.TEX", L"*.TXD"};
+    const wchar_t* patterns[] = {L"*.xtx", L"*.chk", L"*.tex", L"*.txd", L"*.gim", L"*.XTX", L"*.CHK", L"*.TEX", L"*.TXD", L"*.GIM"};
     for (const wchar_t* pattern : patterns) {
         find = FindFirstFileW((directory + pattern).c_str(), &findData);
         if (find == INVALID_HANDLE_VALUE) continue;
@@ -2900,7 +2900,7 @@ static bool findBestCompanionTextureArchive(const std::wstring& modelPath, std::
     archivePathOut.clear();
     textureIndexOut = -1;
 
-    const wchar_t* extensions[] = {L".xtx", L".chk", L".tex", L".txd", L".XTX", L".CHK", L".TEX", L".TXD"};
+    const wchar_t* extensions[] = {L".xtx", L".chk", L".tex", L".txd", L".gim", L".XTX", L".CHK", L".TEX", L".TXD", L".GIM"};
     for (const wchar_t* extension : extensions) {
 
 
@@ -2908,7 +2908,7 @@ static bool findBestCompanionTextureArchive(const std::wstring& modelPath, std::
     }
 
     WIN32_FIND_DATAW findData = {};
-    const wchar_t* patterns[] = {L"*.xtx", L"*.chk", L"*.tex", L"*.txd", L"*.XTX", L"*.CHK", L"*.TEX", L"*.TXD"};
+    const wchar_t* patterns[] = {L"*.xtx", L"*.chk", L"*.tex", L"*.txd", L"*.gim", L"*.XTX", L"*.CHK", L"*.TEX", L"*.TXD", L"*.GIM"};
     for (const wchar_t* pattern : patterns) {
         HANDLE find = FindFirstFileW((directory + pattern).c_str(), &findData);
         if (find == INVALID_HANDLE_VALUE) continue;
@@ -4718,6 +4718,7 @@ static void populateTextureList() {
         getExtensionLower(gTextureArchive.sourcePath());
     const wchar_t* archiveLabel =
         gTextureArchive.isMobileLcs() ? L"LCS Mobile TXD" :
+        archiveExtension == L".gim" ? L"PSP GIM Texture" :
         archiveExtension == L".txd" ? L"RenderWare TXD" :
         archiveExtension == L".chk" ? L"Stories CHK Texture Archive" :
         archiveExtension == L".xtx" ? L"Stories XTX Texture Archive" :
@@ -5027,7 +5028,7 @@ static void invalidateDtzDeepTextureFindIndex() {
 }
 
 static bool isDtzTextureArchiveExtension(const std::wstring& extension) {
-    return extension == L".xtx" || extension == L".chk" || extension == L".tex" || extension == L".txd";
+    return extension == L".xtx" || extension == L".chk" || extension == L".tex" || extension == L".txd" || extension == L".gim";
 }
 
 static bool buildDtzTextureNameIndex(std::wstring& summaryOut) {
@@ -5966,7 +5967,7 @@ static bool archiveEntryIsModel(const StorylandArchiveEntry& entry) {
 
 static bool archiveEntryIsTextureArchive(const StorylandArchiveEntry& entry) {
     std::string ext = archiveEntryExtensionLower(entry.name);
-    return ext == ".xtx" || ext == ".chk" || ext == ".tex" || ext == ".txd";
+    return ext == ".xtx" || ext == ".chk" || ext == ".tex" || ext == ".txd" || ext == ".gim";
 }
 
 static bool archiveEntryIsAnimation(const StorylandArchiveEntry& entry) {
@@ -9850,14 +9851,16 @@ static void selectTexture(int index, uint32_t mipLevel) {
         maxAlpha = std::max<uint8_t>(maxAlpha, gCurrentImage.rgba[p]);
         if (gCurrentImage.rgba[p] != 255u) anyAlpha = true;
     }
-    if (e.kind == TextureKind::RwMobile) {
+    if (e.kind == TextureKind::RwMobile || e.kind == TextureKind::Gim) {
         std::wstringstream details;
-        details << L"LCS Mobile texture: " << widen(e.name) << L"\r\n\r\n"
+        details << (e.kind == TextureKind::Gim ? L"PSP GIM texture: " : L"LCS Mobile texture: ") << widen(e.name) << L"\r\n\r\n"
                 << L"Full size: " << e.width << L" x " << e.height << L"\r\n"
                 << L"Available sizes: " << int(e.mipCount) << L"\r\n"
                 << L"Viewing size " << mipLevel + 1u << L": " << gCurrentImage.width << L" x " << gCurrentImage.height << L"\r\n"
                 << L"Transparency: " << (anyAlpha ? L"yes" : L"no") << L"\r\n\r\n"
-                << L"Use View > Texture, or right-click, to choose a size or pixel order.\r\n";
+                << (e.kind == TextureKind::Gim
+                    ? L"Use View > Texture to choose a size. Replace an image with one of the same dimensions; all stored sizes are updated.\r\n"
+                    : L"Use View > Texture, or right-click, to choose a size or pixel order.\r\n");
         setDetails(details.str());
         InvalidateRect(gPreview, nullptr, TRUE);
         return;
@@ -12314,7 +12317,7 @@ static void openStorylandFile(const std::wstring& path) {
     }
 
     if (!gOpeningDtzStandaloneChild &&
-        (ext == L".anim" || ext == L".ifp" || ext == L".chk" || ext == L".xtx" || ext == L".tex" || ext == L".txd" ||
+        (ext == L".anim" || ext == L".ifp" || ext == L".chk" || ext == L".xtx" || ext == L".tex" || ext == L".txd" || ext == L".gim" ||
          ext == L".img" || ext == L".lvz" || ext == L".wbl" || ext == L".dir" || ext == L".scm" ||
          ext == L".gxt" || ext == L".dtz" || ext == L".bin" || ext == L".mdl" || ext == L".dff" ||
          isStorylandMediaExtension(ext))) {
@@ -12448,7 +12451,7 @@ static void openStorylandFile(const std::wstring& path) {
         return;
     }
 
-    if (ext == L".chk" || ext == L".xtx" || ext == L".tex" || ext == L".txd") {
+    if (ext == L".chk" || ext == L".xtx" || ext == L".tex" || ext == L".txd" || ext == L".gim") {
         if (!gTextureArchive.loadFromFile(path, LeedsPlatform::Auto, error)) {
             MessageBoxW(gMainWindow, widen(error).c_str(), L"Storyland texture open failed", MB_ICONERROR);
             return;
@@ -12473,6 +12476,7 @@ static void openStorylandFile(const std::wstring& path) {
         SetWindowTextW(gMainWindow,
             mobileTxd ? L"Storyland - LCS Mobile TXD Viewer" :
             desktopTxd ? L"Storyland - RenderWare TXD Viewer" :
+            ext == L".gim" ? L"Storyland - PSP GIM Texture" :
             ext == L".txd" ? L"Storyland - LCS Beta TXD Editor" :
             ext == L".chk" ? L"Storyland - CHK Editor" :
             ext == L".xtx" ? L"Storyland - XTX Editor" : L"Storyland - Texture Archive");
@@ -12762,7 +12766,7 @@ static void openSelectedArchiveEntry() {
         setStatus(L"WRLD/AREA sector is shown alone in the LVZ/IMG OpenGL preview.");
         return;
     }
-    if (!(ext == L".mdl" || ext == L".dff" || ext == L".xtx" || ext == L".chk" || ext == L".tex" || ext == L".txd" || ext == L".dtz" || ext == L".gxt" || ext == L".ifp" || ext == L".anim")) {
+    if (!(ext == L".mdl" || ext == L".dff" || ext == L".xtx" || ext == L".chk" || ext == L".tex" || ext == L".txd" || ext == L".gim" || ext == L".dtz" || ext == L".gxt" || ext == L".ifp" || ext == L".anim")) {
         selectArchiveEntry(gSelectedIndex);
         setStatus(L"Selected embedded resource is listed but not directly openable. Model, texture, animation, DTZ, and GXT entries can be opened.");
         return;
@@ -13669,7 +13673,7 @@ static void replaceSelectedArchiveResourceFromFile() {
 
     const wchar_t* filter = selectedModelResource
         ? L"Leeds SimpleModel MDL\0*.mdl\0All files\0*.*\0"
-        : L"Leeds resource\0*.mdl;*.dff;*.wbl;*.xtx;*.chk;*.tex;*.txd;*.wrld;*.area;*.bin\0All files\0*.*\0";
+        : L"Leeds resource\0*.mdl;*.dff;*.wbl;*.xtx;*.chk;*.tex;*.txd;*.gim;*.wrld;*.area;*.bin\0All files\0*.*\0";
     std::wstring path = openFileDialog(filter);
     if (path.empty()) return;
 
@@ -13923,7 +13927,7 @@ static void exportSelectedResourceBytes() {
 
     if (suggestedName.empty()) suggestedName = L"storyland_resource.bin";
     std::wstring outputPath = saveFileDialogWithInitial(
-        L"Leeds resource\0*.mdl;*.dff;*.wbl;*.xtx;*.chk;*.tex;*.txd;*.wrld;*.area;*.anim;*.ifp;*.bin\0All files\0*.*\0",
+        L"Leeds resource\0*.mdl;*.dff;*.wbl;*.xtx;*.chk;*.tex;*.txd;*.gim;*.wrld;*.area;*.anim;*.ifp;*.bin\0All files\0*.*\0",
         L"bin",
         suggestedName
     );
@@ -13957,7 +13961,7 @@ static void exportCurrentOpenedFile(bool exportAs) {
                 fileName);
         } else {
             outputPath = saveFileDialogWithInitial(
-                L"Texture archives\0*.chk;*.xtx;*.tex;*.txd\0All files\0*.*\0",
+                L"Texture archives\0*.chk;*.xtx;*.tex;*.txd;*.gim\0All files\0*.*\0",
                 extension.size() > 1 ? extension.substr(1).c_str() : L"xtx",
                 fileName);
         }
@@ -14000,12 +14004,12 @@ static void exportCurrentOpenedFile(bool exportAs) {
                         LeedsPlatform::Ps2,
                         verificationError,
                         outputPath)) {
-                    error = "Serialized XTX failed reload verification: " + verificationError;
+                    error = "Serialized texture file failed reload verification: " + verificationError;
                     saved = false;
                 } else {
                     std::string structureReport;
                     if (!verification.validateStructure(structureReport, verificationError)) {
-                        error = "Serialized XTX failed runtime validation: " + verificationError;
+                        error = "Serialized texture file failed validation: " + verificationError;
                         saved = false;
                     } else {
                         saved = storylandWriteFilesTransaction(
@@ -14016,8 +14020,8 @@ static void exportCurrentOpenedFile(bool exportAs) {
                             if (!readBinaryFileForUi(outputPath, writtenBytes, readbackError) ||
                                 writtenBytes != serializedBytes) {
                                 error = readbackError.empty()
-                                    ? "XTX export readback mismatch: output differs from the validated export snapshot."
-                                    : "XTX export readback failed: " + readbackError;
+                                    ? "Texture export readback mismatch: output differs from the validated export snapshot."
+                                    : "Texture export readback failed: " + readbackError;
                                 saved = false;
                             }
                         }
@@ -14034,7 +14038,7 @@ static void exportCurrentOpenedFile(bool exportAs) {
         return;
     }
     setStatus((exportAs ? L"Exported as: " : L"Exported: ") + outputPath +
-              (textureMode ? L" | byte-verified XTX snapshot" : L""));
+              (textureMode ? L" | saved bytes verified" : L""));
 }
 
 static bool loadedModelUsesPspGeometry() {
@@ -14595,6 +14599,18 @@ static void replaceSelectedTexture() {
         return;
     }
 
+    if (size_t(gSelectedIndex) < gTextureArchive.textures().size() &&
+        gTextureArchive.textures()[size_t(gSelectedIndex)].kind == TextureKind::Gim) {
+        const int index = gSelectedIndex;
+        if (!gTextureArchive.replaceTexture(size_t(index), image, error)) {
+            MessageBoxW(gMainWindow, widen(error).c_str(), L"GIM replacement failed", MB_ICONERROR); return;
+        }
+        populateTextureList();
+        selectTexture(index);
+        setStatus(L"GIM texture replaced; all stored mipmaps updated.");
+        return;
+    }
+
     uint32_t currentBpp = 8u;
     bool clampedFromHigherBpp = false;
     if (size_t(gSelectedIndex) < gTextureArchive.textures().size()) {
@@ -14886,6 +14902,7 @@ static const wchar_t* textureKindLabel(TextureKind kind) {
     case TextureKind::RwPsp: return L"PSP RenderWare";
     case TextureKind::RwPc: return L"PC RenderWare";
     case TextureKind::RwMobile: return L"LCS Mobile";
+    case TextureKind::Gim: return L"PSP GIM";
     default: return L"Unknown";
     }
 }
@@ -15246,9 +15263,9 @@ static void replaceSelectedDtzDirEntryFromFile() {
     }
 
     static const wchar_t replacementFilter[] =
-        L"Leeds / Stories resource\0*.mdl;*.dff;*.xtx;*.chk;*.tex;*.txd;*.anim;*.ifp;*.cam;*.cut;*.col;*.col2;*.bin\0"
+        L"Leeds / Stories resource\0*.mdl;*.dff;*.xtx;*.chk;*.tex;*.txd;*.gim;*.anim;*.ifp;*.cam;*.cut;*.col;*.col2;*.bin\0"
         L"Model files\0*.mdl;*.dff\0"
-        L"Texture archives\0*.xtx;*.chk;*.tex;*.txd\0"
+        L"Texture archives\0*.xtx;*.chk;*.tex;*.txd;*.gim\0"
         L"Animation / cutscene / collision\0*.anim;*.ifp;*.cam;*.cut;*.col;*.col2\0"
         L"All files\0*.*\0";
     std::wstring replacementPath = openFileDialog(replacementFilter);
@@ -16115,6 +16132,8 @@ static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
     glGetDoublev(GL_MODELVIEW_MATRIX, pickModel);
     glGetDoublev(GL_PROJECTION_MATRIX, pickProjection);
     glGetIntegerv(GL_VIEWPORT, pickViewport);
+    StorylandViewFrustum archiveFrustum;
+    archiveFrustum.set(pickProjection, pickModel);
     for (const auto& placement : placements) {
         if (gArchiveSoloResourceId >= 0) continue;
         if (selectedSectorIndex >= 0 && int(placement.sectorIndex) != selectedSectorIndex) continue;
@@ -16215,8 +16234,11 @@ static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
         uploadedArchiveTextures[texture] = handle;
         return handle;
     };
+    std::map<const StorylandDirectTextureResource*, bool> fractionalAlphaByTexture;
     auto materialNeedsFractionalAlpha = [&](const StorylandDirectTextureResource* texture) -> bool {
         if (texture == nullptr) return false;
+        const auto classified = fractionalAlphaByTexture.find(texture);
+        if (classified != fractionalAlphaByTexture.end()) return classified->second;
         const auto& rgba = texture->rgba;
         if (rgba.size() < 4u) return false;
         const size_t pixelCount = rgba.size() / 4u;
@@ -16230,7 +16252,7 @@ static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
         // pixels as "real translucency" made whole buildings look ghosted.
         // Only use blending when a substantial part of the texture is genuinely
         // fractional; otherwise use alpha test/depth writes.
-        return fractional >= std::max<size_t>(32u, pixelCount / 5u);
+        return fractionalAlphaByTexture[texture] = fractional >= std::max<size_t>(32u, pixelCount / 5u);
     };
 
     // Leeds WRLD stores geometry in render passes.  Drawing every pass as opaque
@@ -16299,6 +16321,8 @@ static void drawArchivePreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
             if (found == meshByKey.end() || found->second == nullptr) continue;
             const StorylandWorldMesh& mesh = *found->second;
             if (mesh.vertices.empty() || mesh.triangles.empty()) continue;
+            if (!(gArchivePlacementGizmoDragging && int(placementIndex) == gArchivePlacementGizmoPlacementIndex) &&
+                !archiveFrustum.visible(mesh.bounds, placement.matrix)) continue;
 
             if (triangleBatchOpen) {
                 glEnd();
@@ -17731,6 +17755,12 @@ static void drawDtzLeeds2dfxPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
     stopStoriesShaderProgram();
     setupFixedPipelineStoriesLighting(false);
 
+    GLdouble areaModelView[16] = {}, areaProjection[16] = {};
+    glGetDoublev(GL_MODELVIEW_MATRIX, areaModelView);
+    glGetDoublev(GL_PROJECTION_MATRIX, areaProjection);
+    StorylandViewFrustum areaFrustum;
+    areaFrustum.set(areaProjection, areaModelView);
+
     size_t drawnAreaInstances = 0;
     size_t drawnAreaTriangles = 0;
     size_t drawnTexturedTriangles = 0;
@@ -17783,8 +17813,11 @@ static void drawDtzLeeds2dfxPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
             uploadedTextures.emplace(texture, handle);
             return handle;
         };
+        std::map<const StorylandDirectTextureResource*, bool> fractionalAlphaByTexture;
         auto materialNeedsFractionalAlpha = [&](const StorylandDirectTextureResource* texture) -> bool {
             if (texture == nullptr) return false;
+            const auto classified = fractionalAlphaByTexture.find(texture);
+            if (classified != fractionalAlphaByTexture.end()) return classified->second;
             const auto& rgba = texture->rgba;
             if (rgba.size() < 4u) return false;
             const size_t pixelCount = rgba.size() / 4u;
@@ -17793,7 +17826,7 @@ static void drawDtzLeeds2dfxPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
                 const uint8_t alpha = rgba[pixel * 4u + 3u];
                 if (alpha > 8u && alpha < 247u) ++fractional;
             }
-            return fractional >= std::max<size_t>(32u, pixelCount / 5u);
+            return fractionalAlphaByTexture[texture] = fractional >= std::max<size_t>(32u, pixelCount / 5u);
         };
 
         // Render WRLD pass classes with the same intent as the standalone
@@ -17847,6 +17880,7 @@ static void drawDtzLeeds2dfxPreviewOpenGl(HWND hwnd, HDC dc, RECT rc) {
 
                 const StorylandWorldMesh& mesh = *found->second;
                 if (mesh.vertices.empty() || mesh.triangles.empty()) continue;
+                if (!areaFrustum.visible(mesh.bounds, placement.matrix)) continue;
 
                 if (triangleBatchOpen) {
                     glEnd();
@@ -18434,6 +18468,10 @@ static void updateActionBar() {
         enableQuaternary = haveMaterialSelection;
         if (gTextureArchive.isMobileLcs())
             showSecondary = showTertiary = showQuaternary = false;
+        if (!gTextureArchive.textures().empty() && gTextureArchive.textures().front().kind == TextureKind::Gim) {
+            showSecondary = showQuaternary = false;
+            tertiaryText = L"Replace Image...";
+        }
     } else if (gMode == StorylandMode::DtzArchive &&
                gDtzEmbeddedPreviewKind == DtzEmbeddedPreviewKind::TextureArchive) {
         showBar = true;
@@ -19374,21 +19412,26 @@ static bool buildTreeContextMenu(HMENU menu) {
         hasItems = hasItems || specificItems;
     } else if (gMode == StorylandMode::TextureArchive) {
         const bool mobileTexture = gTextureArchive.isMobileLcs();
-        if (!mobileTexture) hasItems = addContextMenuItem(menu, ID_TEXTURE_ADD, L"Add material...") || hasItems;
+        const bool gimTexture = !gTextureArchive.textures().empty() && gTextureArchive.textures().front().kind == TextureKind::Gim;
+        if (!mobileTexture && !gimTexture) hasItems = addContextMenuItem(menu, ID_TEXTURE_ADD, L"Add material...") || hasItems;
         hasItems = addContextMenuItem(menu, ID_TEXTURE_VALIDATE, L"Validate texture archive") || hasItems;
         if (gSelectedIndex >= 0) {
             AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
             if (!mobileTexture) {
-                hasItems = addContextMenuItem(menu, ID_FILE_REPLACE_TEXTURE, L"Edit material...") || hasItems;
-                if (gTextureArchive.textures().size() > 1u) hasItems = addContextMenuItem(menu, ID_TEXTURE_SWAP, L"Swap texture data with...") || hasItems;
-                hasItems = addContextMenuItem(menu, ID_TEXTURE_DUPLICATE, L"Duplicate material...") || hasItems;
-                hasItems = addContextMenuItem(menu, ID_FILE_RENAME_TEXTURE, L"Rename texture...") || hasItems;
-                hasItems = addContextMenuItem(menu, ID_TEXTURE_REMOVE, L"Remove material...") || hasItems;
+                hasItems = addContextMenuItem(menu, ID_FILE_REPLACE_TEXTURE, gimTexture ? L"Replace image..." : L"Edit material...") || hasItems;
+                if (!gimTexture) {
+                    if (gTextureArchive.textures().size() > 1u) hasItems = addContextMenuItem(menu, ID_TEXTURE_SWAP, L"Swap texture data with...") || hasItems;
+                    hasItems = addContextMenuItem(menu, ID_TEXTURE_DUPLICATE, L"Duplicate material...") || hasItems;
+                    hasItems = addContextMenuItem(menu, ID_FILE_RENAME_TEXTURE, L"Rename texture...") || hasItems;
+                    hasItems = addContextMenuItem(menu, ID_TEXTURE_REMOVE, L"Remove material...") || hasItems;
+                }
             }
             hasItems = addContextMenuItem(menu, ID_FILE_EXPORT_TEXTURE, L"Export texture PNG...") || hasItems;
-            if (mobileTexture) {
+            if (mobileTexture || gimTexture) {
                 hasItems = addContextMenuItem(menu, ID_VIEW_TEXTURE_MIP_PREVIOUS, L"Larger texture size") || hasItems;
                 hasItems = addContextMenuItem(menu, ID_VIEW_TEXTURE_MIP_NEXT, L"Smaller texture size") || hasItems;
+            }
+            if (mobileTexture) {
                 AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
                 hasItems = addContextMenuItem(menu, ID_VIEW_TEXTURE_ORDER_AUTO, L"Automatic pixel order") || hasItems;
                 hasItems = addContextMenuItem(menu, ID_VIEW_TEXTURE_ORDER_STORED, L"Pixels as stored") || hasItems;
@@ -20388,10 +20431,11 @@ static void rebuildViewMenu() {
     if (gMode == StorylandMode::TextureArchive) {
         gTexturePreviewMenu = CreatePopupMenu();
         AppendMenuW(gTexturePreviewMenu, MF_STRING, ID_VIEW_FLIP_TEXTURE_PREVIEW_V, L"Flip vertically");
-        const bool mobileMips = gSelectedIndex >= 0 && size_t(gSelectedIndex) < gTextureArchive.textures().size() &&
-            gTextureArchive.textures()[size_t(gSelectedIndex)].kind == TextureKind::RwMobile;
-        AppendMenuW(gTexturePreviewMenu, MF_STRING | (mobileMips ? 0 : MF_GRAYED), ID_VIEW_TEXTURE_MIP_PREVIOUS, L"Larger texture size");
-        AppendMenuW(gTexturePreviewMenu, MF_STRING | (mobileMips ? 0 : MF_GRAYED), ID_VIEW_TEXTURE_MIP_NEXT, L"Smaller texture size");
+        const bool selectedTexture = gSelectedIndex >= 0 && size_t(gSelectedIndex) < gTextureArchive.textures().size();
+        const bool mobileMips = selectedTexture && gTextureArchive.textures()[size_t(gSelectedIndex)].kind == TextureKind::RwMobile;
+        const bool hasMips = mobileMips || (selectedTexture && gTextureArchive.textures()[size_t(gSelectedIndex)].kind == TextureKind::Gim);
+        AppendMenuW(gTexturePreviewMenu, MF_STRING | (hasMips ? 0 : MF_GRAYED), ID_VIEW_TEXTURE_MIP_PREVIOUS, L"Larger texture size");
+        AppendMenuW(gTexturePreviewMenu, MF_STRING | (hasMips ? 0 : MF_GRAYED), ID_VIEW_TEXTURE_MIP_NEXT, L"Smaller texture size");
         if (mobileMips) {
             HMENU orderMenu = CreatePopupMenu();
             AppendMenuW(orderMenu, MF_STRING, ID_VIEW_TEXTURE_ORDER_AUTO, L"Automatic");
@@ -21059,7 +21103,7 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         }
 
         case ID_FILE_OPEN: {
-            std::wstring path = openFileDialog(L"Storyland files\0*.dat;*.cfg;*.ide;*.ipl;*.zon;*.gxt;*.scm;*.dtz;*.bin;*.img;*.dir;*.lvz;*.zmg;*.area;*.wbl;*.mdl;*.dff;*.anim;*.ifp;*.chk;*.xtx;*.tex;*.txd;*.sdt;*.raw;*.vag;*.vb;*.wav;*.at3;*.aa3;*.oma;*.mp3;*.ogg;*.flac;*.aac;*.m4a;*.wma;*.ac3;*.aif;*.aiff;*.adx;*.pss;*.pmf;*.mpg;*.mpeg;*.mp4;*.m4v;*.wmv;*.avi;*.mov;*.mkv;*.ts;*.m2ts;*.mts;*.vob;*.3gp;*.3g2;*.webm;*.ogv;*.flv\0Game data\0*.dat;*.cfg;*.ide;*.ipl;*.zon\0Game text\0*.gxt\0Models\0*.mdl;*.dff;*.wbl\0Textures\0*.chk;*.xtx;*.tex;*.txd\0Audio\0*.sdt;*.raw;*.vag;*.vb;*.wav;*.at3;*.aa3;*.oma;*.mp3;*.ogg;*.flac;*.aac;*.m4a;*.wma;*.ac3;*.aif;*.aiff;*.adx\0Video\0*.pss;*.pmf;*.mpg;*.mpeg;*.mp4;*.m4v;*.wmv;*.avi;*.mov;*.mkv;*.ts;*.m2ts;*.mts;*.vob;*.3gp;*.3g2;*.webm;*.ogv;*.flv\0All files\0*.*\0");
+            std::wstring path = openFileDialog(L"Storyland files\0*.dat;*.cfg;*.ide;*.ipl;*.zon;*.gxt;*.scm;*.dtz;*.bin;*.img;*.dir;*.lvz;*.zmg;*.area;*.wbl;*.mdl;*.dff;*.anim;*.ifp;*.chk;*.xtx;*.tex;*.txd;*.gim;*.sdt;*.raw;*.vag;*.vb;*.wav;*.at3;*.aa3;*.oma;*.mp3;*.ogg;*.flac;*.aac;*.m4a;*.wma;*.ac3;*.aif;*.aiff;*.adx;*.pss;*.pmf;*.mpg;*.mpeg;*.mp4;*.m4v;*.wmv;*.avi;*.mov;*.mkv;*.ts;*.m2ts;*.mts;*.vob;*.3gp;*.3g2;*.webm;*.ogv;*.flv\0Game data\0*.dat;*.cfg;*.ide;*.ipl;*.zon\0Game text\0*.gxt\0Models\0*.mdl;*.dff;*.wbl\0Textures\0*.chk;*.xtx;*.tex;*.txd;*.gim\0Audio\0*.sdt;*.raw;*.vag;*.vb;*.wav;*.at3;*.aa3;*.oma;*.mp3;*.ogg;*.flac;*.aac;*.m4a;*.wma;*.ac3;*.aif;*.aiff;*.adx\0Video\0*.pss;*.pmf;*.mpg;*.mpeg;*.mp4;*.m4v;*.wmv;*.avi;*.mov;*.mkv;*.ts;*.m2ts;*.mts;*.vob;*.3gp;*.3g2;*.webm;*.ogv;*.flv\0All files\0*.*\0");
             openStorylandFile(path);
             break;
         }
@@ -21259,7 +21303,7 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             if (gMode == StorylandMode::TextureArchive && gSelectedIndex >= 0 &&
                 size_t(gSelectedIndex) < gTextureArchive.textures().size()) {
                 const auto& texture = gTextureArchive.textures()[size_t(gSelectedIndex)];
-                if (texture.kind == TextureKind::RwMobile && texture.mipCount) {
+                if ((texture.kind == TextureKind::RwMobile || texture.kind == TextureKind::Gim) && texture.mipCount) {
                     uint32_t level = std::min<uint32_t>(gTextureMipLevel, texture.mipCount - 1u);
                     if (LOWORD(wParam) == ID_VIEW_TEXTURE_MIP_PREVIOUS && level) --level;
                     if (LOWORD(wParam) == ID_VIEW_TEXTURE_MIP_NEXT && level + 1u < texture.mipCount) ++level;
