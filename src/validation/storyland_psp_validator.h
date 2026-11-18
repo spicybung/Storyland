@@ -1,6 +1,6 @@
 #pragma once
 
-#include "storyland_dma_validator.h"
+#include "src/validation/storyland_dma_validator.h"
 
 #include <cstddef>
 #include <cstdint>

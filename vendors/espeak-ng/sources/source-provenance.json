@@ -1,0 +1,68 @@
+[
+  {
+    "component": "espeak-ng",
+    "dsc_url": "https://ftp.debian.org/debian/pool/main/e/espeak-ng/espeak-ng_1.52.0+dfsg-5.dsc",
+    "files": [
+      {
+        "name": "espeak-ng_1.52.0+dfsg.orig.tar.gz",
+        "url": "https://ftp.debian.org/debian/pool/main/e/espeak-ng/espeak-ng_1.52.0+dfsg.orig.tar.gz",
+        "sha256": "d2a886bae3547a15c52801cb37e415230834a7ee7f9a57352b98d60454d97cea",
+        "bytes": 16464682
+      },
+      {
+        "name": "espeak-ng_1.52.0+dfsg-5.debian.tar.xz",
+        "url": "https://ftp.debian.org/debian/pool/main/e/espeak-ng/espeak-ng_1.52.0+dfsg-5.debian.tar.xz",
+        "sha256": "d253d81d2815194e2c13c1af77b6761c43db48848ca423430b4a8c416359b813",
+        "bytes": 50116
+      }
+    ]
+  },
+  {
+    "component": "pcaudiolib",
+    "dsc_url": "https://ftp.debian.org/debian/pool/main/p/pcaudiolib/pcaudiolib_1.3-1.dsc",
+    "files": [
+      {
+        "name": "pcaudiolib_1.3.orig.tar.gz",
+        "url": "https://ftp.debian.org/debian/pool/main/p/pcaudiolib/pcaudiolib_1.3.orig.tar.gz",
+        "sha256": "86edb75048eec7fcd8d74f9568f051d50b4781982215095b96ba9c2c9c7c159b",
+        "bytes": 34640
+      },
+      {
+        "name": "pcaudiolib_1.3-1.debian.tar.xz",
+        "url": "https://ftp.debian.org/debian/pool/main/p/pcaudiolib/pcaudiolib_1.3-1.debian.tar.xz",
+        "sha256": "f2cf71ebdcebda3e62ae0e09c4e702b557758d36f584fad4c5519ad5cd0512b3",
+        "bytes": 3340
+      }
+    ]
+  },
+  {
+    "component": "sonic",
+    "dsc_url": "https://ftp.debian.org/debian/pool/main/s/sonic/sonic_0.2.0-13.dsc",
+    "files": [
+      {
+        "name": "sonic_0.2.0.orig.tar.gz",
+        "url": "https://ftp.debian.org/debian/pool/main/s/sonic/sonic_0.2.0.orig.tar.gz",
+        "sha256": "c7827ce576838467590ffa1f935fbe1049e896dfed6c515cf569ad3779c24085",
+        "bytes": 5340269
+      },
+      {
+        "name": "sonic_0.2.0-13.debian.tar.xz",
+        "url": "https://ftp.debian.org/debian/pool/main/s/sonic/sonic_0.2.0-13.debian.tar.xz",
+        "sha256": "fc0bb73344c546f6c20b10358cd791c752503f7f52614c7ad33484e674c880b2",
+        "bytes": 5468
+      }
+    ]
+  },
+  {
+    "component": "espeak-ng-official-windows-release",
+    "files": [
+      {
+        "name": "espeak-ng-official-1.52.0.tar.gz",
+        "url": "https://github.com/espeak-ng/espeak-ng/archive/refs/tags/1.52.0.tar.gz",
+        "sha256": "bb4338102ff3b49a81423da8a1a158b420124b055b60fa76cfb4b18677130a23",
+        "bytes": 17739803,
+        "checksum_note": "Measured locally from official tagged source archive."
+      }
+    ]
+  }
+]

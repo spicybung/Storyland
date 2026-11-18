@@ -1,15 +1,60 @@
-#include "storyland_scm.h"
+#include "src/storyland/storyland_scm.h"
+#include "src/storyland/storyland_gxt.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstdio>
 #include <fstream>
+#include <filesystem>
 #include <limits>
 #include <map>
 #include <regex>
 #include <sstream>
 
 namespace {
+#include "src/storyland/storyland_mission_titles.inc"
+
+std::string storylandMissionTitleKey(std::string key) {
+    const auto digit = key.find_last_not_of("0123456789");
+    if (digit != std::string::npos && key.size() - digit == 2) key.insert(digit + 1, "0");
+    return key;
+}
+
+std::string storylandReadableMissionTitle(const std::u16string& units) {
+    std::string result;
+    for (size_t index = 0; index < units.size(); ++index) {
+        uint32_t codepoint = units[index];
+        if (codepoint == '~') {
+            const auto end = units.find(u'~', index + 1);
+            if (end != std::u16string::npos) { index = end; continue; }
+        }
+        if (codepoint >= 0xD800 && codepoint <= 0xDBFF && index + 1 < units.size() &&
+            units[index + 1] >= 0xDC00 && units[index + 1] <= 0xDFFF) {
+            codepoint = 0x10000 + ((codepoint - 0xD800) << 10) + units[++index] - 0xDC00;
+        } else if (codepoint >= 0xD800 && codepoint <= 0xDFFF) codepoint = 0xFFFD;
+        if (codepoint < 0x80) result.push_back(char(codepoint));
+        else if (codepoint < 0x800) {
+            result.push_back(char(0xC0 | (codepoint >> 6)));
+            result.push_back(char(0x80 | (codepoint & 63)));
+        } else if (codepoint < 0x10000) {
+            result.push_back(char(0xE0 | (codepoint >> 12)));
+            result.push_back(char(0x80 | ((codepoint >> 6) & 63)));
+            result.push_back(char(0x80 | (codepoint & 63)));
+        } else {
+            result.push_back(char(0xF0 | (codepoint >> 18)));
+            result.push_back(char(0x80 | ((codepoint >> 12) & 63)));
+            result.push_back(char(0x80 | ((codepoint >> 6) & 63)));
+            result.push_back(char(0x80 | (codepoint & 63)));
+        }
+    }
+    const auto begin = result.find_first_not_of(" \t\r\n");
+    if (begin == std::string::npos) return {};
+    result = result.substr(begin, result.find_last_not_of(" \t\r\n") - begin + 1);
+    if (result.size() >= 2 && result.front() == '\'' && result.back() == '\'')
+        result = result.substr(1, result.size() - 2);
+    return result == "REMOVED" ? std::string{} : result;
+}
 
 bool readWholeFileBinary(const std::wstring& filePath, std::vector<uint8_t>& bytes, std::string& errorMessage) {
     constexpr uint64_t kMaxScmBytes = 256ull * 1024ull * 1024ull;
@@ -134,12 +179,98 @@ std::vector<SourceLine> splitSourceLines(const std::string& source) {
 }
 
 std::string defaultMissionName(int id) {
-    return "Mission " + std::to_string(id);
+    return "Unidentified script " + std::to_string(id);
+}
+
+bool readNativeScmIdentifier(const std::vector<uint8_t>& bytes, size_t& cursor,
+    size_t end, bool vcs, std::string& value) {
+    value.clear();
+    if (vcs) {
+        if (cursor >= end || bytes[cursor++] != 10) return false;
+        while (cursor < end && bytes[cursor] && value.size() < 128)
+            value.push_back(char(bytes[cursor++]));
+        if (cursor >= end || bytes[cursor++] != 0) return false;
+    } else {
+        if (cursor > end || end - cursor < 8) return false;
+        for (size_t index = 0; index < 8 && bytes[cursor + index]; ++index)
+            value.push_back(char(bytes[cursor + index]));
+        cursor += 8;
+    }
+    return !value.empty() && std::all_of(value.begin(), value.end(), [](unsigned char character) {
+        return std::isalnum(character) || character == '_';
+    });
+}
+
+StorylandScmDialect identifyScmDialect(const std::vector<uint8_t>& bytes,
+    size_t begin, size_t end) {
+    end = std::min(end, bytes.size());
+    StorylandScmDialect result = StorylandScmDialect::Unknown;
+    for (bool vcs : {false, true}) {
+        size_t cursor = begin;
+        for (unsigned instruction = 0; instruction < 4 && cursor < end && end - cursor >= 2; ++instruction) {
+            const uint16_t opcode = readU16(bytes, cursor);
+            cursor += 2;
+            if (opcode == 0 || opcode == (vcs ? 0x01EA : 0x031C)) continue;
+            if (opcode != (vcs ? 0x0238 : 0x03A9) && opcode != (vcs ? 0x033A : 0x0551)) break;
+            std::string identifier;
+            if (!readNativeScmIdentifier(bytes, cursor, end, vcs, identifier)) break;
+            const auto candidate = vcs ? StorylandScmDialect::Vcs : StorylandScmDialect::Lcs;
+            if (result != StorylandScmDialect::Unknown && result != candidate)
+                return StorylandScmDialect::Unknown;
+            result = candidate;
+            break;
+        }
+    }
+    return result;
+}
+
+// Read only the native entry prologue; never search arbitrary operand bytes for opcodes.
+void identifyMission(const std::vector<uint8_t>& bytes, bool vcs, StorylandScmMission& mission) {
+    size_t cursor=mission.binaryOffset;
+    const size_t end=std::min(bytes.size(),cursor+mission.binarySize);
+    const uint16_t scriptName=vcs?0x0238:0x03A9, textTable=vcs?0x033A:0x0551;
+    for(unsigned instruction=0;instruction<4 && cursor+2<=end;++instruction) {
+        const uint16_t opcode=uint16_t(bytes[cursor])|(uint16_t(bytes[cursor+1])<<8);cursor+=2;
+        if(opcode==0||opcode==(vcs?0x01EA:0x031C))continue;
+        if(opcode!=scriptName&&opcode!=textTable)break;
+        std::string value;
+        if(!readNativeScmIdentifier(bytes,cursor,end,vcs,value))break;
+        if(opcode==scriptName)mission.scriptName=value;else mission.textTable=value;
+    }
+    if(vcs&&mission.binarySize==24&&mission.binaryOffset+3<=bytes.size()&&
+        bytes[mission.binaryOffset]==0xC6&&bytes[mission.binaryOffset+1]==3&&bytes[mission.binaryOffset+2]==1) {
+        mission.name="Initialize bridge geometry";mission.category="Startup";
+    }
+    const auto& code=mission.scriptName.empty()?mission.textTable:mission.scriptName;
+    if(!code.empty()) {mission.name=code;mission.category="Script";}
+    if(!vcs&&code.find("INIT")==0)mission.category="Startup";
+    if(vcs) {
+        static const std::map<std::string,std::string> labels={
+            {"INITPU","Initialize pickups"},{"INITCG","Initialize car generators"},
+            {"INITGA","Initialize garages"},{"INITOB","Initialize objects"},
+            {"INITPLA","Initialize player"},{"INITGEN","Initialize game settings"},
+            {"BUILDDE","Empire developer menu"},{"BUILD","Empire building management"},
+            {"PARAMED","Paramedic"},{"VIG","Vigilante"},{"FIRETRK","Firefighter"},
+            {"DRIVERA","Driving activity"},{"TTRIAL","Time trial"},{"QTTRIAL","Quad time trial"},
+            {"BTRIAL","Bicycle trial"},{"DTRIAL","Dirt bike trial"},{"GTRIAL","Vehicle trial"},
+            {"CRASH","Crash activity"},{"BMXMALL","BMX mall challenge"},{"BEACHPL","Beach patrol"},
+            {"TOURVCS","Tour activity"},{"FIREHEL","Fire helicopter activity"},
+            {"RACEHUB","Race selector"},{"GYROTGT","Gyrocopter target challenge"},
+            {"AIRRACE","Air race"},{"AIRRAC2","Air race 2"},{"MVRACE","Multivehicle race"},
+            {"MVRACE2","Multivehicle race 2"},{"PCJPLAY","PCJ playground"},{"HOVERTT","Hovercraft time trial"},
+            {"TAXI","Taxi driver"},{"SRANGE","Shooting range"},{"CHOPLIF","Chopper Checkpoint"},
+            {"E_PR","Empire: Protection racket"},{"E_RE","Empire: Loan shark"},
+            {"E_PI","Empire: Prostitution"},{"E_DR","Empire: Drugs"},
+            {"E_SM","Empire: Smuggling"},{"E_RO","Empire: Robbery"}};
+        const auto found=labels.find(code);
+        if(found!=labels.end()) {mission.name=found->second;mission.category=code.find("INIT")==0?"Startup":"Activity";}
+        if(code=="BUILDDE")mission.category="Development script";
+    }
 }
 
 } // namespace
 
-bool StorylandScmFile::loadFromFile(const std::wstring& filePath, std::string& errorMessage) {
+bool StorylandScmFile::loadFromFile(const std::wstring& filePath, std::string& errorMessage, bool loadNearbyText) {
     std::vector<uint8_t> bytes;
     if (!readWholeFileBinary(filePath, bytes, errorMessage)) return false;
 
@@ -148,10 +279,23 @@ bool StorylandScmFile::loadFromFile(const std::wstring& filePath, std::string& e
     decompiledSource.clear();
     activeMode.clear();
     nativeHeader = {};
+    objectNames.clear();
     nativeMissionRows.clear();
     missionRows.clear();
     parseNativeHeader();
     missionRows = nativeMissionRows;
+    if(loadNearbyText) {
+    const auto directory=std::filesystem::path(filePath).parent_path();
+    const std::array<std::filesystem::path,3> textDirectories={directory,directory/L"TEXT",directory.parent_path()/L"TEXT"};
+    bool titlesLoaded=false;
+    for(const auto& folder:textDirectories) {
+        for(const auto* name:{L"ENGLISH.GXT",L"english.gxt"}) {
+            StorylandGxtFile text;std::string ignored;
+            if(text.loadFromFile((folder/name).wstring(),ignored)) {applyRetailMissionTitles(text);titlesLoaded=true;break;}
+        }
+        if(titlesLoaded)break;
+    }
+    }
     errorMessage.clear();
     return true;
 }
@@ -310,6 +454,12 @@ void StorylandScmFile::parseNativeHeader() {
     cursor += 4;
     uint64_t objectBytes = uint64_t(objectCount) * 24ull;
     if (objectBytes > (std::numeric_limits<size_t>::max)() || cursor + size_t(objectBytes) > thirdGoto) return;
+    objectNames.reserve(objectCount);
+    for(uint32_t index=0;index<objectCount;++index) {
+        const size_t begin=cursor+size_t(index)*24;size_t end=begin;
+        while(end<begin+24&&data[end])++end;
+        objectNames.emplace_back(reinterpret_cast<const char*>(data.data()+begin),end-begin);
+    }
     cursor += size_t(objectBytes);
 
     if (cursor > thirdGoto) return;
@@ -370,6 +520,25 @@ void StorylandScmFile::parseNativeHeader() {
     nativeHeader.exclusiveMissionCount = exclusiveMissionCount;
     nativeHeader.missionTableOffset = uint32_t(missionTableOffset);
 
+    nativeHeader.dialect = identifyScmDialect(data, mainScriptOffset,
+        mainScriptSize > mainScriptOffset ? std::min<size_t>(mainScriptSize, data.size()) : data.size());
+    if (nativeHeader.dialect == StorylandScmDialect::Unknown) {
+        bool conflicting = false;
+        for (uint32_t begin : missionOffsets) {
+            size_t end = data.size();
+            for (uint32_t candidate : missionOffsets)
+                if (candidate > begin && candidate < end) end = candidate;
+            const auto candidate = identifyScmDialect(data, begin, end);
+            if (candidate == StorylandScmDialect::Unknown) continue;
+            if (nativeHeader.dialect != StorylandScmDialect::Unknown && nativeHeader.dialect != candidate) {
+                conflicting = true;
+                break;
+            }
+            nativeHeader.dialect = candidate;
+        }
+        if (conflicting) nativeHeader.dialect = StorylandScmDialect::Unknown;
+    }
+
     nativeMissionRows.reserve(missionOffsets.size());
     for (size_t index = 0; index < missionOffsets.size(); ++index) {
         uint32_t begin = missionOffsets[index];
@@ -385,8 +554,11 @@ void StorylandScmFile::parseNativeHeader() {
         mission.binaryOffset = begin;
         mission.binarySize = end - begin;
         mission.hasBinaryRange = true;
+        if(nativeHeader.dialect!=StorylandScmDialect::Unknown)
+            identifyMission(data,nativeHeader.dialect==StorylandScmDialect::Vcs,mission);
         nativeMissionRows.push_back(std::move(mission));
     }
+    applyRetailMissionTitles(StorylandGxtFile{});
 }
 
 void StorylandScmFile::parseMissions() {
@@ -472,4 +644,46 @@ void StorylandScmFile::parseMissions() {
     std::sort(missionRows.begin(), missionRows.end(), [](const StorylandScmMission& a, const StorylandScmMission& b) {
         return a.id < b.id;
     });
+}
+
+void StorylandScmFile::applyRetailMissionTitles(const StorylandGxtFile& text) {
+    std::map<std::string,std::string> titles;
+    for(size_t index=0;index<text.entries().size();++index) {
+        const auto& entry=text.entries()[index];
+        if(entry.table>=text.tables().size()||text.tables()[entry.table].name!="MAIN")continue;
+        titles.emplace(entry.key,storylandReadableMissionTitle(text.text(index)));
+    }
+    auto apply=[&](auto& rows) {
+        for(auto& row:rows) {
+            std::string key=row.textTable.empty()?row.scriptName:row.textTable;
+            if(key.empty())continue;
+            if(nativeHeader.dialect==StorylandScmDialect::Vcs) {
+                const auto catalog=std::find_if(std::begin(storylandVcsMissionTitles),std::end(storylandVcsMissionTitles),
+                    [&](const auto& entry) {
+                        return storylandMissionTitleKey(entry.identity)==storylandMissionTitleKey(key) ||
+                            (!row.scriptName.empty() &&
+                                storylandMissionTitleKey(entry.identity)==storylandMissionTitleKey(row.scriptName));
+                    });
+                if(catalog!=std::end(storylandVcsMissionTitles)) {
+                    std::string resolved;
+                    std::istringstream keys(catalog->textKeys);
+                    std::string alias;
+                    bool complete=true;
+                    while(std::getline(keys,alias,'|')) {
+                        const auto found=titles.find(alias);
+                        if(found==titles.end()||found->second.empty()) {complete=false;break;}
+                        if(!resolved.empty())resolved+=" / ";
+                        resolved+=found->second;
+                    }
+                    row.name=complete&&!resolved.empty()?resolved:catalog->english;
+                    row.category=catalog->category;
+                    continue;
+                }
+                key=storylandMissionTitleKey(key);
+            }
+            auto found=titles.find(key);
+            if(found!=titles.end()&&!found->second.empty()) {row.name=found->second;if(row.category!="Activity")row.category="Mission";}
+        }
+    };
+    apply(nativeMissionRows);apply(missionRows);
 }

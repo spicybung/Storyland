@@ -14,6 +14,11 @@ struct StorylandAnalysisGraphNode {
     std::string description;
 };
 
+struct StorylandAnalysisGraphEdge {
+    size_t source = 0, target = 0;
+    uint64_t pointerOffset = 0;
+};
+
 class StorylandAnalysisGraph {
 public:
     bool build(
@@ -24,10 +29,13 @@ public:
 
     const std::vector<StorylandAnalysisGraphNode>& nodes() const;
     const std::string& summary() const;
+    const std::vector<StorylandAnalysisGraphEdge>& edges() const;
 
 private:
     std::vector<StorylandAnalysisGraphNode> graphNodes;
     std::string graphSummary;
+    std::vector<StorylandAnalysisGraphEdge> graphEdges;
+    bool buildNativeChunk(const std::vector<uint8_t>& bytes, const std::string& displayName, std::string& errorMessage);
 
     int addNode(
         int parent,

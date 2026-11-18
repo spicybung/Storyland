@@ -1,0 +1,502 @@
+{
+  "format": "storyland_approved_voice_lines",
+  "format_version": 1,
+  "policy_id": "storyland.generated_multilingual.strict.v2",
+  "note": "The original 36 English example lines are preserved. Twenty reviewed Russian translations of the user-supplied DIAC3 opening cues and two Russian translations of authored Jerry Martinez examples are included. DIAC3 retail timing and source provenance are in vcs_domo_russian_opening.json; the Martinez examples are not retail cutscene dialogue. No automatic retail playback hook is implied by catalogue inclusion.",
+  "lines": [
+    {
+      "id": "vcs.victor_vance.example.01",
+      "profile_id": "vcs.victor_vance",
+      "emotion": "neutral",
+      "text": "Keep your head down. I will get us out of here.",
+      "catalogue_status": "included",
+      "origin": "newly_authored_example_not_retail_dialogue"
+    },
+    {
+      "id": "vcs.victor_vance.example.02",
+      "profile_id": "vcs.victor_vance",
+      "emotion": "urgent",
+      "text": "Shit. Get in the car. We need to move.",
+      "catalogue_status": "included",
+      "origin": "newly_authored_example_not_retail_dialogue"
+    },
+    {
+      "id": "vcs.lance_vance.example.01",
+      "profile_id": "vcs.lance_vance",
+      "emotion": "neutral",
+      "text": "Come on, Vic. This could be our way out.",
+      "catalogue_status": "included",
+      "origin": "newly_authored_example_not_retail_dialogue"
+    },
+    {
+      "id": "vcs.lance_vance.example.02",
+      "profile_id": "vcs.lance_vance",
+      "emotion": "urgent",
+      "text": "Fuck. That was not part of the plan.",
+      "catalogue_status": "included",
+      "origin": "newly_authored_example_not_retail_dialogue"
+    },
+    {
+      "id": "vcs.jerry_martinez.example.01",
+      "profile_id": "vcs.jerry_martinez",
+      "emotion": "neutral",
+      "text": "You have your orders. Do not make this complicated.",
+      "catalogue_status": "included",
+      "origin": "newly_authored_example_not_retail_dialogue"
+    },
+    {
+      "id": "vcs.jerry_martinez.example.02",
+      "profile_id": "vcs.jerry_martinez",
+      "emotion": "urgent",
+      "text": "Get the vehicle back here. Move.",
+      "catalogue_status": "included",
+      "origin": "newly_authored_example_not_retail_dialogue"
+    },
+    {
+      "id": "vcs.phil_cassidy.example.01",
+      "profile_id": "vcs.phil_cassidy",
+      "emotion": "neutral",
+      "text": "Keep it steady. We are not done yet.",
+      "catalogue_status": "included",
+      "origin": "newly_authored_example_not_retail_dialogue"
+    },
+    {
+      "id": "vcs.phil_cassidy.example.02",
+      "profile_id": "vcs.phil_cassidy",
+      "emotion": "urgent",
+      "text": "Shit. Stay clear of that fuel tank.",
+      "catalogue_status": "included",
+      "origin": "newly_authored_example_not_retail_dialogue"
+    },
+    {
+      "id": "vcs.louise_cassidy_williams.example.01",
+      "profile_id": "vcs.louise_cassidy_williams",
+      "emotion": "neutral",
+      "text": "We can talk when we get somewhere safe.",
+      "catalogue_status": "included",
+      "origin": "newly_authored_example_not_retail_dialogue"
+    },
+    {
+      "id": "vcs.louise_cassidy_williams.example.02",
+      "profile_id": "vcs.louise_cassidy_williams",
+      "emotion": "urgent",
+      "text": "Victor, please. We need to leave now.",
+      "catalogue_status": "included",
+      "origin": "newly_authored_example_not_retail_dialogue"
+    },
+    {
+      "id": "vcs.marty_jay_williams.example.01",
+      "profile_id": "vcs.marty_jay_williams",
+      "emotion": "neutral",
+      "text": "I said I would handle it. Stay out of the way.",
+      "catalogue_status": "included",
+      "origin": "newly_authored_example_not_retail_dialogue"
+    },
+    {
+      "id": "vcs.marty_jay_williams.example.02",
+      "profile_id": "vcs.marty_jay_williams",
+      "emotion": "urgent",
+      "text": "Get back here. I am not finished.",
+      "catalogue_status": "included",
+      "origin": "newly_authored_example_not_retail_dialogue"
+    },
+    {
+      "id": "vcs.armando_mendez.example.01",
+      "profile_id": "vcs.armando_mendez",
+      "emotion": "neutral",
+      "text": "A good arrangement depends on trust.",
+      "catalogue_status": "included",
+      "origin": "newly_authored_example_not_retail_dialogue"
+    },
+    {
+      "id": "vcs.armando_mendez.example.02",
+      "profile_id": "vcs.armando_mendez",
+      "emotion": "urgent",
+      "text": "We should settle this before it becomes expensive.",
+      "catalogue_status": "included",
+      "origin": "newly_authored_example_not_retail_dialogue"
+    },
+    {
+      "id": "vcs.diego_mendez.example.01",
+      "profile_id": "vcs.diego_mendez",
+      "emotion": "neutral",
+      "text": "You have been given an answer.",
+      "catalogue_status": "included",
+      "origin": "newly_authored_example_not_retail_dialogue"
+    },
+    {
+      "id": "vcs.diego_mendez.example.02",
+      "profile_id": "vcs.diego_mendez",
+      "emotion": "urgent",
+      "text": "Leave the vehicle. Walk away.",
+      "catalogue_status": "included",
+      "origin": "newly_authored_example_not_retail_dialogue"
+    },
+    {
+      "id": "vcs.ricardo_diaz.example.01",
+      "profile_id": "vcs.ricardo_diaz",
+      "emotion": "neutral",
+      "text": "I paid for a result, not an excuse.",
+      "catalogue_status": "included",
+      "origin": "newly_authored_example_not_retail_dialogue"
+    },
+    {
+      "id": "vcs.ricardo_diaz.example.02",
+      "profile_id": "vcs.ricardo_diaz",
+      "emotion": "urgent",
+      "text": "Shit. They are getting away. Go.",
+      "catalogue_status": "included",
+      "origin": "newly_authored_example_not_retail_dialogue"
+    },
+    {
+      "id": "vcs.reni_wassulmaier.example.01",
+      "profile_id": "vcs.reni_wassulmaier",
+      "emotion": "neutral",
+      "text": "Wonderful. Now give me something worth remembering.",
+      "catalogue_status": "included",
+      "origin": "newly_authored_example_not_retail_dialogue"
+    },
+    {
+      "id": "vcs.reni_wassulmaier.example.02",
+      "profile_id": "vcs.reni_wassulmaier",
+      "emotion": "urgent",
+      "text": "No, no. We need to move before the light changes.",
+      "catalogue_status": "included",
+      "origin": "newly_authored_example_not_retail_dialogue"
+    },
+    {
+      "id": "vcs.umberto_robina.example.01",
+      "profile_id": "vcs.umberto_robina",
+      "emotion": "neutral",
+      "text": "You came through for us. I will remember that.",
+      "catalogue_status": "included",
+      "origin": "newly_authored_example_not_retail_dialogue"
+    },
+    {
+      "id": "vcs.umberto_robina.example.02",
+      "profile_id": "vcs.umberto_robina",
+      "emotion": "urgent",
+      "text": "Get everyone inside. We are leaving together.",
+      "catalogue_status": "included",
+      "origin": "newly_authored_example_not_retail_dialogue"
+    },
+    {
+      "id": "vcs.bryan_forbes.example.01",
+      "profile_id": "vcs.bryan_forbes",
+      "emotion": "neutral",
+      "text": "Easy. There is no reason this has to go wrong.",
+      "catalogue_status": "included",
+      "origin": "newly_authored_example_not_retail_dialogue"
+    },
+    {
+      "id": "vcs.bryan_forbes.example.02",
+      "profile_id": "vcs.bryan_forbes",
+      "emotion": "urgent",
+      "text": "Wait. Let me explain before you do anything.",
+      "catalogue_status": "included",
+      "origin": "newly_authored_example_not_retail_dialogue"
+    },
+    {
+      "id": "vcs.gonzalez.example.01",
+      "profile_id": "vcs.gonzalez",
+      "emotion": "neutral",
+      "text": "The delivery arrives tonight. Be ready.",
+      "catalogue_status": "included",
+      "origin": "newly_authored_example_not_retail_dialogue"
+    },
+    {
+      "id": "vcs.gonzalez.example.02",
+      "profile_id": "vcs.gonzalez",
+      "emotion": "urgent",
+      "text": "Take the package and get out of sight.",
+      "catalogue_status": "included",
+      "origin": "newly_authored_example_not_retail_dialogue"
+    },
+    {
+      "id": "vcs.barry_mickelthwaite.example.01",
+      "profile_id": "vcs.barry_mickelthwaite",
+      "emotion": "neutral",
+      "text": "Everything is under control. More or less.",
+      "catalogue_status": "included",
+      "origin": "newly_authored_example_not_retail_dialogue"
+    },
+    {
+      "id": "vcs.barry_mickelthwaite.example.02",
+      "profile_id": "vcs.barry_mickelthwaite",
+      "emotion": "urgent",
+      "text": "Shit. Please tell me you have another car.",
+      "catalogue_status": "included",
+      "origin": "newly_authored_example_not_retail_dialogue"
+    },
+    {
+      "id": "vcs.mary_jo_cassidy.example.01",
+      "profile_id": "vcs.mary_jo_cassidy",
+      "emotion": "neutral",
+      "text": "She needs help, not another promise.",
+      "catalogue_status": "included",
+      "origin": "newly_authored_example_not_retail_dialogue"
+    },
+    {
+      "id": "vcs.mary_jo_cassidy.example.02",
+      "profile_id": "vcs.mary_jo_cassidy",
+      "emotion": "urgent",
+      "text": "Go and find her. I will stay here.",
+      "catalogue_status": "included",
+      "origin": "newly_authored_example_not_retail_dialogue"
+    },
+    {
+      "id": "vcs.alberto_robina.example.01",
+      "profile_id": "vcs.alberto_robina",
+      "emotion": "neutral",
+      "text": "There is no need to hurry on my account.",
+      "catalogue_status": "included",
+      "origin": "newly_authored_example_not_retail_dialogue"
+    },
+    {
+      "id": "vcs.alberto_robina.example.02",
+      "profile_id": "vcs.alberto_robina",
+      "emotion": "urgent",
+      "text": "Careful with that turn. Keep your eyes on the road.",
+      "catalogue_status": "included",
+      "origin": "newly_authored_example_not_retail_dialogue"
+    },
+    {
+      "id": "vcs.janet_vance.example.01",
+      "profile_id": "vcs.janet_vance",
+      "emotion": "neutral",
+      "text": "I came to see how you were doing.",
+      "catalogue_status": "included",
+      "origin": "newly_authored_example_not_retail_dialogue"
+    },
+    {
+      "id": "vcs.janet_vance.example.02",
+      "profile_id": "vcs.janet_vance",
+      "emotion": "urgent",
+      "text": "Wait a moment. I have not finished talking.",
+      "catalogue_status": "included",
+      "origin": "newly_authored_example_not_retail_dialogue"
+    },
+    {
+      "id": "vcs.phil_collins_standin.example.01",
+      "profile_id": "vcs.phil_collins_standin",
+      "emotion": "neutral",
+      "text": "Let us get everyone somewhere safe.",
+      "catalogue_status": "included",
+      "origin": "newly_authored_example_not_retail_dialogue"
+    },
+    {
+      "id": "vcs.phil_collins_standin.example.02",
+      "profile_id": "vcs.phil_collins_standin",
+      "emotion": "urgent",
+      "text": "We should leave now. The car is outside.",
+      "catalogue_status": "included",
+      "origin": "newly_authored_example_not_retail_dialogue"
+    },
+    {
+      "id": "vcs.domo_arigato.opening.ru.001",
+      "profile_id": "vcs.ricardo_diaz",
+      "emotion": "neutral",
+      "text": "Ну что, договорились, Кью?",
+      "language": "ru",
+      "catalogue_status": "included",
+      "origin": "reviewed_russian_translation_of_user_supplied_vcs_ps2_DIAC3.CUT"
+    },
+    {
+      "id": "vcs.domo_arigato.opening.ru.002",
+      "profile_id": "vcs.lance_vance",
+      "emotion": "neutral",
+      "text": "Договорились, детка! Вернём всё, что заняли, плюс двадцать пять процентов в неделю, или будем работать на тебя.",
+      "language": "ru",
+      "catalogue_status": "included",
+      "origin": "reviewed_russian_translation_of_user_supplied_vcs_ps2_DIAC3.CUT"
+    },
+    {
+      "id": "vcs.domo_arigato.opening.ru.003",
+      "profile_id": "vcs.ricardo_diaz",
+      "emotion": "neutral",
+      "text": "Да... За здоровье.",
+      "language": "ru",
+      "catalogue_status": "included",
+      "origin": "reviewed_russian_translation_of_user_supplied_vcs_ps2_DIAC3.CUT"
+    },
+    {
+      "id": "vcs.domo_arigato.opening.ru.004",
+      "profile_id": "vcs.lance_vance",
+      "emotion": "neutral",
+      "text": "За здоровье.",
+      "language": "ru",
+      "catalogue_status": "included",
+      "origin": "reviewed_russian_translation_of_user_supplied_vcs_ps2_DIAC3.CUT"
+    },
+    {
+      "id": "vcs.domo_arigato.opening.ru.005",
+      "profile_id": "vcs.lance_vance",
+      "emotion": "neutral",
+      "text": "Хорошая штука.",
+      "language": "ru",
+      "catalogue_status": "included",
+      "origin": "reviewed_russian_translation_of_user_supplied_vcs_ps2_DIAC3.CUT"
+    },
+    {
+      "id": "vcs.domo_arigato.opening.ru.006",
+      "profile_id": "vcs.ricardo_diaz",
+      "emotion": "neutral",
+      "text": "Или я забью вас с братцем тупым предметом. Вик, мы как раз о тебе говорили.",
+      "language": "ru",
+      "catalogue_status": "included",
+      "origin": "reviewed_russian_translation_of_user_supplied_vcs_ps2_DIAC3.CUT"
+    },
+    {
+      "id": "vcs.domo_arigato.opening.ru.007",
+      "profile_id": "vcs.victor_vance",
+      "emotion": "neutral",
+      "text": "Да?",
+      "language": "ru",
+      "catalogue_status": "included",
+      "origin": "reviewed_russian_translation_of_user_supplied_vcs_ps2_DIAC3.CUT"
+    },
+    {
+      "id": "vcs.domo_arigato.opening.ru.008",
+      "profile_id": "vcs.ricardo_diaz",
+      "emotion": "neutral",
+      "text": "Да... Как вы вернёте взятые у меня деньги.",
+      "language": "ru",
+      "catalogue_status": "included",
+      "origin": "reviewed_russian_translation_of_user_supplied_vcs_ps2_DIAC3.CUT"
+    },
+    {
+      "id": "vcs.domo_arigato.opening.ru.009",
+      "profile_id": "vcs.victor_vance",
+      "emotion": "angry",
+      "text": "Какие ещё деньги? О чём он говорит?",
+      "language": "ru",
+      "catalogue_status": "included",
+      "origin": "reviewed_russian_translation_of_user_supplied_vcs_ps2_DIAC3.CUT"
+    },
+    {
+      "id": "vcs.domo_arigato.opening.ru.010",
+      "profile_id": "vcs.lance_vance",
+      "emotion": "reassuring",
+      "text": "Я занял нам денег у Рикардо. Мы всё вернём, ясно?",
+      "language": "ru",
+      "catalogue_status": "included",
+      "origin": "reviewed_russian_translation_of_user_supplied_vcs_ps2_DIAC3.CUT"
+    },
+    {
+      "id": "vcs.domo_arigato.opening.ru.011",
+      "profile_id": "vcs.victor_vance",
+      "emotion": "angry",
+      "text": "Что ты опять натворил?",
+      "language": "ru",
+      "catalogue_status": "included",
+      "origin": "reviewed_russian_translation_of_user_supplied_vcs_ps2_DIAC3.CUT"
+    },
+    {
+      "id": "vcs.domo_arigato.opening.ru.012",
+      "profile_id": "vcs.lance_vance",
+      "emotion": "neutral",
+      "text": "Я вложил их обратно в дело.",
+      "language": "ru",
+      "catalogue_status": "included",
+      "origin": "reviewed_russian_translation_of_user_supplied_vcs_ps2_DIAC3.CUT"
+    },
+    {
+      "id": "vcs.domo_arigato.opening.ru.013",
+      "profile_id": "vcs.lance_vance",
+      "emotion": "reassuring",
+      "text": "Прости, Рикардо, детка, но братья иногда любят показать, кто тут главный.",
+      "language": "ru",
+      "catalogue_status": "included",
+      "origin": "reviewed_russian_translation_of_user_supplied_vcs_ps2_DIAC3.CUT"
+    },
+    {
+      "id": "vcs.domo_arigato.opening.ru.014",
+      "profile_id": "vcs.ricardo_diaz",
+      "emotion": "neutral",
+      "text": "Знаю... Потому я своего и убил. Парни, спокойно.",
+      "language": "ru",
+      "catalogue_status": "included",
+      "origin": "reviewed_russian_translation_of_user_supplied_vcs_ps2_DIAC3.CUT"
+    },
+    {
+      "id": "vcs.domo_arigato.opening.ru.015",
+      "profile_id": "vcs.ricardo_diaz",
+      "emotion": "neutral",
+      "text": "Просто сделайте для меня то дело, и всё будет хорошо. Пока что.",
+      "language": "ru",
+      "catalogue_status": "included",
+      "origin": "reviewed_russian_translation_of_user_supplied_vcs_ps2_DIAC3.CUT"
+    },
+    {
+      "id": "vcs.domo_arigato.opening.ru.016",
+      "profile_id": "vcs.victor_vance",
+      "emotion": "urgent",
+      "text": "О чём он говорит?",
+      "language": "ru",
+      "catalogue_status": "included",
+      "origin": "reviewed_russian_translation_of_user_supplied_vcs_ps2_DIAC3.CUT"
+    },
+    {
+      "id": "vcs.domo_arigato.opening.ru.017",
+      "profile_id": "vcs.lance_vance",
+      "emotion": "reassuring",
+      "text": "Слушай, Рикардо хочет, чтобы мы уничтожили все облигации Армандо Мендеса на предъявителя.",
+      "language": "ru",
+      "catalogue_status": "included",
+      "origin": "reviewed_russian_translation_of_user_supplied_vcs_ps2_DIAC3.CUT"
+    },
+    {
+      "id": "vcs.domo_arigato.opening.ru.018",
+      "profile_id": "vcs.lance_vance",
+      "emotion": "reassuring",
+      "text": "Знаю, звучит рискованно, но... Доверься мне! Всё схвачено... Я ведь уже миллион раз так делал.",
+      "language": "ru",
+      "catalogue_status": "included",
+      "origin": "reviewed_russian_translation_of_user_supplied_vcs_ps2_DIAC3.CUT"
+    },
+    {
+      "id": "vcs.domo_arigato.opening.ru.019",
+      "profile_id": "vcs.lance_vance",
+      "emotion": "quiet",
+      "text": "Давай просто зажжём, детка... Ну, знаешь... Просто... зажжём.",
+      "language": "ru",
+      "catalogue_status": "included",
+      "origin": "reviewed_russian_translation_of_user_supplied_vcs_ps2_DIAC3.CUT"
+    },
+    {
+      "id": "vcs.domo_arigato.opening.ru.020",
+      "profile_id": "vcs.victor_vance",
+      "emotion": "neutral",
+      "text": "Видно, справляться мне одному.",
+      "language": "ru",
+      "catalogue_status": "included",
+      "origin": "reviewed_russian_translation_of_user_supplied_vcs_ps2_DIAC3.CUT"
+    },
+    {
+      "id": "vcs.jerry_martinez.example.ru.01",
+      "profile_id": "vcs.jerry_martinez",
+      "emotion": "neutral",
+      "text": "Приказ ты получил. Не усложняй.",
+      "catalogue_status": "included",
+      "origin": "reviewed_russian_translation_of_authored_example_not_retail_dialogue",
+      "source_line_id": "vcs.jerry_martinez.example.01",
+      "language": "ru",
+      "translation_notes": [
+        "Short, dry military phrasing preserves the authored instruction; delivery is controlled rather than shouted. No additional profanity."
+      ]
+    },
+    {
+      "id": "vcs.jerry_martinez.example.ru.02",
+      "profile_id": "vcs.jerry_martinez",
+      "emotion": "urgent",
+      "text": "Верни машину сюда. Живо.",
+      "catalogue_status": "included",
+      "origin": "reviewed_russian_translation_of_authored_example_not_retail_dialogue",
+      "source_line_id": "vcs.jerry_martinez.example.02",
+      "language": "ru",
+      "translation_notes": [
+        "Short, dry military phrasing preserves the authored instruction; delivery is controlled rather than shouted. No additional profanity."
+      ]
+    }
+  ]
+}

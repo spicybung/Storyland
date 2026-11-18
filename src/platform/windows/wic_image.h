@@ -1,5 +1,5 @@
 #pragma once
-#include "leeds_texture.h"
+#include "src/leeds/leeds_texture.h"
 #include <string>
 
 bool loadImageWithWic(const std::wstring& path, RgbaImage& image, std::string& errorMessage);

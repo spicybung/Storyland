@@ -1,0 +1,4 @@
+pip==25.0.1
+setuptools==78.1.0
+wheel==0.45.1
+uv_build==0.12.7

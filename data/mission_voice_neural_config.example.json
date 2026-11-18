@@ -1,0 +1,26 @@
+{
+  "format": "storyland_neural_voice_config",
+  "format_version": 1,
+  "code_directory": "vendor/chatterbox",
+  "model_directory": "models/chatterbox-multilingual-v3",
+  "catalogue": "vcs_approved_voice_lines.json",
+  "profiles": {
+    "vcs.victor_vance": {
+      "reference_audio": "references/vcs.victor_vance.wav"
+    },
+    "vcs.lance_vance": {
+      "reference_audio": "references/vcs.lance_vance.wav"
+    },
+    "vcs.ricardo_diaz": {
+      "reference_audio": "references/vcs.ricardo_diaz.wav"
+    },
+    "vcs.jerry_martinez": {
+      "reference_audio": "references/vcs.jerry_martinez.wav"
+    }
+  },
+  "device": "cpu",
+  "cpu_threads": 4,
+  "seed": 20261109,
+  "t3_model": "v3",
+  "code_revision": "ab55923c27757c90cfcc407baa57dc25a7d25217"
+}

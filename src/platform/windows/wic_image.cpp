@@ -1,6 +1,6 @@
-#include "wic_image.h"
+#include "src/platform/windows/wic_image.h"
 
-#include <Windows.h>
+#include <windows.h>
 #include <wincodec.h>
 #include <comdef.h>
 #include <sstream>

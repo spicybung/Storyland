@@ -1,5 +1,5 @@
-#include "storyland_gxt.h"
-#include "storyland_atomic_io.h"
+#include "src/storyland/storyland_gxt.h"
+#include "src/storyland/storyland_atomic_io.h"
 #include <algorithm>
 #include <cstring>
 #include <fstream>
@@ -40,6 +40,24 @@ const uint16_t windows1252[32] = {
     0x90,0x2018,0x2019,0x201C,0x201D,0x2022,0x2013,0x2014,
     0x2DC,0x2122,0x161,0x203A,0x153,0x9D,0x17E,0x178
 };
+const uint16_t windows1251[128] = {
+    0x0402,0x0403,0x201A,0x0453,0x201E,0x2026,0x2020,0x2021,
+    0x20AC,0x2030,0x0409,0x2039,0x040A,0x040C,0x040B,0x040F,
+    0x0452,0x2018,0x2019,0x201C,0x201D,0x2022,0x2013,0x2014,
+    0x0098,0x2122,0x0459,0x203A,0x045A,0x045C,0x045B,0x045F,
+    0x00A0,0x040E,0x045E,0x0408,0x00A4,0x0490,0x00A6,0x00A7,
+    0x0401,0x00A9,0x0404,0x00AB,0x00AC,0x00AD,0x00AE,0x0407,
+    0x00B0,0x00B1,0x0406,0x0456,0x0491,0x00B5,0x00B6,0x00B7,
+    0x0451,0x2116,0x0454,0x00BB,0x0458,0x0405,0x0455,0x0457,
+    0x0410,0x0411,0x0412,0x0413,0x0414,0x0415,0x0416,0x0417,
+    0x0418,0x0419,0x041A,0x041B,0x041C,0x041D,0x041E,0x041F,
+    0x0420,0x0421,0x0422,0x0423,0x0424,0x0425,0x0426,0x0427,
+    0x0428,0x0429,0x042A,0x042B,0x042C,0x042D,0x042E,0x042F,
+    0x0430,0x0431,0x0432,0x0433,0x0434,0x0435,0x0436,0x0437,
+    0x0438,0x0439,0x043A,0x043B,0x043C,0x043D,0x043E,0x043F,
+    0x0440,0x0441,0x0442,0x0443,0x0444,0x0445,0x0446,0x0447,
+    0x0448,0x0449,0x044A,0x044B,0x044C,0x044D,0x044E,0x044F
+};
 const uint16_t lcsTail[32] = {
     0x20AC,0x201A,0x201E,0x2C6,0x2039,0x152,0x2018,0x2019,
     0x201C,0x201D,0x2DC,0x2122,0x203A,0x153,0x178,0xA1,
@@ -50,6 +68,8 @@ uint16_t decode(uint16_t value, StorylandGxtEncoding encoding) {
     if (encoding == StorylandGxtEncoding::LcsFont) {
         if (value >= 0x80 && value <= 0xBF) return uint16_t(value + 0x40);
         if (value >= 0xC0 && value <= 0xDF) return lcsTail[value - 0xC0];
+    } else if (encoding == StorylandGxtEncoding::Windows1251 && value >= 0x80 && value <= 0xFF) {
+        return windows1251[value - 0x80];
     } else if (encoding == StorylandGxtEncoding::Windows1252 && value >= 0x80 && value <= 0x9F) {
         return windows1252[value - 0x80];
     }
@@ -195,7 +215,8 @@ std::u16string StorylandGxtFile::text(size_t index) const {
             continue;
         }
         const uint16_t displayed = decode(value, encoding_);
-        const bool outsideFont = encoding_ != StorylandGxtEncoding::Unicode && (value > 255 || (encoding_ == StorylandGxtEncoding::LcsFont && value >= 0xE0));
+        const bool nativeCyrillic = encoding_ == StorylandGxtEncoding::Windows1251 && value >= 0x0400 && value <= 0x052F;
+        const bool outsideFont = encoding_ != StorylandGxtEncoding::Unicode && !nativeCyrillic && (value > 255 || (encoding_ == StorylandGxtEncoding::LcsFont && value >= 0xE0));
         if (outsideFont || displayed == 0x7F || (displayed >= 0x80 && displayed <= 0x9F) || value == 0 ||
             (value < 32 && value != 10 && value != 9) || value >= 0xFEEF || (value >= 0xD800 && value <= 0xDFFF)) {
             appendEscape(result, value);
@@ -203,6 +224,24 @@ std::u16string StorylandGxtFile::text(size_t index) const {
     }
     return result;
 }
+bool StorylandGxtFile::lookup(const std::string& key, const std::string& preferredTable,
+    std::u16string& value) const {
+    value.clear();
+    size_t mainEntry=entries_.size(),otherEntry=entries_.size();
+    size_t otherMatches=0;
+    for(size_t index=0;index<entries_.size();++index) {
+        const auto& entry=entries_[index];
+        if(entry.key!=key||entry.table>=tables_.size())continue;
+        const auto& table=tables_[entry.table].name;
+        if(!preferredTable.empty()&&table==preferredTable) {value=text(index);return true;}
+        if(table=="MAIN")mainEntry=index;
+        otherEntry=index;++otherMatches;
+    }
+    if(mainEntry<entries_.size()) {value=text(mainEntry);return true;}
+    if(otherMatches==1) {value=text(otherEntry);return true;}
+    return false;
+}
+
 bool StorylandGxtFile::setText(size_t index, const std::u16string& text, std::string& error) {
     if (index >= entries_.size()) { error = "No GXT string selected."; return false; }
     std::u16string units;
@@ -227,6 +266,7 @@ bool StorylandGxtFile::setText(size_t index, const std::u16string& text, std::st
                 for (unsigned raw = 1; raw < 256; ++raw) {
                     if (decode(uint16_t(raw), encoding_) == value) { value = uint16_t(raw); found = true; break; }
                 }
+                if (!found && encoding_ == StorylandGxtEncoding::Windows1251 && value >= 0x0400 && value <= 0x052F) found = true;
                 if (!found) { error = "Character unavailable in this font. Choose Unicode or use ~#XXXX~ for a raw code."; return false; }
             }
         }

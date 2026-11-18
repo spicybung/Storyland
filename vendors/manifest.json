@@ -1,0 +1,317 @@
+{
+  "format": 2,
+  "scope": "Essential editable Storyland vendor build inputs",
+  "path_base": "vendors",
+  "bundles": {
+    "sdl2": {
+      "root": "SDL2",
+      "required_files": [
+        "CMakeLists.txt",
+        "include/SDL.h",
+        "src/SDL.c",
+        "LICENSE.txt",
+        "android-project/app/src/main/java/org/libsdl/app/SDLActivity.java"
+      ]
+    },
+    "ffmpeg-source": {
+      "root": "ffmpeg/source",
+      "required_files": [
+        "configure",
+        "Makefile",
+        "libavcodec/avcodec.h",
+        "libavformat/avformat.h",
+        "libavutil/avutil.h",
+        "libswscale/swscale.h",
+        "LICENSE.md",
+        "COPYING.GPLv2",
+        "COPYING.GPLv3",
+        "COPYING.LGPLv2.1",
+        "COPYING.LGPLv3"
+      ]
+    },
+    "ffmpeg-android": {
+      "root": "ffmpeg/android",
+      "required_files": [
+        "arm64-v8a/lib/libavcodec.a",
+        "arm64-v8a/lib/libavformat.a",
+        "arm64-v8a/lib/libavutil.a",
+        "arm64-v8a/lib/libswscale.a",
+        "arm64-v8a/include/libavcodec/avcodec.h",
+        "arm64-v8a/include/libavformat/avformat.h",
+        "arm64-v8a/include/libavutil/avutil.h",
+        "arm64-v8a/include/libswscale/swscale.h"
+      ]
+    },
+    "espeak-ng": {
+      "root": "espeak-ng",
+      "required_files": [
+        "runtime-provenance.json",
+        "sources/source-provenance.json",
+        "licenses/GPL-3.txt",
+        "licenses/COPYRIGHT-espeak-ng.txt",
+        "linux/libespeak-ng.so.1",
+        "linux/libpcaudio.so.0",
+        "linux/libsonic.so.0",
+        "windows/libespeak-ng.dll",
+        "linux/espeak-ng-data/phondata",
+        "linux/espeak-ng-data/phonindex",
+        "linux/espeak-ng-data/phontab",
+        "linux/espeak-ng-data/en_dict",
+        "windows/espeak-ng-data/phondata",
+        "windows/espeak-ng-data/phonindex",
+        "windows/espeak-ng-data/phontab",
+        "windows/espeak-ng-data/en_dict"
+      ]
+    },
+    "lua": {
+      "root": "lua",
+      "required_files": [
+        "STORYLAND_SOURCE.md",
+        "doc/readme.html",
+        "src/Makefile",
+        "src/lapi.c",
+        "src/lapi.h",
+        "src/lauxlib.c",
+        "src/lauxlib.h",
+        "src/lbaselib.c",
+        "src/lcode.c",
+        "src/lcode.h",
+        "src/lcorolib.c",
+        "src/lctype.c",
+        "src/lctype.h",
+        "src/ldblib.c",
+        "src/ldebug.c",
+        "src/ldebug.h",
+        "src/ldo.c",
+        "src/ldo.h",
+        "src/ldump.c",
+        "src/lfunc.c",
+        "src/lfunc.h",
+        "src/lgc.c",
+        "src/lgc.h",
+        "src/linit.c",
+        "src/liolib.c",
+        "src/ljumptab.h",
+        "src/llex.c",
+        "src/llex.h",
+        "src/llimits.h",
+        "src/lmathlib.c",
+        "src/lmem.c",
+        "src/lmem.h",
+        "src/loadlib.c",
+        "src/lobject.c",
+        "src/lobject.h",
+        "src/lopcodes.c",
+        "src/lopcodes.h",
+        "src/lopnames.h",
+        "src/loslib.c",
+        "src/lparser.c",
+        "src/lparser.h",
+        "src/lprefix.h",
+        "src/lstate.c",
+        "src/lstate.h",
+        "src/lstring.c",
+        "src/lstring.h",
+        "src/lstrlib.c",
+        "src/ltable.c",
+        "src/ltable.h",
+        "src/ltablib.c",
+        "src/ltm.c",
+        "src/ltm.h",
+        "src/lua.c",
+        "src/lua.h",
+        "src/lua.hpp",
+        "src/luac.c",
+        "src/luaconf.h",
+        "src/lualib.h",
+        "src/lundump.c",
+        "src/lundump.h",
+        "src/lutf8lib.c",
+        "src/lvm.c",
+        "src/lvm.h",
+        "src/lzio.c",
+        "src/lzio.h"
+      ]
+    },
+    "opensubdiv": {
+      "root": "opensubdiv",
+      "required_files": [
+        "LICENSE.txt",
+        "NOTICE.txt",
+        "UPSTREAM",
+        "opensubdiv/far/bilinearPatchBuilder.cpp",
+        "opensubdiv/far/bilinearPatchBuilder.h",
+        "opensubdiv/far/catmarkPatchBuilder.cpp",
+        "opensubdiv/far/catmarkPatchBuilder.h",
+        "opensubdiv/far/error.cpp",
+        "opensubdiv/far/error.h",
+        "opensubdiv/far/loopPatchBuilder.cpp",
+        "opensubdiv/far/loopPatchBuilder.h",
+        "opensubdiv/far/patchBasis.cpp",
+        "opensubdiv/far/patchBasis.h",
+        "opensubdiv/far/patchBuilder.cpp",
+        "opensubdiv/far/patchBuilder.h",
+        "opensubdiv/far/patchDescriptor.cpp",
+        "opensubdiv/far/patchDescriptor.h",
+        "opensubdiv/far/patchMap.cpp",
+        "opensubdiv/far/patchMap.h",
+        "opensubdiv/far/patchParam.h",
+        "opensubdiv/far/patchTable.cpp",
+        "opensubdiv/far/patchTable.h",
+        "opensubdiv/far/patchTableFactory.cpp",
+        "opensubdiv/far/patchTableFactory.h",
+        "opensubdiv/far/primvarRefiner.h",
+        "opensubdiv/far/ptexIndices.cpp",
+        "opensubdiv/far/ptexIndices.h",
+        "opensubdiv/far/sparseMatrix.h",
+        "opensubdiv/far/stencilBuilder.cpp",
+        "opensubdiv/far/stencilBuilder.h",
+        "opensubdiv/far/stencilTable.cpp",
+        "opensubdiv/far/stencilTable.h",
+        "opensubdiv/far/stencilTableFactory.cpp",
+        "opensubdiv/far/stencilTableFactory.h",
+        "opensubdiv/far/topologyDescriptor.cpp",
+        "opensubdiv/far/topologyDescriptor.h",
+        "opensubdiv/far/topologyLevel.h",
+        "opensubdiv/far/topologyRefiner.cpp",
+        "opensubdiv/far/topologyRefiner.h",
+        "opensubdiv/far/topologyRefinerFactory.cpp",
+        "opensubdiv/far/topologyRefinerFactory.h",
+        "opensubdiv/far/types.h",
+        "opensubdiv/sdc/bilinearScheme.h",
+        "opensubdiv/sdc/catmarkScheme.h",
+        "opensubdiv/sdc/crease.cpp",
+        "opensubdiv/sdc/crease.h",
+        "opensubdiv/sdc/loopScheme.h",
+        "opensubdiv/sdc/options.h",
+        "opensubdiv/sdc/scheme.h",
+        "opensubdiv/sdc/typeTraits.cpp",
+        "opensubdiv/sdc/types.h",
+        "opensubdiv/version.cpp",
+        "opensubdiv/version.h",
+        "opensubdiv/vtr/array.h",
+        "opensubdiv/vtr/componentInterfaces.h",
+        "opensubdiv/vtr/fvarLevel.cpp",
+        "opensubdiv/vtr/fvarLevel.h",
+        "opensubdiv/vtr/fvarRefinement.cpp",
+        "opensubdiv/vtr/fvarRefinement.h",
+        "opensubdiv/vtr/level.cpp",
+        "opensubdiv/vtr/level.h",
+        "opensubdiv/vtr/quadRefinement.cpp",
+        "opensubdiv/vtr/quadRefinement.h",
+        "opensubdiv/vtr/refinement.cpp",
+        "opensubdiv/vtr/refinement.h",
+        "opensubdiv/vtr/sparseSelector.cpp",
+        "opensubdiv/vtr/sparseSelector.h",
+        "opensubdiv/vtr/stackBuffer.h",
+        "opensubdiv/vtr/triRefinement.cpp",
+        "opensubdiv/vtr/triRefinement.h",
+        "opensubdiv/vtr/types.h"
+      ]
+    },
+    "chatterbox": {
+      "root": "chatterbox/source",
+      "required_files": [
+        "pyproject.toml",
+        "LICENSE",
+        "src/chatterbox/mtl_tts.py"
+      ]
+    },
+    "perth": {
+      "root": "perth",
+      "required_files": [
+        "pyproject.toml",
+        "LICENSE",
+        "src/perth/__init__.py",
+        "src/perth/perth_net/pretrained/implicit/perth_net_250000.pth.tar"
+      ]
+    },
+    "zlib": {
+      "root": "zlib",
+      "required_files": [
+        "CMakeLists.txt",
+        "zlib.h",
+        "zconf.h",
+        "adler32.c",
+        "inflate.c",
+        "LICENSE"
+      ]
+    },
+    "espeak-source": {
+      "root": "espeak-ng/source",
+      "required_files": [
+        "CMakeLists.txt",
+        "COPYING",
+        "src/include/espeak-ng/speak_lib.h",
+        "src/libespeak-ng/speech.c"
+      ]
+    },
+    "imgui": {
+      "root": "imgui",
+      "required_files": [
+        "imgui.cpp",
+        "imgui.h",
+        "LICENSE.txt"
+      ]
+    },
+    "nlohmann": {
+      "root": "nlohmann",
+      "required_files": [
+        "json.hpp",
+        "LICENSE.MIT"
+      ]
+    },
+    "mikktspace": {
+      "root": "mikktspace",
+      "required_files": [
+        "mikktspace.c",
+        "mikktspace.h"
+      ]
+    },
+    "sannybuilder": {
+      "root": "sannybuilder",
+      "required_files": [
+        "LCSSCM.INI",
+        "VCSSCM.INI"
+      ]
+    },
+    "relcs_mobile": {
+      "root": "relcs_mobile",
+      "required_files": [
+        "leedsBuilding.vert",
+        "leedsVehicle_mobile.vert"
+      ]
+    },
+    "relcs": {
+      "root": "relcs",
+      "required_files": [
+        "REFERENCE.md"
+      ]
+    },
+    "storyland_fonts": {
+      "root": "storyland_fonts",
+      "required_files": [
+        "LICENSE.txt"
+      ]
+    },
+    "chatterbox-resources": {
+      "root": "chatterbox",
+      "required_files": [
+        "runtime_manifest.json",
+        "local-runtime.patch",
+        "requirements-runtime.txt",
+        "LICENSE.chatterbox",
+        "LICENSE.perth"
+      ]
+    },
+    "integration": {
+      "root": ".",
+      "required_files": [
+        "CMakeLists.txt",
+        "README.md",
+        "storyland_imgui_config.h",
+        "ffmpeg/CMakeLists.txt"
+      ]
+    }
+  }
+}

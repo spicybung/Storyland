@@ -1,79 +1,33 @@
-#include "storyland_shaders.h"
-
-const char* storylandStoriesVertexShaderSource() {
-    return
-        "#version 120\n"
-        "varying vec4 vColor;\n"
-        "varying vec2 vTex0;\n"
-        "varying vec3 vLighting;\n"
-        "varying float vFog;\n"
-        "uniform vec3 uAmbientColor;\n"
-        "uniform vec3 uDirectionalColor;\n"
-        "uniform vec3 uSunDirection;\n"
-        "uniform float uFogStart;\n"
-        "uniform float uFarClip;\n"
-        "void main(){\n"
-        "  vec4 eyePos = gl_ModelViewMatrix * gl_Vertex;\n"
-        "  gl_Position = gl_ModelViewProjectionMatrix * gl_Vertex;\n"
-        "  vColor = gl_Color;\n"
-        "  vTex0 = gl_MultiTexCoord0.xy;\n"
-        "  // Do not derive Stories lighting from reconstructed preview normals.\n"
-        "  // Leeds strips can duplicate/split vertices and reconstructed normals\n"
-        "  // expose those boundaries as triangles and squares.  Until the retail\n"
-        "  // normal stream is decoded for the active MDL variant, use the actual\n"
-        "  // timecycle object ambient plus a uniform directional fill.\n"
-        "  // Stable Stories preview lighting: keep the timecycle colour, but do not\n"
-        "  // let low objectAmbient values crush characters into black silhouettes.\n"
-        "  // This remains uniform across the mesh, so strip/triangle boundaries cannot\n"
-        "  // reappear through reconstructed normals.\n"
-        "  vec3 directional = uDirectionalColor * 0.30;\n"
-        "  vec3 baseLight = uAmbientColor * 1.35 + directional + vec3(0.12);\n"
-        "  vLighting = clamp(baseLight, vec3(0.28), vec3(1.0));\n"
-        "  float distanceFromCamera = length(eyePos.xyz);\n"
-        "  float fogRange = max(uFarClip - uFogStart, 0.001);\n"
-        "  vFog = clamp((uFarClip - distanceFromCamera) / fogRange, 0.0, 1.0);\n"
-        "}\n";
+#include "src/shaders/storyland_shaders.h"
+#include "storyland_shader_sources.h"
+// World, skin and vehicle passes keep their own shader pairs.
+const char* storylandStoriesVertexShaderSource(bool vcs,StorylandShaderKind kind) {
+    switch(kind) {
+    case StorylandShaderKind::World:return vcs?StorylandShaderSources::vcs_world_vertex:StorylandShaderSources::lcs_world_vertex;
+    case StorylandShaderKind::Vehicle:return vcs?StorylandShaderSources::vcs_vehicle_vertex:StorylandShaderSources::lcs_vehicle_vertex;
+    case StorylandShaderKind::Pedestrian:return vcs?StorylandShaderSources::vcs_pedestrian_vertex:StorylandShaderSources::lcs_pedestrian_vertex;
+    case StorylandShaderKind::Vegetation:return vcs?StorylandShaderSources::vcs_vegetation_vertex:StorylandShaderSources::lcs_vegetation_vertex;
+    case StorylandShaderKind::Generic:return vcs?StorylandShaderSources::vcs_generic_vertex:StorylandShaderSources::lcs_generic_vertex;
+    }
+    return nullptr;
 }
-
-const char* storylandStoriesFragmentShaderSource() {
-    return
-        "#version 120\n"
-        "uniform sampler2D tex0;\n"
-        "uniform int uUseTexture;\n"
-        "uniform int uRenderMode;\n"
-        "uniform vec3 uFogColor;\n"
-        "uniform int uPrelightMode;\n"
-        "varying vec4 vColor;\n"
-        "varying vec2 vTex0;\n"
-        "varying vec3 vLighting;\n"
-        "varying float vFog;\n"
-        "void main(){\n"
-        "  vec4 texel = (uUseTexture != 0) ? texture2D(tex0, vTex0) : vec4(1.0);\n"
-        "  vec3 runtime = clamp(vLighting, 0.0, 1.0);\n"
-        "  vec3 lit = texel.rgb;\n"
-        "  float outAlpha = texel.a;\n"
-        "\n"
-        "  if(uPrelightMode == 1){\n"
-        "    // Raw prelight inspection is deliberately literal and bypasses\n"
-        "    // timecycle light/fog so source vertex colours can be edited.\n"
-        "    lit = texel.rgb * clamp(vColor.rgb, 0.0, 1.0);\n"
-        "    outAlpha *= clamp(vColor.a, 0.0, 1.0);\n"
-        "  } else if(uRenderMode == 0 || uRenderMode == 2){\n"
-        "    // Stories lighting is driven primarily by timecycle ambient + sun.\n"
-        "    // Leeds VIF colour bytes are useful as prelight, but treating their\n"
-        "    // RGB channels as a second full colour light produces triangle and\n"
-        "    // checkerboard artefacts on real VCS strips.  Use only bounded\n"
-        "    // luminance modulation in combined mode.\n"
-        "    // Combined mode intentionally does not inject the raw per-strip\n"
-        "    // colour bytes into lighting.  Raw mode remains exact for viewing\n"
-        "    // and editing; Stories mode stays stable until the Leeds colour\n"
-        "    // stream semantics are proven for each MDL variant.\n"
-        "    lit = texel.rgb * runtime;\n"
-        "  }\n"
-        "\n"
-        "  if(uPrelightMode != 1){\n"
-        "    lit = mix(uFogColor, clamp(lit, 0.0, 1.0), vFog);\n"
-        "  }\n"
-        "  gl_FragColor = vec4(clamp(lit, 0.0, 1.0), outAlpha);\n"
-        "}\n";
+const char* storylandStoriesFragmentShaderSource(bool vcs,StorylandShaderKind kind) {
+    switch(kind) {
+    case StorylandShaderKind::World:return vcs?StorylandShaderSources::vcs_world_fragment:StorylandShaderSources::lcs_world_fragment;
+    case StorylandShaderKind::Vehicle:return vcs?StorylandShaderSources::vcs_vehicle_fragment:StorylandShaderSources::lcs_vehicle_fragment;
+    case StorylandShaderKind::Pedestrian:return vcs?StorylandShaderSources::vcs_pedestrian_fragment:StorylandShaderSources::lcs_pedestrian_fragment;
+    case StorylandShaderKind::Vegetation:return vcs?StorylandShaderSources::vcs_vegetation_fragment:StorylandShaderSources::lcs_vegetation_fragment;
+    case StorylandShaderKind::Generic:return vcs?StorylandShaderSources::vcs_generic_fragment:StorylandShaderSources::lcs_generic_fragment;
+    }
+    return nullptr;
+}
+const char* storylandStoriesHlslSource(bool vcs,StorylandShaderKind kind) {
+    switch(kind) {
+    case StorylandShaderKind::World:return vcs?StorylandShaderSources::vcs_world_hlsl:StorylandShaderSources::lcs_world_hlsl;
+    case StorylandShaderKind::Vehicle:return vcs?StorylandShaderSources::vcs_vehicle_hlsl:StorylandShaderSources::lcs_vehicle_hlsl;
+    case StorylandShaderKind::Pedestrian:return vcs?StorylandShaderSources::vcs_pedestrian_hlsl:StorylandShaderSources::lcs_pedestrian_hlsl;
+    case StorylandShaderKind::Vegetation:return vcs?StorylandShaderSources::vcs_vegetation_hlsl:StorylandShaderSources::lcs_vegetation_hlsl;
+    case StorylandShaderKind::Generic:return vcs?StorylandShaderSources::vcs_generic_hlsl:StorylandShaderSources::lcs_generic_hlsl;
+    }
+    return nullptr;
 }

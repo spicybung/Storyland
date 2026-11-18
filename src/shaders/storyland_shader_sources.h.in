@@ -1,0 +1,119 @@
+#pragma once
+namespace StorylandShaderSources {
+inline constexpr char lcs_ps2_world_vert[]=R"shader(@STORYLAND_lcs_ps2_world_vert@)shader";
+inline constexpr char lcs_ps2_world_frag[]=R"shader(@STORYLAND_lcs_ps2_world_frag@)shader";
+inline constexpr char lcs_ps2_vehicle_vert[]=R"shader(@STORYLAND_lcs_ps2_vehicle_vert@)shader";
+inline constexpr char lcs_ps2_vehicle_frag[]=R"shader(@STORYLAND_lcs_ps2_vehicle_frag@)shader";
+inline constexpr char lcs_ps2_pedestrian_vert[]=R"shader(@STORYLAND_lcs_ps2_pedestrian_vert@)shader";
+inline constexpr char lcs_ps2_pedestrian_frag[]=R"shader(@STORYLAND_lcs_ps2_pedestrian_frag@)shader";
+inline constexpr char lcs_ps2_vegetation_vert[]=R"shader(@STORYLAND_lcs_ps2_vegetation_vert@)shader";
+inline constexpr char lcs_ps2_vegetation_frag[]=R"shader(@STORYLAND_lcs_ps2_vegetation_frag@)shader";
+inline constexpr char lcs_ps2_generic_vert[]=R"shader(@STORYLAND_lcs_ps2_generic_vert@)shader";
+inline constexpr char lcs_ps2_generic_frag[]=R"shader(@STORYLAND_lcs_ps2_generic_frag@)shader";
+inline constexpr char lcs_psp_world_vert[]=R"shader(@STORYLAND_lcs_psp_world_vert@)shader";
+inline constexpr char lcs_psp_world_frag[]=R"shader(@STORYLAND_lcs_psp_world_frag@)shader";
+inline constexpr char lcs_psp_vehicle_vert[]=R"shader(@STORYLAND_lcs_psp_vehicle_vert@)shader";
+inline constexpr char lcs_psp_vehicle_frag[]=R"shader(@STORYLAND_lcs_psp_vehicle_frag@)shader";
+inline constexpr char lcs_psp_pedestrian_vert[]=R"shader(@STORYLAND_lcs_psp_pedestrian_vert@)shader";
+inline constexpr char lcs_psp_pedestrian_frag[]=R"shader(@STORYLAND_lcs_psp_pedestrian_frag@)shader";
+inline constexpr char lcs_psp_vegetation_vert[]=R"shader(@STORYLAND_lcs_psp_vegetation_vert@)shader";
+inline constexpr char lcs_psp_vegetation_frag[]=R"shader(@STORYLAND_lcs_psp_vegetation_frag@)shader";
+inline constexpr char lcs_psp_generic_vert[]=R"shader(@STORYLAND_lcs_psp_generic_vert@)shader";
+inline constexpr char lcs_psp_generic_frag[]=R"shader(@STORYLAND_lcs_psp_generic_frag@)shader";
+inline constexpr char vcs_ps2_world_vert[]=R"shader(@STORYLAND_vcs_ps2_world_vert@)shader";
+inline constexpr char vcs_ps2_world_frag[]=R"shader(@STORYLAND_vcs_ps2_world_frag@)shader";
+inline constexpr char vcs_ps2_vehicle_vert[]=R"shader(@STORYLAND_vcs_ps2_vehicle_vert@)shader";
+inline constexpr char vcs_ps2_vehicle_frag[]=R"shader(@STORYLAND_vcs_ps2_vehicle_frag@)shader";
+inline constexpr char vcs_ps2_pedestrian_vert[]=R"shader(@STORYLAND_vcs_ps2_pedestrian_vert@)shader";
+inline constexpr char vcs_ps2_pedestrian_frag[]=R"shader(@STORYLAND_vcs_ps2_pedestrian_frag@)shader";
+inline constexpr char vcs_ps2_vegetation_vert[]=R"shader(@STORYLAND_vcs_ps2_vegetation_vert@)shader";
+inline constexpr char vcs_ps2_vegetation_frag[]=R"shader(@STORYLAND_vcs_ps2_vegetation_frag@)shader";
+inline constexpr char vcs_ps2_generic_vert[]=R"shader(@STORYLAND_vcs_ps2_generic_vert@)shader";
+inline constexpr char vcs_ps2_generic_frag[]=R"shader(@STORYLAND_vcs_ps2_generic_frag@)shader";
+inline constexpr char vcs_psp_world_vert[]=R"shader(@STORYLAND_vcs_psp_world_vert@)shader";
+inline constexpr char vcs_psp_world_frag[]=R"shader(@STORYLAND_vcs_psp_world_frag@)shader";
+inline constexpr char vcs_psp_vehicle_vert[]=R"shader(@STORYLAND_vcs_psp_vehicle_vert@)shader";
+inline constexpr char vcs_psp_vehicle_frag[]=R"shader(@STORYLAND_vcs_psp_vehicle_frag@)shader";
+inline constexpr char vcs_psp_pedestrian_vert[]=R"shader(@STORYLAND_vcs_psp_pedestrian_vert@)shader";
+inline constexpr char vcs_psp_pedestrian_frag[]=R"shader(@STORYLAND_vcs_psp_pedestrian_frag@)shader";
+inline constexpr char vcs_psp_vegetation_vert[]=R"shader(@STORYLAND_vcs_psp_vegetation_vert@)shader";
+inline constexpr char vcs_psp_vegetation_frag[]=R"shader(@STORYLAND_vcs_psp_vegetation_frag@)shader";
+inline constexpr char vcs_psp_generic_vert[]=R"shader(@STORYLAND_vcs_psp_generic_vert@)shader";
+inline constexpr char vcs_psp_generic_frag[]=R"shader(@STORYLAND_vcs_psp_generic_frag@)shader";
+inline const char* console_vert[4][5] = {
+    {lcs_ps2_world_vert, lcs_ps2_vehicle_vert, lcs_ps2_pedestrian_vert, lcs_ps2_vegetation_vert, lcs_ps2_generic_vert},
+    {lcs_psp_world_vert, lcs_psp_vehicle_vert, lcs_psp_pedestrian_vert, lcs_psp_vegetation_vert, lcs_psp_generic_vert},
+    {vcs_ps2_world_vert, vcs_ps2_vehicle_vert, vcs_ps2_pedestrian_vert, vcs_ps2_vegetation_vert, vcs_ps2_generic_vert},
+    {vcs_psp_world_vert, vcs_psp_vehicle_vert, vcs_psp_pedestrian_vert, vcs_psp_vegetation_vert, vcs_psp_generic_vert},
+};
+inline const char* console_frag[4][5] = {
+    {lcs_ps2_world_frag, lcs_ps2_vehicle_frag, lcs_ps2_pedestrian_frag, lcs_ps2_vegetation_frag, lcs_ps2_generic_frag},
+    {lcs_psp_world_frag, lcs_psp_vehicle_frag, lcs_psp_pedestrian_frag, lcs_psp_vegetation_frag, lcs_psp_generic_frag},
+    {vcs_ps2_world_frag, vcs_ps2_vehicle_frag, vcs_ps2_pedestrian_frag, vcs_ps2_vegetation_frag, vcs_ps2_generic_frag},
+    {vcs_psp_world_frag, vcs_psp_vehicle_frag, vcs_psp_pedestrian_frag, vcs_psp_vegetation_frag, vcs_psp_generic_frag},
+};
+
+inline constexpr char ctw_vertex[]=R"shader(@STORYLAND_CTW_VERTEX@)shader";
+inline constexpr char ctw_fragment[]=R"shader(@STORYLAND_CTW_FRAGMENT@)shader";
+inline constexpr char lcs_world_vertex[]=R"shader(@STORYLAND_LCS_WORLD_VERTEX@)shader";
+inline constexpr char lcs_world_fragment[]=R"shader(@STORYLAND_LCS_WORLD_FRAGMENT@)shader";
+inline constexpr char lcs_vehicle_vertex[]=R"shader(@STORYLAND_LCS_VEHICLE_VERTEX@)shader";
+inline constexpr char lcs_vehicle_fragment[]=R"shader(@STORYLAND_LCS_VEHICLE_FRAGMENT@)shader";
+inline constexpr char lcs_pedestrian_vertex[]=R"shader(@STORYLAND_LCS_PEDESTRIAN_VERTEX@)shader";
+inline constexpr char lcs_pedestrian_fragment[]=R"shader(@STORYLAND_LCS_PEDESTRIAN_FRAGMENT@)shader";
+inline constexpr char lcs_vegetation_vertex[]=R"shader(@STORYLAND_LCS_VEGETATION_VERTEX@)shader";
+inline constexpr char lcs_vegetation_fragment[]=R"shader(@STORYLAND_LCS_VEGETATION_FRAGMENT@)shader";
+inline constexpr char lcs_generic_vertex[]=R"shader(@STORYLAND_LCS_GENERIC_VERTEX@)shader";
+inline constexpr char lcs_generic_fragment[]=R"shader(@STORYLAND_LCS_GENERIC_FRAGMENT@)shader";
+inline constexpr char vcs_world_vertex[]=R"shader(@STORYLAND_VCS_WORLD_VERTEX@)shader";
+inline constexpr char vcs_world_fragment[]=R"shader(@STORYLAND_VCS_WORLD_FRAGMENT@)shader";
+inline constexpr char vcs_vehicle_vertex[]=R"shader(@STORYLAND_VCS_VEHICLE_VERTEX@)shader";
+inline constexpr char vcs_vehicle_fragment[]=R"shader(@STORYLAND_VCS_VEHICLE_FRAGMENT@)shader";
+inline constexpr char vcs_pedestrian_vertex[]=R"shader(@STORYLAND_VCS_PEDESTRIAN_VERTEX@)shader";
+inline constexpr char vcs_pedestrian_fragment[]=R"shader(@STORYLAND_VCS_PEDESTRIAN_FRAGMENT@)shader";
+inline constexpr char vcs_vegetation_vertex[]=R"shader(@STORYLAND_VCS_VEGETATION_VERTEX@)shader";
+inline constexpr char vcs_vegetation_fragment[]=R"shader(@STORYLAND_VCS_VEGETATION_FRAGMENT@)shader";
+inline constexpr char vcs_generic_vertex[]=R"shader(@STORYLAND_VCS_GENERIC_VERTEX@)shader";
+inline constexpr char vcs_generic_fragment[]=R"shader(@STORYLAND_VCS_GENERIC_FRAGMENT@)shader";
+inline constexpr char lcs_world_hlsl[]=R"shader(@STORYLAND_LCS_WORLD_HLSL@)shader";
+inline constexpr char lcs_vehicle_hlsl[]=R"shader(@STORYLAND_LCS_VEHICLE_HLSL@)shader";
+inline constexpr char lcs_pedestrian_hlsl[]=R"shader(@STORYLAND_LCS_PEDESTRIAN_HLSL@)shader";
+inline constexpr char lcs_vegetation_hlsl[]=R"shader(@STORYLAND_LCS_VEGETATION_HLSL@)shader";
+inline constexpr char lcs_generic_hlsl[]=R"shader(@STORYLAND_LCS_GENERIC_HLSL@)shader";
+inline constexpr char vcs_world_hlsl[]=R"shader(@STORYLAND_VCS_WORLD_HLSL@)shader";
+inline constexpr char vcs_vehicle_hlsl[]=R"shader(@STORYLAND_VCS_VEHICLE_HLSL@)shader";
+inline constexpr char vcs_pedestrian_hlsl[]=R"shader(@STORYLAND_VCS_PEDESTRIAN_HLSL@)shader";
+inline constexpr char vcs_vegetation_hlsl[]=R"shader(@STORYLAND_VCS_VEGETATION_HLSL@)shader";
+inline constexpr char vcs_generic_hlsl[]=R"shader(@STORYLAND_VCS_GENERIC_HLSL@)shader";
+}
+
+namespace StorylandShaderSources {
+inline const char* aero_vertex=R"AERO(@STORYLAND_AERO_vert@)AERO";
+inline const char* san_andreas_fragment=R"AERO(@STORYLAND_SAN_ANDREAS_FRAG@)AERO";
+// CMake inserts the shared lamp code before this source is compiled.
+inline const char* aero_fragment=R"AERO(@STORYLAND_AERO_frag@)AERO";
+}
+
+namespace StorylandShaderSources {
+inline const char* neo_vertex=R"NEO(@STORYLAND_NEO_VERTEX@)NEO";
+inline const char* neo_world=R"NEO(@STORYLAND_NEO_WORLD@)NEO";
+inline const char* neo_vehicle=R"NEO(@STORYLAND_NEO_VEHICLE@)NEO";
+inline const char* cel_vertex=neo_vertex;
+inline const char* cel_fragment=R"NEO(@STORYLAND_CEL_FRAGMENT@)NEO";
+inline const char* budokai_vertex=neo_vertex;
+inline const char* budokai_fragment=R"NEO(@STORYLAND_BUDOKAI_FRAGMENT@)NEO";
+}
+
+namespace StorylandShaderSources {
+inline const char* deferred_vertex=R"AERO(@STORYLAND_DEFERRED_vert@)AERO";
+inline const char* deferred_fragment=R"AERO(@STORYLAND_DEFERRED_frag@)AERO";
+inline const char* aero_bloom_fragment=R"AERO(@STORYLAND_BLOOM_FRAGMENT@)AERO";
+}
+
+namespace StorylandShaderSources {
+inline const char* mobile_world_vertex=R"MOBILE(@STORYLAND_mobile_world_vertex@)MOBILE";
+inline const char* mobile_vehicle_vertex=R"MOBILE(@STORYLAND_mobile_vehicle_vertex@)MOBILE";
+inline const char* console_world_vertex=R"MOBILE(@STORYLAND_console_world_vertex@)MOBILE";
+inline const char* mobile_world_fragment=R"MOBILE(@STORYLAND_mobile_world_fragment@)MOBILE";
+inline const char* mobile_vehicle_fragment=R"MOBILE(@STORYLAND_mobile_vehicle_fragment@)MOBILE";
+}

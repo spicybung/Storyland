@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="org.reignsstudio.storyland.preview" android:versionCode="1030600" android:versionName="1.3.6">
+    <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="35" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-feature android:glEsVersion="0x00030000" android:required="true" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <application android:label="Storyland" android:icon="@drawable/icon" android:theme="@android:style/Theme.Material.NoActionBar" android:allowBackup="false" android:extractNativeLibs="false" android:hasCode="true">
+        <activity android:name="org.reignsstudio.storyland.StorylandActivity" android:label="Storyland" android:exported="true" android:screenOrientation="sensorLandscape" android:configChanges="keyboard|keyboardHidden|orientation|screenSize|screenLayout|smallestScreenSize|uiMode|navigation|density" android:launchMode="singleTask">
+            <intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter>
+        </activity>
+    </application>
+</manifest>

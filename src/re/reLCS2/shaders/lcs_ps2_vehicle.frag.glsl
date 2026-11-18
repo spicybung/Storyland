@@ -1,0 +1,5 @@
+#version 120
+#define STORYLAND_PS2_WORLD 0
+#define STORYLAND_PS2_VCS 0
+#define STORYLAND_PS2_REFLECTION_ENHANCED 1
+// @ps2_fragment@

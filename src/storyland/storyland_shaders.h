@@ -1,4 +1,2 @@
 #pragma once
-
-const char* storylandStoriesVertexShaderSource();
-const char* storylandStoriesFragmentShaderSource();
+#include "src/shaders/storyland_shaders.h"

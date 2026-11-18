@@ -1,6 +1,8 @@
-#include "storyland_renderware.h"
-#include "leeds_texture.h"
-#include "storyland_atomic_io.h"
+#include "src/storyland/storyland_manhunt.h"
+#include "src/storyland/storyland_renderware.h"
+#include "src/leeds/leeds_texture.h"
+#include "src/leeds/leeds_psp_texture.h"
+#include "src/storyland/storyland_atomic_io.h"
 
 #include <cctype>
 #include <algorithm>
@@ -14,6 +16,34 @@
 #include <map>
 #include <set>
 #include <sstream>
+
+bool leedsBuildNativePs2Rgba(
+    const uint8_t* rgba, size_t rgbaBytes,
+    const uint8_t* ps2Alpha, size_t alphaBytes,
+    bool ps2FiveBitColor, std::vector<uint8_t>& nativeRgba,
+    std::string& errorMessage) {
+    if (!rgba || !rgbaBytes || rgbaBytes % 4u ||
+        (alphaBytes && (!ps2Alpha || alphaBytes != rgbaBytes / 4u)) ||
+        (ps2FiveBitColor && !alphaBytes)) {
+        errorMessage = "Native PS2 upload metadata does not match the RGBA raster.";
+        return false;
+    }
+    std::vector<uint8_t> pixels(rgba, rgba + rgbaBytes);
+    if (alphaBytes) {
+        for (size_t pixel = 0; pixel < alphaBytes; ++pixel) {
+            if (ps2FiveBitColor) {
+                // Editor RGB is floor(channel5 * 255 / 31); its high five bits
+                // recover the original channel before the GS's three-bit shift.
+                for (size_t channel = 0; channel < 3u; ++channel)
+                    pixels[pixel * 4u + channel] &= 0xF8u;
+            }
+            pixels[pixel * 4u + 3u] = ps2Alpha[pixel];
+        }
+    }
+    nativeRgba = std::move(pixels);
+    errorMessage.clear();
+    return true;
+}
 
 static uint32_t readU32(const std::vector<uint8_t>& data, size_t offset) {
     if (offset > data.size() || data.size() - offset < 4u) return 0;
@@ -137,6 +167,7 @@ static bool normalizePs2TextureImage(const RgbaImage& source, RgbaImage& output,
 
     const int targetWidth = nearestSupportedPowerOfTwo(source.width);
     const int targetHeight = nearestSupportedPowerOfTwo(source.height);
+    output = {};
     output.width = targetWidth;
     output.height = targetHeight;
     output.rgba.assign(size_t(targetWidth) * size_t(targetHeight) * 4u, 0u);
@@ -223,7 +254,7 @@ static bool parsePspHeader(const std::vector<uint8_t>& data, uint32_t offset, Le
     return true;
 }
 
-static bool parsePs2Header(const std::vector<uint8_t>& data, uint32_t offset, LeedsTextureEntry& entry) {
+static bool parsePs2Header(const std::vector<uint8_t>& data, uint32_t offset, LeedsTextureEntry& entry, bool compact=false) {
     if (offset == 0 || size_t(offset) + 16 > data.size()) return false;
     uint32_t reserved0 = readU32(data, offset + 0);
     uint32_t reserved1 = readU32(data, offset + 4);
@@ -234,8 +265,8 @@ static bool parsePs2Header(const std::vector<uint8_t>& data, uint32_t offset, Le
     // before the intrusive texture-list links. The node points to this pair.
     // VCS XTX uses a separate raster header, so only select the CHK layout
     // when the following two fields identify the owning list node.
-    if (readU32(data, offset + 8) == offset &&
-        readU32(data, offset + 12) == 0x20u) {
+    if (compact || (readU32(data, offset + 8) == offset &&
+        readU32(data, offset + 12) == 0x20u)) {
         rasterOffset = readU32(data, offset + 0);
         flags = readU32(data, offset + 4);
         reserved0 = 0u;
@@ -365,6 +396,9 @@ static bool parseDdsHeader(const std::vector<uint8_t>& data, uint32_t offset, Le
     return true;
 }
 
+#include "src/storyland/storyland_manhunt_ps2_texture.inl"
+#include "src/storyland/storyland_manhunt_texture.inl"
+
 static bool parseTcdtContainerAt(const std::vector<uint8_t>& data, uint32_t base, LeedsTextureEntry& entry) {
     if (!checkedTextureRange(size_t(base), 0x68u, data.size())) return false;
     std::string name = readCString(data, size_t(base) + 8u, 64u);
@@ -403,7 +437,13 @@ static bool parseTcdtContainerAt(const std::vector<uint8_t>& data, uint32_t base
         }
     }
     if (!valid) return false;
-    if ((width != 0u && uint32_t(parsed.width) != width) || (height != 0u && uint32_t(parsed.height) != height)) return false;
+    // Manhunt 2 PC loading-screen TEX resources retain 256x256 dimensions in
+    // the Leeds container even when the embedded DDS is a widescreen image.
+    // The DDS header and payload have already been independently validated.
+    const bool loadingScreen = name == "picload";
+    if (!loadingScreen &&
+        ((width != 0u && uint32_t(parsed.width) != width) ||
+         (height != 0u && uint32_t(parsed.height) != height))) return false;
     if (bitDepth != 0u && bitDepth != parsed.reserved1 && bitDepth != parsed.bpp && bitDepth != 4u && bitDepth != 8u) {
         return false;
     }
@@ -424,6 +464,11 @@ static bool parseTcdtCollection(const std::vector<uint8_t>& data, std::vector<Le
     }
 
     uint32_t expectedCount = data[0x20u];
+    if (expectedCount == 0u && data.size() >= 0x34u &&
+        readU32(data, 0x24u) == 0x24u && readU32(data, 0x28u) == 0x24u) {
+        errorMessage.clear();
+        return true;
+    }
     if (expectedCount == 0u || expectedCount > 4096u) {
         errorMessage = "Texture collection has an invalid container count.";
         return false;
@@ -1502,6 +1547,13 @@ static void flipRgbaRowsInPlace(RgbaImage& image) {
         std::copy(image.rgba.begin() + top, image.rgba.begin() + top + rowBytes, temp.begin());
         std::copy(image.rgba.begin() + bottom, image.rgba.begin() + bottom + rowBytes, image.rgba.begin() + top);
         std::copy(temp.begin(), temp.end(), image.rgba.begin() + bottom);
+        if (image.ps2Alpha.size() == size_t(image.width) * size_t(image.height)) {
+            const size_t topAlpha = size_t(y) * size_t(image.width);
+            const size_t bottomAlpha = size_t(image.height - 1 - y) * size_t(image.width);
+            std::swap_ranges(image.ps2Alpha.begin() + topAlpha,
+                image.ps2Alpha.begin() + topAlpha + size_t(image.width),
+                image.ps2Alpha.begin() + bottomAlpha);
+        }
     }
 }
 
@@ -1731,7 +1783,8 @@ static std::vector<uint32_t> collectKnownOffsetFields(const std::vector<uint8_t>
         if (entry.kind == TextureKind::Psp) {
             appendOffsetField(fields, entry.textureHeaderOffset + 0x04);
         } else if (entry.kind == TextureKind::Ps2) {
-            appendOffsetField(fields, entry.textureHeaderOffset + 0x08);
+            const bool compact=readU32(data,entry.textureHeaderOffset)==entry.rasterOffset;
+            appendOffsetField(fields, entry.textureHeaderOffset + (compact?0u:0x08u));
         }
     }
 
@@ -1817,6 +1870,15 @@ static bool writeTextureHeaderDimensions(std::vector<uint8_t>& data, const Leeds
             return false;
         }
 
+        const bool compact=readU32(data,entry.textureHeaderOffset)==entry.rasterOffset;
+        if(compact) {
+            const uint32_t flags=uint32_t(widthPow2)|(uint32_t(heightPow2)<<6)|
+                (uint32_t(entry.bpp)<<12)|(((entry.flags>>12)&3u)<<18)|
+                (uint32_t(entry.mipCount?entry.mipCount:1)<<20)|(uint32_t(entry.swizzleMask)<<24);
+            writeU32(data,entry.textureHeaderOffset,rasterOffset);
+            writeU32(data,entry.textureHeaderOffset+4,flags);
+            return true;
+        }
         writeU32(data, entry.textureHeaderOffset + 8, rasterOffset);
 
         uint32_t reserved1 = readU32(data, entry.textureHeaderOffset + 4);
@@ -2647,6 +2709,7 @@ bool LeedsTextureArchive::loadFromFile(const std::wstring& filePath, LeedsPlatfo
 
     path = filePath;
     loadedPlatform = platform;
+    if (!storylandUnpackManhunt(dataBytes, manhuntCompressed, errorMessage)) return false;
     return parse(platform, errorMessage);
 }
 
@@ -2663,7 +2726,13 @@ bool LeedsTextureArchive::loadFromMemory(const std::vector<uint8_t>& bytes, Leed
     dataBytes = bytes;
     path = virtualPath;
     loadedPlatform = platform;
+    if (!storylandUnpackManhunt(dataBytes, manhuntCompressed, errorMessage)) return false;
     return parse(platform, errorMessage);
+}
+
+bool LeedsTextureArchive::isManhuntPc() const {
+    return dataBytes.size() >= 4 && std::memcmp(dataBytes.data(), "TCDT", 4) == 0 &&
+           !entries.empty() && entries.front().kind == TextureKind::Dds;
 }
 
 static bool isPs2StoriesXetRuntimeMarker(uint32_t value) {
@@ -2712,6 +2781,11 @@ static void padPs2StoriesXetToSectorBoundary(std::vector<uint8_t>& bytes) {
 
 bool LeedsTextureArchive::saveToFile(const std::wstring& filePath, std::string& errorMessage) const {
     if (filePath.empty()) { errorMessage = "Output path is empty."; return false; }
+    if (manhuntCompressed) {
+        std::vector<uint8_t> packed;
+        if (!storylandPackManhunt(dataBytes, packed, errorMessage)) return false;
+        return storylandWriteFilesTransaction({{std::filesystem::path(filePath), &packed}}, errorMessage);
+    }
 
     // A parseable PS2 Stories XTX is not necessarily a runtime-safe XTX.
     // Old Storyland builds emitted several editor/legacy serializations:
@@ -2786,6 +2860,17 @@ bool LeedsTextureArchive::parse(LeedsPlatform platform, std::string& errorMessag
     entries.clear();
     mobileLayoutCache.clear();
     gimImages.clear();
+    if (dataBytes.size() >= 128u && readU32(dataBytes, 0u) == LeedsDdsMagic) {
+        LeedsTextureEntry entry;
+        if (!parseDdsHeader(dataBytes, 0u, entry)) {
+            errorMessage = "Standalone DDS header or first mip is invalid.";
+            return false;
+        }
+        entry.name = path.empty() ? "texture" : std::filesystem::path(path).stem().string();
+        entries.push_back(std::move(entry));
+        errorMessage.clear();
+        return true;
+    }
     if (storylandIsGim(dataBytes)) {
         if (!storylandParseGim(dataBytes, gimImages, errorMessage)) return false;
         for (size_t index = 0; index < gimImages.size(); ++index) {
@@ -2860,6 +2945,12 @@ bool LeedsTextureArchive::parse(LeedsPlatform platform, std::string& errorMessag
         return false;
     }
     if (sig == "TCDT") {
+        if (parseManhuntPspTextures(dataBytes, entries, errorMessage)) {
+            if (platform == LeedsPlatform::Ps2 || (platform == LeedsPlatform::Auto && manhuntTcdtIsPs2(dataBytes)))
+                for (auto& entry : entries) entry.kind = TextureKind::ManhuntPs2;
+            return true;
+        }
+        entries.clear();
         return parseTcdtCollection(dataBytes, entries, errorMessage);
     }
 
@@ -2900,7 +2991,14 @@ bool LeedsTextureArchive::parse(LeedsPlatform platform, std::string& errorMessag
             LeedsTextureEntry psp;
             LeedsTextureEntry ps2;
             bool havePsp = platform != LeedsPlatform::Ps2 && parsePspHeader(dataBytes, texOff, psp);
-            bool havePs2 = platform != LeedsPlatform::Psp && parsePs2Header(dataBytes, texOff, ps2);
+            bool havePs2 = false;
+            if(platform != LeedsPlatform::Psp) {
+                // LCS can pack all eight-byte raster descriptors before the texture nodes.
+                const bool compact=readU32(dataBytes,base+4)==0x20u&&
+                    readU32(dataBytes,texOff)>0&&readU32(dataBytes,texOff)<texOff;
+                havePs2=parsePs2Header(dataBytes,texOff,ps2,compact);
+                if(!havePs2&&compact)havePs2=parsePs2Header(dataBytes,texOff,ps2);
+            }
             LeedsTextureEntry chosen;
             bool haveChosen = false;
             if (platform == LeedsPlatform::Psp && havePsp) { chosen = psp; haveChosen = true; }
@@ -3039,6 +3137,22 @@ static bool decodeDesktopPcTexture(
         return finishDecodedTexture(image);
     }
 
+    if (depth == 16u && d3dFormat == 51u) { // D3DFMT_A8L8
+        const size_t required = pixelCount * 2u;
+        if (entry.blockSize < required ||
+            !checkedTextureRange(entry.rasterOffset, required, data.size())) {
+            errorMessage = "PC RenderWare alpha-luminance texture data is truncated.";
+            return false;
+        }
+        for (size_t index = 0; index < pixelCount; ++index) {
+            const size_t source = size_t(entry.rasterOffset) + index * 2u;
+            uint8_t* pixel = image.rgba.data() + index * 4u;
+            pixel[0] = pixel[1] = pixel[2] = data[source];
+            pixel[3] = data[source + 1u];
+        }
+        return finishDecodedTexture(image);
+    }
+
     if (depth == 32u &&
         (baseFormat == 0x0500u ||
          baseFormat == 0x0600u ||
@@ -3114,11 +3228,16 @@ static bool decodeDesktopPcTexture(
 }
 
 bool LeedsTextureArchive::decodeTexture(size_t textureIndex, RgbaImage& image, std::string& errorMessage) const {
+    image.mipLevels.clear();
+    image.ps2Alpha.clear();
+    image.ps2FiveBitColor = false;
     if (textureIndex >= entries.size()) {
         errorMessage = "Texture index is out of range.";
         return false;
     }
     const LeedsTextureEntry& entry = entries[textureIndex];
+    if (entry.kind == TextureKind::ManhuntPs2) return decodeManhuntPs2Texture(dataBytes, entry, image, errorMessage);
+    if (entry.kind == TextureKind::ManhuntPsp) return decodeManhuntPspTexture(dataBytes, entry, image, errorMessage);
     if (entry.kind == TextureKind::RwMobile || entry.kind == TextureKind::Gim) return decodeTextureMip(textureIndex, 0u, image, errorMessage);
     size_t pixelCount = size_t(entry.width) * size_t(entry.height);
 
@@ -3144,6 +3263,31 @@ bool LeedsTextureArchive::decodeTexture(size_t textureIndex, RgbaImage& image, s
         return false;
     }
 
+    if (entry.kind == TextureKind::Psp) {
+        size_t dataEnd = dataBytes.size();
+        if (entry.blockSize) {
+            if (entry.rasterOffset > dataEnd || entry.blockSize > dataEnd - entry.rasterOffset) {
+                errorMessage = "PSP raster allocation points outside the file.";
+                return false;
+            }
+            dataEnd = size_t(entry.rasterOffset) + entry.blockSize;
+        }
+        StorylandPspTextureLayout layout;
+        const unsigned mipCount = std::max(1u, unsigned(entry.mipCount & 63u));
+        if (!storylandResolvePspTextureLayout(entry.rasterOffset, entry.widthPow2,
+                entry.heightPow2, entry.bpp, mipCount, entry.swizzleWidth,
+                entry.swizzleWidth != 0u, dataEnd, layout)) {
+            errorMessage = "PSP mip chain or shared palette is outside the raster allocation.";
+            return false;
+        }
+        image = storylandDecodePspTexture(dataBytes, layout, size_t(LeedsMaxDecodedTextureBytes));
+        if (image.rgba.empty()) {
+            errorMessage = "PSP authored mip levels could not be decoded within their native allocation.";
+            return false;
+        }
+        return finishDecodedTexture(image);
+    }
+
     size_t baseBytes = 0;
     if (entry.bpp == 4) baseBytes = (pixelCount + 1) / 2;
     else if (entry.bpp == 8) baseBytes = pixelCount;
@@ -3160,7 +3304,7 @@ bool LeedsTextureArchive::decodeTexture(size_t textureIndex, RgbaImage& image, s
 
     image.width = entry.width;
     image.height = entry.height;
-    image.rgba.assign(pixelCount * 4, 255);
+    if (entry.kind != TextureKind::Ps2) image.rgba.assign(pixelCount * 4, 255);
     const uint8_t* raw = dataBytes.data() + entry.rasterOffset;
 
     if (isPspTextureKind(entry.kind)) {
@@ -3184,40 +3328,88 @@ bool LeedsTextureArchive::decodeTexture(size_t textureIndex, RgbaImage& image, s
     }
 
     if (entry.kind == TextureKind::Ps2) {
-        if (entry.bpp == 32) {
-            std::vector<uint8_t> rgba = (entry.swizzleMask & 1) ? unswizzlePspBytes(raw, baseBytes, entry.width, entry.height, 4, 1) : std::vector<uint8_t>(raw, raw + baseBytes);
-            image.rgba = std::move(rgba);
-            for (size_t i = 0; i < pixelCount; ++i) image.rgba[i * 4 + 3] = uint8_t(std::min(255, int(image.rgba[i * 4 + 3]) * 255 / 128));
-            return finishDecodedTexture(image);
+        const unsigned levels = std::max(1u, unsigned(entry.mipCount));
+        const uint32_t payloadBytes = rasterPayloadBytesBeforePalette(entry);
+        const size_t allocationEnd = entry.blockSize
+            ? size_t(entry.rasterOffset) + entry.blockSize : dataBytes.size();
+        if (!payloadBytes || allocationEnd > dataBytes.size() ||
+            !checkedTextureRange(entry.rasterOffset, payloadBytes, allocationEnd)) {
+            errorMessage = "PS2 authored mip levels exceed the raster allocation.";
+            return false;
         }
-        if (entry.bpp == 16) {
-            for (size_t i = 0; i < pixelCount; ++i) {
-                uint16_t v = uint16_t(raw[i * 2]) | (uint16_t(raw[i * 2 + 1]) << 8);
-                image.rgba[i * 4 + 0] = uint8_t(((v >> 0) & 0x1F) * 255 / 31);
-                image.rgba[i * 4 + 1] = uint8_t(((v >> 5) & 0x1F) * 255 / 31);
-                image.rgba[i * 4 + 2] = uint8_t(((v >> 10) & 0x1F) * 255 / 31);
-                image.rgba[i * 4 + 3] = (v & 0x8000) ? 255 : 0;
+        uint64_t decodedBytes = 0;
+        for (unsigned level = 0; level < levels; ++level)
+            decodedBytes += uint64_t(std::max(1, entry.width >> level)) *
+                uint64_t(std::max(1, entry.height >> level)) * 5u;
+        if (decodedBytes > LeedsMaxDecodedTextureBytes) {
+            errorMessage = "PS2 mip levels and native alpha exceed the decode limit.";
+            return false;
+        }
+        std::vector<uint8_t> palette;
+        if (entry.bpp <= 8) {
+            const int paletteEntries = entry.bpp == 4 ? 16 : 256;
+            uint32_t paletteStart = 0;
+            if (!findPaletteStartForEntry(dataBytes, entry, paletteEntries, paletteStart) ||
+                paletteStart < size_t(entry.rasterOffset) + payloadBytes ||
+                !checkedTextureRange(paletteStart, size_t(paletteEntries) * 4u, allocationEnd)) {
+                errorMessage = "PS2 authored mip levels have no complete shared palette.";
+                return false;
             }
-            return finishDecodedTexture(image);
+            palette.assign(dataBytes.begin() + paletteStart,
+                dataBytes.begin() + paletteStart + size_t(paletteEntries) * 4u);
         }
-        std::vector<uint8_t> indices;
-        if (entry.bpp == 4) {
-            std::vector<uint8_t> packed(raw, raw + baseBytes);
-            indices = expandNibblesLoFirst(packed.data(), packed.size(), pixelCount);
-            if (entry.swizzleMask & 1) indices = unswizzlePs2Indices(indices, entry.width, entry.height);
-        } else {
-            indices = std::vector<uint8_t>(raw, raw + baseBytes);
-            if (entry.swizzleMask & 1) indices = unswizzlePs2Indices(indices, entry.width, entry.height);
-            convertClutPs2(indices);
-        }
-        int paletteEntries = entry.bpp == 4 ? 16 : 256;
-        std::vector<uint8_t> palette = readPalette(dataBytes, entry, paletteEntries, true);
-        for (size_t i = 0; i < pixelCount; ++i) {
-            int p = indices[i] % paletteEntries;
-            image.rgba[i * 4 + 0] = palette[size_t(p) * 4 + 0];
-            image.rgba[i * 4 + 1] = palette[size_t(p) * 4 + 1];
-            image.rgba[i * 4 + 2] = palette[size_t(p) * 4 + 2];
-            image.rgba[i * 4 + 3] = palette[size_t(p) * 4 + 3];
+        size_t mipOffset = entry.rasterOffset;
+        image.mipLevels.reserve(levels - 1u);
+        for (unsigned level = 0; level < levels; ++level) {
+            RgbaMipLevel mip;
+            mip.width = std::max(1, entry.width >> level);
+            mip.height = std::max(1, entry.height >> level);
+            const size_t count = size_t(mip.width) * size_t(mip.height);
+            const size_t storedBytes = bytesForTextureLevel(mip.width, mip.height, entry.bpp);
+            const uint8_t* mipRaw = dataBytes.data() + mipOffset;
+            const bool swizzled = (unsigned(entry.swizzleMask) & (1u << level)) != 0;
+            mip.ps2Alpha.resize(count);
+            mip.rgba.resize(count * 4u);
+            if (entry.bpp == 32) {
+                mip.rgba = swizzled ? unswizzlePspBytes(mipRaw, storedBytes, mip.width, mip.height, 4, 1)
+                    : std::vector<uint8_t>(mipRaw, mipRaw + storedBytes);
+                for (size_t pixel = 0; pixel < count; ++pixel) {
+                    mip.ps2Alpha[pixel] = mip.rgba[pixel * 4u + 3u];
+                    mip.rgba[pixel * 4u + 3u] = uint8_t(std::min(255u,
+                        unsigned(mip.ps2Alpha[pixel]) * 255u / 128u));
+                }
+            } else if (entry.bpp == 16) {
+                mip.ps2FiveBitColor = true;
+                for (size_t pixel = 0; pixel < count; ++pixel) {
+                    const uint16_t value = uint16_t(mipRaw[pixel * 2u]) |
+                        uint16_t(mipRaw[pixel * 2u + 1u]) << 8u;
+                    mip.rgba[pixel * 4u] = uint8_t((value & 31u) * 255u / 31u);
+                    mip.rgba[pixel * 4u + 1u] = uint8_t(((value >> 5u) & 31u) * 255u / 31u);
+                    mip.rgba[pixel * 4u + 2u] = uint8_t(((value >> 10u) & 31u) * 255u / 31u);
+                    mip.rgba[pixel * 4u + 3u] = value & 0x8000u ? 255u : 0u;
+                    mip.ps2Alpha[pixel] = value & 0x8000u ? 128u : 0u;
+                }
+            } else {
+                std::vector<uint8_t> indices = entry.bpp == 4
+                    ? expandNibblesLoFirst(mipRaw, storedBytes, count)
+                    : std::vector<uint8_t>(mipRaw, mipRaw + storedBytes);
+                if (swizzled) indices = unswizzlePs2Indices(indices, mip.width, mip.height);
+                if (entry.bpp == 8) convertClutPs2(indices);
+                for (size_t pixel = 0; pixel < count; ++pixel) {
+                    const size_t color = size_t(indices[pixel]) * 4u;
+                    for (size_t channel = 0; channel < 3u; ++channel)
+                        mip.rgba[pixel * 4u + channel] = palette[color + channel];
+                    mip.ps2Alpha[pixel] = palette[color + 3u];
+                    mip.rgba[pixel * 4u + 3u] = uint8_t(std::min(255u,
+                        unsigned(mip.ps2Alpha[pixel]) * 255u / 128u));
+                }
+            }
+            if (level == 0) {
+                image.rgba = std::move(mip.rgba);
+                image.ps2Alpha = std::move(mip.ps2Alpha);
+                image.ps2FiveBitColor = mip.ps2FiveBitColor;
+            } else image.mipLevels.push_back(std::move(mip));
+            mipOffset += storedBytes;
         }
         return finishDecodedTexture(image);
     }
@@ -3270,8 +3462,8 @@ bool LeedsTextureArchive::replaceTextureAsBpp(size_t textureIndex, const RgbaIma
         return storylandReplaceGim(dataBytes, gim, image, palette, errorMessage);
     }
 
-    if (entry.kind == TextureKind::Dds) {
-        errorMessage = "TCDT DDS texture replacement is read-only in this build.";
+    if (entry.kind == TextureKind::Dds || entry.kind == TextureKind::ManhuntPsp || entry.kind == TextureKind::ManhuntPs2) {
+        errorMessage = "Manhunt textures can be viewed and exported; raster replacement is not available.";
         return false;
     }
 
@@ -3879,6 +4071,12 @@ static bool collectRawPs2BuildItems(
         StorylandPs2RawBuildItem item;
         item.name = e.name;
         item.headerBytes.assign(source.begin() + e.textureHeaderOffset, source.begin() + e.textureHeaderOffset + 16u);
+        if(readU32(source,e.textureHeaderOffset)==e.rasterOffset) {
+            item.headerBytes.assign(16,0);
+            writeU32(item.headerBytes,4,defaultPs2Reserved1(e.width,e.bpp));
+            writeU32(item.headerBytes,8,e.rasterOffset);
+            writeU32(item.headerBytes,12,e.flags);
+        }
         item.rasterBlock.assign(source.begin() + e.rasterOffset, source.begin() + e.rasterOffset + e.blockSize);
         itemsOut.push_back(std::move(item));
     }
@@ -4091,6 +4289,7 @@ bool LeedsTextureArchive::normalizePs2RuntimeLayout(std::string& report, std::st
 
 
 bool LeedsTextureArchive::createEmptyPs2(const std::wstring& virtualPath, std::string& errorMessage) {
+    manhuntCompressed = false;
     std::vector<uint8_t> fresh;
     if (!buildCanonicalPs2Xet({}, fresh, errorMessage, pathUsesVcsXtxProfile(virtualPath))) return false;
     dataBytes = std::move(fresh);
@@ -4106,6 +4305,7 @@ bool LeedsTextureArchive::createLcsBetaTxd(
     uint8_t bpp,
     std::string& errorMessage
 ) {
+    manhuntCompressed = false;
     std::vector<uint8_t> firstNative;
     if (!buildLcsBetaRwNativeTextureChunk(
             firstName,
@@ -4168,7 +4368,113 @@ bool LeedsTextureArchive::createLcsBetaTxd(
     return parse(loadedPlatform, errorMessage);
 }
 
+bool LeedsTextureArchive::createLcsMobileTxd(
+    const std::wstring& virtualPath,
+    const std::string& firstName,
+    const RgbaImage& sourceImage,
+    uint8_t bpp,
+    std::string& errorMessage
+) {
+    if ((bpp != 4u && bpp != 8u) || firstName.empty() ||
+        firstName.size() > 31u || !isPrintableName(firstName)) {
+        errorMessage = "Mobile LCS TXD requires a printable texture name and 4bpp or 8bpp.";
+        return false;
+    }
+
+    RgbaImage image;
+    std::string resizeNote;
+    if (!normalizePs2TextureImage(sourceImage, image, resizeNote)) {
+        errorMessage = resizeNote;
+        return false;
+    }
+
+    const int paletteCount = bpp == 4u ? 16 : 256;
+    std::vector<uint8_t> palette = buildPaletteFromReplacementImage(image, paletteCount, false);
+    if (palette.size() != size_t(paletteCount) * 4u) {
+        errorMessage = "Could not construct the Mobile LCS texture palette.";
+        return false;
+    }
+
+    const size_t pixelCount = size_t(image.width) * size_t(image.height);
+    std::vector<uint8_t> indices(pixelCount);
+    for (size_t pixel = 0u; pixel < pixelCount; ++pixel) {
+        indices[pixel] = uint8_t(nearestPaletteIndex(
+            palette, paletteCount,
+            image.rgba[pixel * 4u + 0u],
+            image.rgba[pixel * 4u + 1u],
+            image.rgba[pixel * 4u + 2u],
+            image.rgba[pixel * 4u + 3u]));
+    }
+
+    std::vector<uint8_t> raster = bpp == 4u ? packNibblesLoFirst(indices) : indices;
+    for (size_t index = 3u; index < palette.size(); index += 4u) {
+        palette[index] = uint8_t((uint32_t(palette[index]) * 128u + 127u) / 255u);
+    }
+    raster.insert(raster.end(), palette.begin(), palette.end());
+
+    constexpr uint32_t mobileVersion = 0x00000310u;
+    std::vector<uint8_t> nativePayload;
+    std::vector<uint8_t> platformHeader;
+    appendU32Le(platformHeader, 0x00505350u);
+    appendU32Le(platformHeader, 0x00001102u);
+    appendRwChunk(nativePayload, 0x01u, mobileVersion, platformHeader);
+
+    std::vector<uint8_t> namePayload(firstName.begin(), firstName.end());
+    namePayload.push_back(0u);
+    while (namePayload.size() % 4u != 0u) namePayload.push_back(0u);
+    appendRwChunk(nativePayload, 0x02u, mobileVersion, namePayload);
+    appendRwChunk(nativePayload, 0x02u, mobileVersion, {0u, 0u, 0u, 0u});
+
+    std::vector<uint8_t> rasterHeader;
+    appendU32Le(rasterHeader, uint32_t(image.width));
+    appendU32Le(rasterHeader, uint32_t(image.height));
+    appendU32Le(rasterHeader, uint32_t(bpp));
+    appendU32Le(rasterHeader, 1u);
+    appendU32Le(rasterHeader, 0u);
+    std::vector<uint8_t> rasterContainer;
+    appendRwChunk(rasterContainer, 0x01u, mobileVersion, rasterHeader);
+    appendRwChunk(rasterContainer, 0x01u, mobileVersion, raster);
+    appendRwChunk(nativePayload, 0x01u, mobileVersion, rasterContainer);
+    appendRwChunk(nativePayload, 0x03u, mobileVersion, {});
+
+    std::vector<uint8_t> nativeChunk;
+    appendRwChunk(nativeChunk, 0x15u, mobileVersion, nativePayload);
+    std::vector<uint8_t> dictionaryPayload;
+    appendRwChunk(dictionaryPayload, 0x01u, mobileVersion, {1u, 0u, 0u, 0u});
+    dictionaryPayload.insert(dictionaryPayload.end(), nativeChunk.begin(), nativeChunk.end());
+    appendRwChunk(dictionaryPayload, 0x03u, mobileVersion, {});
+    std::vector<uint8_t> fresh;
+    appendRwChunk(fresh, 0x16u, mobileVersion, dictionaryPayload);
+
+    LeedsTextureArchive trial;
+    std::string trialError;
+    if (!trial.loadFromMemory(fresh, LeedsPlatform::Auto, trialError, virtualPath) ||
+        !trial.isMobileLcs() || trial.textures().size() != 1u ||
+        trial.textures()[0].bpp != bpp) {
+        errorMessage = "Mobile LCS TXD did not pass readback: " + trialError;
+        return false;
+    }
+    RgbaImage decoded;
+    if (!trial.decodeTextureMip(0u, 0u, decoded, trialError, MobileTextureLayout::Stored) ||
+        decoded.width != image.width || decoded.height != image.height) {
+        errorMessage = "Mobile LCS TXD raster readback failed: " + trialError;
+        return false;
+    }
+
+    dataBytes = std::move(fresh);
+    path = virtualPath;
+    loadedPlatform = LeedsPlatform::Auto;
+    manhuntCompressed = false;
+    errorMessage.clear();
+    return parse(loadedPlatform, errorMessage);
+}
+
 bool LeedsTextureArchive::addTexture(const std::string& name, const RgbaImage& image, uint8_t bpp, std::string& errorMessage) {
+    if (!entries.empty() && (entries.front().kind == TextureKind::ManhuntPsp || entries.front().kind == TextureKind::ManhuntPs2)) {
+        errorMessage = "Manhunt PSP texture collections are read-only. Images can be exported.";
+        return false;
+    }
+
     if (storylandIsGim(dataBytes)) {
         errorMessage = "GIM supports replacing existing images. Adding, removing, duplicating, or swapping image slots is not available.";
         return false;
@@ -4301,6 +4607,11 @@ bool LeedsTextureArchive::addTexture(const std::string& name, const RgbaImage& i
 }
 
 bool LeedsTextureArchive::swapTextureData(size_t firstTextureIndex, size_t secondTextureIndex, std::string& errorMessage) {
+    if (!entries.empty() && (entries.front().kind == TextureKind::ManhuntPsp || entries.front().kind == TextureKind::ManhuntPs2)) {
+        errorMessage = "Manhunt PSP texture collections are read-only. Images can be exported.";
+        return false;
+    }
+
     if (storylandIsGim(dataBytes)) {
         errorMessage = "GIM supports replacing existing images. Adding, removing, duplicating, or swapping image slots is not available.";
         return false;
@@ -4385,6 +4696,11 @@ bool LeedsTextureArchive::swapTextureData(size_t firstTextureIndex, size_t secon
 }
 
 bool LeedsTextureArchive::duplicateTexture(size_t textureIndex, const std::string& newName, std::string& errorMessage) {
+    if (!entries.empty() && (entries.front().kind == TextureKind::ManhuntPsp || entries.front().kind == TextureKind::ManhuntPs2)) {
+        errorMessage = "Manhunt PSP texture collections are read-only. Images can be exported.";
+        return false;
+    }
+
     if (storylandIsGim(dataBytes)) {
         errorMessage = "GIM supports replacing existing images. Adding, removing, duplicating, or swapping image slots is not available.";
         return false;
@@ -4471,6 +4787,11 @@ bool LeedsTextureArchive::duplicateTexture(size_t textureIndex, const std::strin
 }
 
 bool LeedsTextureArchive::removeTexture(size_t textureIndex, std::string& errorMessage) {
+    if (!entries.empty() && (entries.front().kind == TextureKind::ManhuntPsp || entries.front().kind == TextureKind::ManhuntPs2)) {
+        errorMessage = "Manhunt PSP texture collections are read-only. Images can be exported.";
+        return false;
+    }
+
     if (storylandIsGim(dataBytes)) {
         errorMessage = "GIM supports replacing existing images. Adding, removing, duplicating, or swapping image slots is not available.";
         return false;
@@ -4528,6 +4849,18 @@ bool LeedsTextureArchive::removeTexture(size_t textureIndex, std::string& errorM
 }
 
 bool LeedsTextureArchive::validateStructure(std::string& report, std::string& errorMessage) const {
+    if (!entries.empty() && (entries.front().kind == TextureKind::ManhuntPsp || entries.front().kind == TextureKind::ManhuntPs2)) {
+        std::vector<LeedsTextureEntry> checked;
+        if (!parseManhuntPspTextures(dataBytes, checked, errorMessage)) return false;
+        for (const auto& entry : checked) {
+            RgbaImage image;
+            if (entries.front().kind == TextureKind::ManhuntPs2) {
+                if (!decodeManhuntPs2Texture(dataBytes, entry, image, errorMessage)) return false;
+            } else if (!decodeManhuntPspTexture(dataBytes, entry, image, errorMessage)) return false;
+        }
+        report = std::string(entries.front().kind == TextureKind::ManhuntPs2 ? "Manhunt 2 PS2 TCDT: PASS | Textures: " : "Manhunt 2 PSP TCDT: PASS | Textures: ") + std::to_string(checked.size());
+        errorMessage.clear(); return true;
+    }
     if (storylandIsGim(dataBytes)) {
         std::vector<StorylandGimImage> images;
         if (!storylandParseGim(dataBytes, images, errorMessage)) return false;
@@ -4909,6 +5242,11 @@ bool LeedsTextureArchive::validateStructure(std::string& report, std::string& er
 }
 
 bool LeedsTextureArchive::renameTexture(size_t textureIndex, const std::string& newName, std::string& errorMessage) {
+    if (!entries.empty() && (entries.front().kind == TextureKind::ManhuntPsp || entries.front().kind == TextureKind::ManhuntPs2)) {
+        errorMessage = "Manhunt PSP texture collections are read-only. Images can be exported.";
+        return false;
+    }
+
     if (isMobileLcs()) {
         errorMessage = "LCS Mobile textures can be viewed and exported. Editing this format is not available.";
         return false;
@@ -5018,11 +5356,29 @@ bool LeedsTextureArchive::isMobileLcs() const {
 }
 
 bool LeedsTextureArchive::decodeTextureMip(size_t textureIndex, uint32_t level, RgbaImage& image, std::string& errorMessage, MobileTextureLayout layout) const {
+    image.mipLevels.clear();
+    image.ps2Alpha.clear();
+    image.ps2FiveBitColor = false;
     if (textureIndex >= entries.size()) { errorMessage = "Texture index is out of range."; return false; }
     const auto& entry = entries[textureIndex];
     if (entry.kind == TextureKind::Gim) {
         if (textureIndex >= gimImages.size()) { errorMessage = "GIM image metadata is missing."; return false; }
         return storylandDecodeGim(dataBytes, gimImages[textureIndex], level, image, errorMessage);
+    }
+    if (entry.kind == TextureKind::Ps2 && level != 0u) {
+        RgbaImage decoded;
+        if (!decodeTexture(textureIndex, decoded, errorMessage)) return false;
+        if (level > decoded.mipLevels.size()) {
+            errorMessage = "Mipmap level is out of range.";
+            return false;
+        }
+        auto& mip = decoded.mipLevels[level - 1u];
+        image.width = mip.width;
+        image.height = mip.height;
+        image.rgba = std::move(mip.rgba);
+        image.ps2Alpha = std::move(mip.ps2Alpha);
+        image.ps2FiveBitColor = mip.ps2FiveBitColor;
+        return finishDecodedTexture(image);
     }
     if (entry.kind != TextureKind::RwMobile) {
         if (level == 0u) return decodeTexture(textureIndex, image, errorMessage);

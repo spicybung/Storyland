@@ -1,0 +1,733 @@
+{
+  "format": "storyland_neural_runtime_sources",
+  "format_version": 1,
+  "model_repository": "ResembleAI/chatterbox",
+  "model_revision": "5bb1f6ee58e50c3b8d408bc82a6d3740c2db6e18",
+  "model_license": "MIT",
+  "sources": {
+    "chatterbox": {
+      "revision": "ab55923c27757c90cfcc407baa57dc25a7d25217",
+      "url": "https://codeload.github.com/resemble-ai/chatterbox/tar.gz/ab55923c27757c90cfcc407baa57dc25a7d25217",
+      "bytes": 1432950,
+      "sha256": "46ee991e5b68f7c8adad6bb68a8f2465b5f8f669e95116e859b34b67ada3a3d6",
+      "license": "MIT",
+      "repository": "https://github.com/resemble-ai/chatterbox",
+      "bundled_source": {
+        "directory": "source",
+        "renamed_paths": {
+          ".gitignore": ".gitignore.upstream"
+        },
+        "file_count": 66,
+        "files": [
+          {
+            "path": ".github/workflows/install_check.yml",
+            "bytes": 382,
+            "sha256": "68a0a1cb9836b962e2c56889696553800ed7f68cd107d42656b5766c18dfaa26",
+            "mode": 436
+          },
+          {
+            "path": ".gitignore.upstream",
+            "bytes": 623,
+            "sha256": "1b1f6f206c843d070c83ed01c2d2c8111faeb95c43de832087bfb3a1f0d47d30",
+            "mode": 436
+          },
+          {
+            "path": "Chatterbox-Multilingual.png",
+            "bytes": 724392,
+            "sha256": "cb7501958899a59986922ae399d5a9c92fffc16e6059ad7bd5046b76f5f85af2",
+            "mode": 436
+          },
+          {
+            "path": "Chatterbox-Turbo.jpg",
+            "bytes": 781306,
+            "sha256": "5d953d46b7d811dcc7f6ce6b67092db41c8a5e69c35fba9cb8e4cb657ddb19e1",
+            "mode": 436
+          },
+          {
+            "path": "LICENSE",
+            "bytes": 1067,
+            "sha256": "4248e910a928849fe5815a0f9236e17fa07768d95b9193212752c464b93d6caa",
+            "mode": 436
+          },
+          {
+            "path": "README.md",
+            "bytes": 15885,
+            "sha256": "8e94dfd0a943d95dc2d24db51c71a6da2e3401563637409f26782e36a266b4ae",
+            "mode": 436
+          },
+          {
+            "path": "example_for_mac.py",
+            "bytes": 1011,
+            "sha256": "bd41e3fa1011555af14500f2970589a993bdf8ae07bfffe6593051f3b45dd35c",
+            "mode": 436
+          },
+          {
+            "path": "example_tts.py",
+            "bytes": 1391,
+            "sha256": "d0736f855d99c173977020fd9e5130d054465ae2117deaffaffde4de1aadcb4f",
+            "mode": 436
+          },
+          {
+            "path": "example_tts_nano.py",
+            "bytes": 754,
+            "sha256": "ae99bf2c4f8cd0275aaff6326831da26ba13b54ae198943d642bda33d49f76de",
+            "mode": 436
+          },
+          {
+            "path": "example_tts_turbo.py",
+            "bytes": 664,
+            "sha256": "4e2062e56140bd8113e22073026678e32572e2bd27b821491a0e7b8435a0a1b9",
+            "mode": 436
+          },
+          {
+            "path": "example_vc.py",
+            "bytes": 531,
+            "sha256": "bfd8aab938279acd86565cd792ed3133021c7637a9e4252a8f4cc627730b3b11",
+            "mode": 436
+          },
+          {
+            "path": "gradio_tts_app.py",
+            "bytes": 3216,
+            "sha256": "0176a9f4a2279f26947fc83719414f6b9a8e001bc34d70f9bec9534b64bb4422",
+            "mode": 436
+          },
+          {
+            "path": "gradio_tts_turbo_app.py",
+            "bytes": 5697,
+            "sha256": "e38e33e363783c1b43ed392d1470afc34d631f7f98e1a378b6671b80c5b515bd",
+            "mode": 436
+          },
+          {
+            "path": "gradio_vc_app.py",
+            "bytes": 702,
+            "sha256": "48a1d5c82017156b69b69a004ade78e74735a86ff18f253a9918deb53db85e48",
+            "mode": 436
+          },
+          {
+            "path": "multilingual_app.py",
+            "bytes": 14194,
+            "sha256": "b3ac8593363909f68d71a9cfe198094ce2e39a813f4733186413e46346aed0b3",
+            "mode": 436
+          },
+          {
+            "path": "pyproject.toml",
+            "bytes": 1328,
+            "sha256": "e1aab210e1eb6023a694a05e92ae4cbb08efa9510d295401303e90eec41d594f",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/__init__.py",
+            "bytes": 300,
+            "sha256": "dab20a9fb088c06cba044bc3b0ba2c52a914d5b5d51e6266bfd220d23f1bea41",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/__init__.py",
+            "bytes": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/s3gen/__init__.py",
+            "bytes": 68,
+            "sha256": "1eb98b785c481502e515676da0e65afbfd8fa2254ae303b6fa9714db6a52730c",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/s3gen/configs.py",
+            "bytes": 220,
+            "sha256": "15a84f5819e0fe1371ae4f5ac7e3cfb56df52cf36704401586efddd0383697fb",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/s3gen/const.py",
+            "bytes": 34,
+            "sha256": "0a3a957453060ca081a427e71559889f65e45181e6d7befa649e7314cd90e516",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/s3gen/decoder.py",
+            "bytes": 13171,
+            "sha256": "40d093fd61549a09f5f71d74081585df1e3871b3a8e6b6fafde12bb447701810",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/s3gen/f0_predictor.py",
+            "bytes": 1993,
+            "sha256": "917825eec353b9601b9f7af0c0e3603eb1061d8b641539225e78c910d7bc2255",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/s3gen/flow.py",
+            "bytes": 8178,
+            "sha256": "1e9bc8219eb0832b6db2b86bf7e4085dc9d0c0de47e5c496eb94bbd38b01511d",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/s3gen/flow_matching.py",
+            "bytes": 10786,
+            "sha256": "63fc979521e1b758f0e8f3bee00a496a53184a714ef1a7a723b319a58158d612",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/s3gen/hifigan.py",
+            "bytes": 17652,
+            "sha256": "e49f4723323937493ecf5f6c7f1934f57766ef46c74eaf7c60bf456a1c6fe897",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/s3gen/matcha/decoder.py",
+            "bytes": 14435,
+            "sha256": "a9f35df7b3eb1c7defb8744626b32ef0504a519a066f3240fde90393a39b3488",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/s3gen/matcha/flow_matching.py",
+            "bytes": 4556,
+            "sha256": "56614b92aad52f713c198ae089d47e6a7df13450f3cf5d1144f65fb34c35107d",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/s3gen/matcha/text_encoder.py",
+            "bytes": 14965,
+            "sha256": "a1e993ad219d95dee864e010d8415e7057abb6131a21550093d83db0279b01cb",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/s3gen/matcha/transformer.py",
+            "bytes": 13237,
+            "sha256": "66ff2092d974a99b251b9d8e5c08bbcecceaedfaf41e2bd8af2b4bc7a56dcbea",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/s3gen/s3gen.py",
+            "bytes": 13189,
+            "sha256": "b3ea20b6f3f98dacfa3c2c99502bbf3dfbe7a77362f2ce0d16783d4324e6fc96",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/s3gen/transformer/__init__.py",
+            "bytes": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/s3gen/transformer/activation.py",
+            "bytes": 3089,
+            "sha256": "a4a96caea9f7b05111286de5ea760bdfdf9c4e53448f53420857dc04a50440c2",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/s3gen/transformer/attention.py",
+            "bytes": 14415,
+            "sha256": "28c38f1e3ea1aeac1526e98f8349d9f068e25f1f6ae246c60badc3d540d62794",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/s3gen/transformer/convolution.py",
+            "bytes": 5230,
+            "sha256": "eb5f41f324a97225c73b9c430af8bb231bd77386ef18450bb0fd329f469ab4e1",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/s3gen/transformer/embedding.py",
+            "bytes": 11399,
+            "sha256": "3646e748783fe6c069b424cc9cbfe81bc54a5ccfea1ae7041df398a603cccd3e",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/s3gen/transformer/encoder_layer.py",
+            "bytes": 9602,
+            "sha256": "1920582be2c9b7cf7835e7b539118ec1eb9da8f2c711c6257f8598b3792951b9",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/s3gen/transformer/positionwise_feed_forward.py",
+            "bytes": 4219,
+            "sha256": "6e8038e3bcc8ca086ddca508fb9b9d40bf3ab98bebabcf5c94935d032329d0f8",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/s3gen/transformer/subsampling.py",
+            "bytes": 12666,
+            "sha256": "31fc0347a851abc1205dfd4cf68099c0c416589c3e99a07b250e8630cece19d0",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/s3gen/transformer/upsample_encoder.py",
+            "bytes": 13694,
+            "sha256": "1794ff01b678791ad665d7b0c0999448e760fc1dcb3bc8208de5f58510c1f68c",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/s3gen/utils/class_utils.py",
+            "bytes": 2334,
+            "sha256": "02f3cb3a55ee124c279777245b09061fa15a8182e6e7d7762f8fa45c0a631948",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/s3gen/utils/intmeanflow.py",
+            "bytes": 951,
+            "sha256": "df3c73d77244518c7b90224c2a5180bf0435d27868f598cb876cfcf812aa5285",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/s3gen/utils/mask.py",
+            "bytes": 7666,
+            "sha256": "902c85fbbd1e30a0cb9792cdcf1b9acd97804bd5cb3b5d6a440dc236f274bb3e",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/s3gen/utils/mel.py",
+            "bytes": 2556,
+            "sha256": "afbb6fe14c30e104cb2617230daa2a6770f97452948b2e6f6eea4a4c2f4ff3ba",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/s3gen/xvector.py",
+            "bytes": 14141,
+            "sha256": "c7c759920cbf1aac9f12e0a15c1bf3d38da51ca9d3ea7a7b53cf740c86fe17fa",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/s3tokenizer/__init__.py",
+            "bytes": 595,
+            "sha256": "7357ce9a0349bae51e8e8cabcdd01ba8534dd6a2373c1e092291ecb716414fe0",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/s3tokenizer/s3tokenizer.py",
+            "bytes": 5155,
+            "sha256": "76eae9f95b14608c4847c9d7acfcf08138c365640b0d4589de01e742b0e5eb43",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/t3/__init__.py",
+            "bytes": 19,
+            "sha256": "cfecc1c7df7d22398157d40605abfa64f30ef9b697190dc4f57b229299f70538",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/t3/inference/t3_hf_backend.py",
+            "bytes": 3990,
+            "sha256": "2d8407cf500ec1e6b707b060861145bb7802741328d76ec341280c06c7f3f2b5",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/t3/llama_configs.py",
+            "bytes": 2608,
+            "sha256": "8d348019801dd017d85b88c2a17c5f785e6bb4ffba4ba6edf190a8996536a60a",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/t3/modules/cond_enc.py",
+            "bytes": 3293,
+            "sha256": "d8128803091423141051caf295de6208113da987fe537de5566c4b84e19df847",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/t3/modules/learned_pos_emb.py",
+            "bytes": 1099,
+            "sha256": "2ec5b09ce94d71261e9c25833a08f666bd6e2d5439b2314123e035c02df8b7af",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/t3/modules/perceiver.py",
+            "bytes": 7719,
+            "sha256": "f9c4b0130652e94d05873ead931ecd399a9dd644b7a17edf1b76d7d7f2bfbf42",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/t3/modules/t3_config.py",
+            "bytes": 1245,
+            "sha256": "e07d8c09f85242f061a036cb1ac56de5b49cd5444790e8ac35098df44348801f",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/t3/t3.py",
+            "bytes": 18116,
+            "sha256": "bfb689c9018a329aa3a1a364aaa6d03a68a97b7352cbc394a13d4711742f9a0a",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/tokenizers/__init__.py",
+            "bytes": 48,
+            "sha256": "6759fb8b4f6d50b8e4ab8ddd0e39d44e1ca7196544f93311b385a7eeea6c38c2",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/tokenizers/tokenizer.py",
+            "bytes": 10202,
+            "sha256": "e169f02f14b008e8e7a4f29df66ecafaa29972ff4a38724b51545b8563861889",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/utils.py",
+            "bytes": 148,
+            "sha256": "c30615629f906acf71c67104a78d36f682c635e55b808d7d8022d47a2738b225",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/voice_encoder/__init__.py",
+            "bytes": 56,
+            "sha256": "adf1bcef74e90dae0fcb5c2945103cbc0bd9af15cc9be4288f960ad7d22ce678",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/voice_encoder/config.py",
+            "bytes": 406,
+            "sha256": "0b41d794a16fd94929b37fd229dc61d3634178a11046a6b5834e109109a8e3c8",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/voice_encoder/melspec.py",
+            "bytes": 1940,
+            "sha256": "0f5fea173841c5150fa6ea9236160798c8ee24afba724d65da61dce78a4d48e8",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/models/voice_encoder/voice_encoder.py",
+            "bytes": 10555,
+            "sha256": "4b12e9d49cbb7ce81e6731c02d4f37a9b763ef7419dba95a7e66ea078d49a9c3",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/mtl_tts.py",
+            "bytes": 11721,
+            "sha256": "936759044e54cffe8c68b91b32e01da0bc032a1e084f769f0403080d86ad153c",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/tts.py",
+            "bytes": 8924,
+            "sha256": "7896787bc17e20eafcd1dce7b8a4a6ea3a6478baab771c60d63e9e81f5564195",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/tts_turbo.py",
+            "bytes": 11379,
+            "sha256": "2f27e8ff2fa35181fdd2849367fb96ecc2cb87a1088ca7520c8bd51946599f08",
+            "mode": 436
+          },
+          {
+            "path": "src/chatterbox/vc.py",
+            "bytes": 3520,
+            "sha256": "4093a7edf32b1174999b00a74b5b83de193763c65249b0d5288d5f45f3ac2d71",
+            "mode": 436
+          }
+        ]
+      }
+    },
+    "perth": {
+      "revision": "ff1c8ac55a976971245cdd53c18d6131ca00d993",
+      "url": "https://codeload.github.com/resemble-ai/Perth/tar.gz/ff1c8ac55a976971245cdd53c18d6131ca00d993",
+      "bytes": 34548910,
+      "sha256": "00e89ff833f7efc1a0ae0ca3c5420ae108b9adbed9c0fb7b03750b854d30f149",
+      "license": "MIT",
+      "repository": "https://github.com/resemble-ai/Perth",
+      "bundled_source": {
+        "directory": "perth",
+        "sibling_directory": "perth",
+        "renamed_paths": {
+          ".gitignore": ".gitignore.upstream"
+        },
+        "file_count": 37,
+        "files": [
+          {
+            "path": ".github/workflows/perth.yaml",
+            "bytes": 2141,
+            "sha256": "4b470f454551a63282fbb0ed10145995fd4b1e6ad6b0e3a80366e8a0dfd2748f",
+            "mode": 436
+          },
+          {
+            "path": ".gitignore.upstream",
+            "bytes": 1449,
+            "sha256": "1e0a294f0e0a48f0dce5ab1b268d9b2276132de78988c9fa6a87823eee0a9e8a",
+            "mode": 436
+          },
+          {
+            "path": ".pre-commit-config.yaml",
+            "bytes": 254,
+            "sha256": "9d8dda198ff1fe1914b376732b949cb31cab316da936b490f028573447e450de",
+            "mode": 436
+          },
+          {
+            "path": ".python-version",
+            "bytes": 5,
+            "sha256": "7a41a41354ab8049091ef1a00253ca00567f5a1d3f9aef5502c0b4b5ce9ae707",
+            "mode": 436
+          },
+          {
+            "path": "LICENSE",
+            "bytes": 1068,
+            "sha256": "4543f6777abede354f09bc2ba6580bd475c364e7d6f39315bf9d315d033b48f4",
+            "mode": 436
+          },
+          {
+            "path": "README.md",
+            "bytes": 3613,
+            "sha256": "9a744dcb3f99f75e0e291b29845d6e9df1d462ccee59f1e71b3ce4f19a44f8c9",
+            "mode": 436
+          },
+          {
+            "path": "docs/api_reference.md",
+            "bytes": 5037,
+            "sha256": "994e421ebdc0c86458a4943fc5c9f126b84321c6bfde2be8c84b83da125e9627",
+            "mode": 436
+          },
+          {
+            "path": "docs/getting_started.md",
+            "bytes": 2011,
+            "sha256": "57a177138fcce37ab455826052949a6e0bb790ff1f915c978a7f1f3df648a415",
+            "mode": 436
+          },
+          {
+            "path": "examples/advanced/robustness_test.py",
+            "bytes": 7223,
+            "sha256": "c4d30f7d87cbb0e1df5d3dadb2f8dba147aac530b38af83f03d8f9ac9acf7427",
+            "mode": 436
+          },
+          {
+            "path": "examples/basic/watermark_audio.py",
+            "bytes": 2336,
+            "sha256": "3ec1c059e2bba1c13d7ee98ab03c23c7764296a8c207093a0ca1e58b2c05270f",
+            "mode": 436
+          },
+          {
+            "path": "makefile",
+            "bytes": 243,
+            "sha256": "7b731deb8bd8b37f92fbf2a2d6392eb79a647792c340ee491ac9a2577c3cd3a6",
+            "mode": 436
+          },
+          {
+            "path": "pyproject.toml",
+            "bytes": 2106,
+            "sha256": "09655d2deecc8e8257e440640e7062169158be804121737608754e0cb1723ac1",
+            "mode": 436
+          },
+          {
+            "path": "src/perth/__init__.py",
+            "bytes": 856,
+            "sha256": "9608dbd3ad783d7cfa5e455f4c0f4b55c232339f5c78b12fa35033928b90b6a1",
+            "mode": 436
+          },
+          {
+            "path": "src/perth/cli/__init__.py",
+            "bytes": 107,
+            "sha256": "878c345d2efabb0f93b36eb57fa86e325b5aeabf28ed54cf11b702d88477498a",
+            "mode": 436
+          },
+          {
+            "path": "src/perth/cli/watermark_cli.py",
+            "bytes": 5143,
+            "sha256": "071efea826d41b67ebe2c3695f6055c62e7db74f2fffebc01467303b9ceadc32",
+            "mode": 436
+          },
+          {
+            "path": "src/perth/config.py",
+            "bytes": 4561,
+            "sha256": "d7d16a15c53087c895345da7522ee4ca4e3354bad44c0de6871d80aa7ef6a492",
+            "mode": 436
+          },
+          {
+            "path": "src/perth/dummy_watermarker.py",
+            "bytes": 1794,
+            "sha256": "11645acda37fbc70c481e1f034a0ae62099f222783d0859c611a721f43b5a407",
+            "mode": 436
+          },
+          {
+            "path": "src/perth/perth_net/__init__.py",
+            "bytes": 211,
+            "sha256": "57cb1f06014a3c1828fe16569b8d2cddb0776672e12ab4df42ddf04d5ca91572",
+            "mode": 436
+          },
+          {
+            "path": "src/perth/perth_net/perth_net_implicit/__init__.py",
+            "bytes": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "mode": 436
+          },
+          {
+            "path": "src/perth/perth_net/perth_net_implicit/audio_processor.py",
+            "bytes": 1635,
+            "sha256": "54a725918961f0c468503a9c34eec8722643a90dcdbefff941b41b97db607793",
+            "mode": 436
+          },
+          {
+            "path": "src/perth/perth_net/perth_net_implicit/checkpoint_manager.py",
+            "bytes": 2224,
+            "sha256": "ea3e1a016ec654b630f85f11840d6b1a23388a794dff7d1d23437f32ef40691e",
+            "mode": 436
+          },
+          {
+            "path": "src/perth/perth_net/perth_net_implicit/config.py",
+            "bytes": 756,
+            "sha256": "e2f001e114e516f11cc2b8c093d12f3b186a7881f3a3fcd7d81c6ae9fbdf5b58",
+            "mode": 436
+          },
+          {
+            "path": "src/perth/perth_net/perth_net_implicit/model/__init__.py",
+            "bytes": 894,
+            "sha256": "1c8f62c99bc6c6bfddb9255f2101fb3c8219bd2df73f182da64fad607d5d5362",
+            "mode": 436
+          },
+          {
+            "path": "src/perth/perth_net/perth_net_implicit/model/decoder.py",
+            "bytes": 2879,
+            "sha256": "17e36a21196a801bc920cc4d0a7fb5a4b0811ccd6793fbb849423379e9ee9b4d",
+            "mode": 436
+          },
+          {
+            "path": "src/perth/perth_net/perth_net_implicit/model/encoder.py",
+            "bytes": 981,
+            "sha256": "d08b893760666c46e6497ed63c80e054702329c151f7ee96c5bb908412888bb5",
+            "mode": 436
+          },
+          {
+            "path": "src/perth/perth_net/perth_net_implicit/model/perth_net.py",
+            "bytes": 4144,
+            "sha256": "0679ea14ac124d350eb3dfc213dd8d9829b449cbd2da1acb06c030661565e33a",
+            "mode": 436
+          },
+          {
+            "path": "src/perth/perth_net/perth_net_implicit/perth_watermarker.py",
+            "bytes": 2730,
+            "sha256": "7bd8c5fd1ac5dac577f6d8f5f23ea7cbad7f28b449c1864996b2c4162fa2b417",
+            "mode": 436
+          },
+          {
+            "path": "src/perth/perth_net/perth_net_implicit/utils.py",
+            "bytes": 5104,
+            "sha256": "55bf374a355124dedf7f9bd5ee3535d8d65dba41f0a6363c7e3cb881da3c1eac",
+            "mode": 436
+          },
+          {
+            "path": "src/perth/perth_net/pretrained/implicit/hparams.yaml",
+            "bytes": 257,
+            "sha256": "c66e8f8ce5b09d100e719843a064d37a97c5aec13510824343bf4e096b3184db",
+            "mode": 436
+          },
+          {
+            "path": "src/perth/perth_net/pretrained/implicit/id.txt",
+            "bytes": 22,
+            "sha256": "f4129d0cce1fcd76a01c778dd46aeecc84130e38d83c98402abf2e1b9c49770d",
+            "mode": 436
+          },
+          {
+            "path": "src/perth/perth_net/pretrained/implicit/perth_net_250000.pth.tar",
+            "bytes": 37429684,
+            "sha256": "a15bce457ebc53ce5e6c9c3f11df78cf7ee2bf9cdab0a798902135b4c4027670",
+            "mode": 436
+          },
+          {
+            "path": "src/perth/utils.py",
+            "bytes": 6768,
+            "sha256": "6bf68c94d9a470dded54544e4ee9d63c3256455c1a1ffa280b1223297a83154d",
+            "mode": 436
+          },
+          {
+            "path": "src/perth/watermarker.py",
+            "bytes": 2392,
+            "sha256": "3e8587c30a4063c7b065ab415190fd5185d04f99f974b0cc47f338ecaa55446e",
+            "mode": 436
+          },
+          {
+            "path": "src/perth/waveform.py",
+            "bytes": 2523,
+            "sha256": "fb14829df176df64514eb510a6f3a40f5d379d836939df97db7a0ee5543ae8ca",
+            "mode": 436
+          },
+          {
+            "path": "tests/pytest.ini",
+            "bytes": 113,
+            "sha256": "f30e64fc8941132b1a53668db27fc469be43d4dcd28bea2a7cd7cb660cb51c21",
+            "mode": 436
+          },
+          {
+            "path": "tests/test_basic.py",
+            "bytes": 3033,
+            "sha256": "acc3fa79f060375288afcd4778d59098abd15150d9dc772e9d69502b22a05eb7",
+            "mode": 436
+          },
+          {
+            "path": "uv.lock",
+            "bytes": 560151,
+            "sha256": "493b145c2de5c13c923b8cef8922f521854f477cf6d022318ea8b1cf83ad3357",
+            "mode": 436
+          }
+        ]
+      }
+    }
+  },
+  "models": [
+    {
+      "name": "ve.pt",
+      "bytes": 5698626,
+      "sha256": "4b16d836bc598509860f6fa068165a8bb5e9ac84f05582dfcf278a5a372879f1",
+      "url": "https://huggingface.co/ResembleAI/chatterbox/resolve/5bb1f6ee58e50c3b8d408bc82a6d3740c2db6e18/ve.pt"
+    },
+    {
+      "name": "grapheme_mtl_merged_expanded_v1.json",
+      "bytes": 69989,
+      "sha256": "69632f47220a788a52ce2661d096453c5655e9bf25289d89a8d832c46ee07dbf",
+      "url": "https://huggingface.co/ResembleAI/chatterbox/resolve/5bb1f6ee58e50c3b8d408bc82a6d3740c2db6e18/grapheme_mtl_merged_expanded_v1.json"
+    },
+    {
+      "name": "Cangjie5_TC.json",
+      "bytes": 1920163,
+      "sha256": "7073fd9de919443ae88e0bd2449917a65fe54898a4413ed1edcc4b67f28bce8c",
+      "url": "https://huggingface.co/ResembleAI/chatterbox/resolve/5bb1f6ee58e50c3b8d408bc82a6d3740c2db6e18/Cangjie5_TC.json"
+    },
+    {
+      "name": "s3gen.pt",
+      "bytes": 1057165844,
+      "sha256": "9b9ff07e60b20c136e2b1b3d7563a24604e8d2c4c267888d1ee929dd0151d2a3",
+      "url": "https://huggingface.co/ResembleAI/chatterbox/resolve/5bb1f6ee58e50c3b8d408bc82a6d3740c2db6e18/s3gen.pt"
+    },
+    {
+      "name": "t3_mtl23ls_v3.safetensors",
+      "bytes": 2143989928,
+      "sha256": "5abca8321ede76f8e61f1cc0d19aea6c946b28871017ce8726f8a69203f05953",
+      "url": "https://huggingface.co/ResembleAI/chatterbox/resolve/5bb1f6ee58e50c3b8d408bc82a6d3740c2db6e18/t3_mtl23ls_v3.safetensors"
+    }
+  ],
+  "patches": [
+    {
+      "path": "src/chatterbox/models/tokenizers/tokenizer.py",
+      "original_sha256": "e169f02f14b008e8e7a4f29df66ecafaa29972ff4a38724b51545b8563861889",
+      "patched_sha256": "64a23132cd850fd9fdad5e3336077219f93830fc1e57bb394b473d54f8fdb6cc",
+      "replacements": [
+        {
+          "before": "            cangjie_file = hf_hub_download(\n                repo_id=REPO_ID,\n                filename=\"Cangjie5_TC.json\",\n                cache_dir=model_dir\n            )",
+          "after": "            cangjie_file = Path(model_dir) / \"Cangjie5_TC.json\""
+        },
+        {
+          "before": "        self.cangjie_converter = ChineseCangjieConverter(model_dir)",
+          "after": "        self.cangjie_model_dir = model_dir\n        self.cangjie_converter = None"
+        },
+        {
+          "before": "        if language_id == 'zh':\n            txt = self.cangjie_converter(txt)",
+          "after": "        if language_id == 'zh':\n            if self.cangjie_converter is None:\n                self.cangjie_converter = ChineseCangjieConverter(self.cangjie_model_dir)\n            txt = self.cangjie_converter(txt)"
+        }
+      ]
+    },
+    {
+      "path": "src/chatterbox/mtl_tts.py",
+      "original_sha256": "936759044e54cffe8c68b91b32e01da0bc032a1e084f769f0403080d86ad153c",
+      "patched_sha256": "95b095154a271e7e0caa369c5854dd91361122e489c62f315d9a813622db73fa",
+      "replacements": [
+        {
+          "before": "        t3.load_state_dict(t3_state)\n        t3.to(device).eval()",
+          "after": "        t3.load_state_dict(t3_state)\n        del t3_state\n        t3.to(device).eval()"
+        }
+      ]
+    }
+  ],
+  "watermark": {
+    "implementation": "PerthImplicitWatermarker",
+    "relative_checkpoint": "vendor/perth/src/perth/perth_net/pretrained/implicit/perth_net_250000.pth.tar",
+    "sha256": "a15bce457ebc53ce5e6c9c3f11df78cf7ee2bf9cdab0a798902135b4c4027670",
+    "bytes": 37429684,
+    "required": true
+  }
+}

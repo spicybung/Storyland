@@ -1,0 +1,165 @@
+{
+  "schema_version": 1,
+  "format": "MPEG-2 program stream with native Sony PSS private-stream PCM audio",
+  "video_stream_id": "0xE0",
+  "audio_stream_id": "0xBD",
+  "audio_private_header": "FF A0 00 00",
+  "audio_header_chunks": [
+    "SShd",
+    "SSbd"
+  ],
+  "target": "Storyland software playback on desktop and Android",
+  "ps2_hardware_compatibility": false,
+  "display_policy": {
+    "viewport": "Current game viewport or window aspect ratio",
+    "foreground": "Complete source frame fitted without distortion or cropping",
+    "remaining_area": "Dimmed centered cover copy of the same movie frame"
+  },
+  "notes": [
+    "The original full source frames and 1.0x timing are retained.",
+    "These HD assets exceed the original console decoder limits and are not advertised as PS2 hardware-compatible.",
+    "Video is MPEG-2 re-encoded; audio exactly matches decoded 16-bit source samples through the declared audio track duration.",
+    "Only terminal AAC padding beyond the declared source audio duration was excluded."
+  ],
+  "format_references": [
+    "https://azuco.sakura.ne.jp/fao/doc/pss.html",
+    "https://www.ffmpeg.org/doxygen/trunk/ads_8c_source.html"
+  ],
+  "assets": [
+    {
+      "id": "vcs_pc_intro",
+      "file": "intro_pc.pss",
+      "bytes": 94964396,
+      "sha256": "23045c1c4e21311661873c24cf300997fdfb9279a3e17e8a486f20fa8e8e66c5",
+      "game": "VCS",
+      "shader_profiles": [
+        "PC"
+      ],
+      "sequence_role": "game_intro",
+      "source": {
+        "file": "intro_HD_typography_restored (2).mp4",
+        "bytes": 59267260,
+        "sha256": "4f5081b6ce4282867543f612c582592ff0f5aec5fca785eae2117f612f1e7e23",
+        "video_codec": "h264",
+        "audio_codec": "aac",
+        "included_in_runtime_package": false
+      },
+      "video": {
+        "codec": "MPEG-2",
+        "profile": "Main",
+        "pixel_format": "yuv420p",
+        "width": 1920,
+        "height": 1680,
+        "sample_aspect_ratio": "1:1",
+        "display_aspect_ratio": "8:7",
+        "frame_rate": "30/1",
+        "frame_count": 2527,
+        "decoded_duration_seconds": 84.23333333333333,
+        "encoder": "FFmpeg 7.1.5 mpeg2video",
+        "quantizer": 3,
+        "gop_frames": 15,
+        "b_frames": 2,
+        "vbv_buffer_bits": 8000000,
+        "maximum_bit_rate": 50000000,
+        "source_framing_preserved": true,
+        "source_timing_preserved": true,
+        "lossless": false,
+        "full_frame_comparison": {
+          "frame_count": 2527,
+          "psnr_average_db": 52.225565,
+          "ssim_all": 0.997677,
+          "decode_exit_code": 0
+        },
+        "color_range": "tv",
+        "color_space": "bt709",
+        "duration_metadata_note": "The program-stream demuxer may estimate 84.166667 seconds because the last reordered frames share PES packets. All 2527 source frames are present. Playback must use decoded EOF and the 84.24-second audio endpoint."
+      },
+      "audio": {
+        "codec": "Sony PSS PCM16LE",
+        "sony_codec_id": 1,
+        "channels": 2,
+        "sample_rate": 48000,
+        "sample_frames": 4043520,
+        "duration_seconds": 84.24,
+        "channel_interleave_bytes": 512,
+        "source_decoded_pcm_sha256": "6a844b4bf82d6d20a02416eb30fe7e9ae1c457ed6f081ba672e64d113df6cbd0",
+        "terminal_aac_padding_sample_frames_excluded": 256,
+        "resampled": false,
+        "retimed": false,
+        "native_path_and_callback_decode_sample_exact": true,
+        "native_incremental_streaming_decode_sample_exact": true,
+        "streaming_header_highest_source_offset": 2128
+      },
+      "presentation_start_pts": 48000,
+      "time_base": "1/90000",
+      "playback_duration_seconds": 84.24,
+      "under_100_mib": true
+    },
+    {
+      "id": "reigns_studio_intro",
+      "file": "reigns_studio.pss",
+      "bytes": 25365862,
+      "sha256": "82e7862d1ad8ce8fcecbd110f06f61ddf3d69e328d3647023ba6ba50972c7972",
+      "game": "LCS/VCS",
+      "shader_profiles": [
+        "all"
+      ],
+      "sequence_role": "after_game_intro",
+      "source": {
+        "file": "Reigns_Studio_Intro_v12(1).mp4",
+        "bytes": 6185574,
+        "sha256": "15132694f0677cea265f769a9b5019cc7c1e2473752f48419e200132e30330e4",
+        "video_codec": "h264",
+        "audio_codec": "aac",
+        "included_in_runtime_package": false
+      },
+      "video": {
+        "codec": "MPEG-2",
+        "profile": "Main",
+        "pixel_format": "yuv420p",
+        "width": 1920,
+        "height": 1080,
+        "sample_aspect_ratio": "1:1",
+        "display_aspect_ratio": "16:9",
+        "frame_rate": "30/1",
+        "frame_count": 360,
+        "decoded_duration_seconds": 12.0,
+        "encoder": "FFmpeg 7.1.5 mpeg2video",
+        "quantizer": 2,
+        "gop_frames": 15,
+        "b_frames": 2,
+        "vbv_buffer_bits": 8000000,
+        "maximum_bit_rate": 50000000,
+        "source_framing_preserved": true,
+        "source_timing_preserved": true,
+        "lossless": false,
+        "full_frame_comparison": {
+          "frame_count": 360,
+          "psnr_average_db": 48.324548,
+          "ssim_all": 0.992604,
+          "decode_exit_code": 0
+        }
+      },
+      "audio": {
+        "codec": "Sony PSS PCM16LE",
+        "sony_codec_id": 1,
+        "channels": 2,
+        "sample_rate": 16000,
+        "sample_frames": 192000,
+        "duration_seconds": 12.0,
+        "channel_interleave_bytes": 512,
+        "source_decoded_pcm_sha256": "7374e9095d6df11ec27a6dd201af385d939586f75b8a71c20504b77fa686953e",
+        "terminal_aac_padding_sample_frames_excluded": 512,
+        "resampled": false,
+        "retimed": false,
+        "native_path_and_callback_decode_sample_exact": true,
+        "native_incremental_streaming_decode_sample_exact": true,
+        "streaming_header_highest_source_offset": 2128
+      },
+      "presentation_start_pts": 48000,
+      "time_base": "1/90000",
+      "playback_duration_seconds": 12.0,
+      "under_100_mib": true
+    }
+  ]
+}

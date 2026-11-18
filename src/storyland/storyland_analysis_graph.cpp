@@ -1,8 +1,9 @@
-#include "storyland_analysis_graph.h"
+#include "src/storyland/storyland_analysis_graph.h"
 
-#include "leeds_texture.h"
-#include "storyland_anim.h"
-#include "storyland_model.h"
+#include "src/leeds/leeds_texture.h"
+#include "src/leeds/leeds_anim.h"
+#include "src/leeds/leeds_model.h"
+#include "src/leeds/leeds_native_world.h"
 
 #include <algorithm>
 #include <cctype>
@@ -148,6 +149,7 @@ bool StorylandAnalysisGraph::build(
     const std::string& displayName,
     std::string& errorMessage) {
     graphNodes.clear();
+    graphEdges.clear();
     graphSummary.clear();
 
     if (bytes.empty()) {
@@ -156,21 +158,21 @@ bool StorylandAnalysisGraph::build(
     }
 
     const std::string ext = lowerAscii(extensionLower);
-    if (ext == ".dff" || ext == ".txd") {
+    if (ext == ".dff" || ext == ".txd" || ext == ".bsp") {
         return buildRenderWare(bytes, displayName, errorMessage);
     }
     if (ext == ".mdl") {
-        return buildMdl(bytes, displayName, errorMessage);
+        if (readU32(bytes,0) == 0x006D646Cu) return buildMdl(bytes, displayName, errorMessage);
+        return buildNativeChunk(bytes, displayName, errorMessage);
     }
-    if (ext == ".xtx" || ext == ".chk") {
+    if (ext == ".xtx" || ext == ".chk" || ext == ".tex") {
         return buildTextureArchive(bytes, ext, displayName, errorMessage);
     }
-    if (ext == ".anim") {
+    if (ext == ".anim" || ext == ".ifp") {
         return buildAnim(bytes, displayName, errorMessage);
     }
 
-    errorMessage = "Analyze Graph currently supports only DFF, TXD, MDL, XTX, CHK and ANIM.";
-    return false;
+    return buildNativeChunk(bytes, displayName, errorMessage);
 }
 
 bool StorylandAnalysisGraph::buildRenderWare(
@@ -405,6 +407,17 @@ bool StorylandAnalysisGraph::buildMdl(
             bone.sectionKind);
     }
 
+    for (const auto& collision : storylandDecodeEmbeddedMdlCollision(bytes)) {
+        const int collisionNode = addNode(root,collision.offset,96,0,0,"Collision model",
+            "Embedded native collision referenced by the MDL relocation table.");
+        std::map<uint8_t,size_t> surfaces;
+        for (const auto& triangle : collision.model.triangles) ++surfaces[triangle.surface];
+        for (const auto& box : collision.model.boxes) ++surfaces[box.surface];
+        for (const auto& sphere : collision.model.spheres) ++surfaces[sphere.surface];
+        for (const auto& surface : surfaces)
+            addNode(collisionNode,collision.offset,0,0,0,"Surface "+std::to_string(surface.first),std::to_string(surface.second)+" collision primitives");
+    }
+
     std::ostringstream summaryText;
     summaryText << displayName << ": Leeds MDL, "
                 << model.armatureBones().size() << " frames/bones, "
@@ -568,4 +581,49 @@ bool StorylandAnalysisGraph::buildAnim(
         " clips, " + std::to_string(anim.tracks().size()) + " tracks";
     errorMessage.clear();
     return true;
+}
+
+const std::vector<StorylandAnalysisGraphEdge>& StorylandAnalysisGraph::edges() const { return graphEdges; }
+
+bool StorylandAnalysisGraph::buildNativeChunk(const std::vector<uint8_t>& bytes,
+    const std::string& displayName, std::string& errorMessage) {
+    if (bytes.empty()) { errorMessage = "Resource has no bytes."; return false; }
+    const int root = addNode(-1, 0, bytes.size(), readU32(bytes,0), 0, displayName);
+    const int header = addNode(root, 0, std::min<size_t>(32,bytes.size()), 0, 0, "Container header");
+    const uint32_t limit = readU32(bytes,12), table = readU32(bytes,16), count = readU32(bytes,20);
+    if (bytes.size() >= 32 && limit >= 32 && limit <= bytes.size() && table >= limit &&
+        uint64_t(table)+uint64_t(count)*4 <= bytes.size() && count <= 1000000) {
+        const int data = addNode(root,32,limit-32,0,0,"Data blocks");
+        addNode(root,table,uint64_t(count)*4,0,0,"Pointer relocations ["+std::to_string(count)+"]");
+        std::map<uint32_t,int> targets;
+        std::vector<std::pair<uint32_t,uint32_t>> pointers;
+        for(uint32_t index=0;index<count;++index) {
+            const uint32_t field=readU32(bytes,uint64_t(table)+index*4ull);
+            if(field<32||uint64_t(field)+4>limit)continue;
+            const uint32_t target=readU32(bytes,field);
+            if(target<32||target>=limit)continue;
+            if(targets.size()>=8000 && !targets.count(target))continue;
+            targets.emplace(target,-1); pointers.emplace_back(field,target);
+        }
+        for(auto it=targets.begin();it!=targets.end();++it){
+            auto next=std::next(it);const uint32_t end=next==targets.end()?limit:next->first;
+            it->second=addNode(data,it->first,end-it->first,0,0,"Block "+hexValue(it->first),"Referenced by a native relocation pointer.");
+        }
+        for(const auto& pointer:pointers){
+            auto owner=targets.upper_bound(pointer.first);
+            int source=header;
+            if(owner!=targets.begin()){--owner;source=owner->second;}
+            const int target=targets[pointer.second];
+            if(source!=target && graphEdges.size()<30000)graphEdges.push_back({size_t(source),size_t(target),pointer.first});
+        }
+        graphSummary=displayName+": "+std::to_string(targets.size())+" referenced blocks, "+std::to_string(graphEdges.size())+" pointer links";
+    } else {
+        // Raw resources still have an inspectable byte graph without inventing
+        // pointer relationships or claiming that untyped bytes are geometry.
+        const uint64_t stride = std::max<uint64_t>(4096,(bytes.size()+255)/256);
+        for(uint64_t offset=32;offset<bytes.size();offset+=stride)
+            addNode(root,offset,std::min<uint64_t>(stride,bytes.size()-offset),0,0,"Data "+hexValue(offset));
+        graphSummary=displayName+": byte ranges";
+    }
+    errorMessage.clear();return true;
 }

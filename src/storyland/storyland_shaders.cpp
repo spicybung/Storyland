@@ -1,4 +1,4 @@
-#include "storyland_shaders.h"
+#include "src/storyland/storyland_shaders.h"
 
 const char* storylandStoriesVertexShaderSource() {
     return

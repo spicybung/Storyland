@@ -4,7 +4,7 @@
 #include <vector>
 
 enum class StorylandGxtFormat { Stories, ChinatownWars };
-enum class StorylandGxtEncoding { LcsFont, Windows1252, Unicode };
+enum class StorylandGxtEncoding { LcsFont, Windows1252, Unicode, Windows1251 };
 struct StorylandGxtEntry {
     std::string key;
     size_t table = 0;
@@ -30,6 +30,7 @@ public:
     bool saveToFile(const std::wstring& path, std::string& error) const;
     bool setText(size_t entry, const std::u16string& text, std::string& error);
     std::u16string text(size_t entry) const;
+    bool lookup(const std::string& key, const std::string& preferredTable, std::u16string& value) const;
     std::string summary() const;
     const std::vector<StorylandGxtEntry>& entries() const { return entries_; }
     const std::vector<StorylandGxtTable>& tables() const { return tables_; }

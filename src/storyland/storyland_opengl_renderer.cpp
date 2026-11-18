@@ -1,10 +1,11 @@
 #define NOMINMAX
-#include "storyland_opengl_renderer.h"
+#include "src/storyland/storyland_opengl_renderer.h"
 
 #ifdef _WIN32
 #include <windows.h>
 #endif
 #include <GL/gl.h>
+#include "src/graphics/storyland_directx.h"
 
 #include <algorithm>
 #include <cmath>

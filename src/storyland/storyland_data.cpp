@@ -1,5 +1,5 @@
-#include "storyland_data.h"
-#include "storyland_atomic_io.h"
+#include "src/storyland/storyland_data.h"
+#include "src/storyland/storyland_atomic_io.h"
 #include <algorithm>
 #include <cctype>
 #include <cmath>

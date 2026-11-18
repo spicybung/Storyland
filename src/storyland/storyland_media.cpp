@@ -1,4 +1,11 @@
-#include "storyland_media.h"
+#if defined(_WIN32) && !defined(NOMINMAX)
+#define NOMINMAX
+#endif
+#include "src/storyland/storyland_sdt.h"
+#include "src/storyland/storyland_vag_bank.h"
+#include "src/storyland/storyland_compressed_audio.h"
+#include "src/storyland/storyland_media.h"
+#include "src/storyland/storyland_radio_position.h"
 
 #include <algorithm>
 #include <array>
@@ -11,6 +18,13 @@
 #include <limits>
 #include <new>
 #include <sstream>
+#include <atomic>
+#include <thread>
+#include <mutex>
+#include "src/storyland/storyland_radio_vb.h"
+#include "src/storyland/storyland_pss_audio.h"
+#include "src/storyland/storyland_video_presentation.h"
+#include <chrono>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -22,7 +36,9 @@ extern "C" {
 }
 
 #ifdef _WIN32
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #include <mfapi.h>
 #include <mferror.h>
@@ -31,6 +47,8 @@ extern "C" {
 #include <propvarutil.h>
 #include <mmsystem.h>
 #endif
+
+#include "src/storyland/storyland_audio_output.h"
 
 namespace {
 
@@ -132,6 +150,8 @@ struct GameVideoDecoder {
     bool hasStartPts = false;
     bool inputEof = false;
     bool sentFlush = false;
+    bool hasDecodedFrame = false;
+    double frameInterval = 1.0 / 30.0;
 };
 
 std::string ffmpegError(int code) {
@@ -175,6 +195,25 @@ bool decodeNextGameVideoFrame(GameVideoDecoder* decoder, StorylandVideoFrame& ou
                 error = "Could not create the game video color converter.";
                 return false;
             }
+            const auto colorspace=decoder->decoded->colorspace==AVCOL_SPC_UNSPECIFIED?
+                decoder->codec->colorspace:decoder->decoded->colorspace;
+            int matrix=SWS_CS_ITU601;
+            switch(colorspace) {
+                case AVCOL_SPC_BT709:matrix=SWS_CS_ITU709;break;
+                case AVCOL_SPC_FCC:matrix=SWS_CS_FCC;break;
+                case AVCOL_SPC_SMPTE240M:matrix=SWS_CS_SMPTE240M;break;
+                case AVCOL_SPC_BT2020_NCL:
+                case AVCOL_SPC_BT2020_CL:matrix=SWS_CS_BT2020;break;
+                default:break;
+            }
+            const auto range=decoder->decoded->color_range==AVCOL_RANGE_UNSPECIFIED?
+                decoder->codec->color_range:decoder->decoded->color_range;
+            const int* coefficients=sws_getCoefficients(matrix);
+            if(sws_setColorspaceDetails(decoder->sws,coefficients,range==AVCOL_RANGE_JPEG?1:0,
+                coefficients,1,0,1<<16,1<<16)<0) {
+                error="Could not apply the game video's color matrix and range.";
+                return false;
+            }
 
             const uint64_t bytes64 = uint64_t(width) * uint64_t(height) * 4ull;
             if (bytes64 > uint64_t(std::numeric_limits<size_t>::max())) {
@@ -201,6 +240,9 @@ bool decodeNextGameVideoFrame(GameVideoDecoder* decoder, StorylandVideoFrame& ou
                 seconds = double(pts) * av_q2d(decoder->timeBase);
                 if (!std::isfinite(seconds) || seconds < 0.0) seconds = 0.0;
             }
+            if(decoder->hasDecodedFrame&&(pts==AV_NOPTS_VALUE||seconds<=positionSeconds))
+                seconds=positionSeconds+decoder->frameInterval;
+            decoder->hasDecodedFrame=true;
             positionSeconds = seconds;
             output.timestamp100ns = int64_t(std::llround(seconds * 10000000.0));
             av_frame_unref(decoder->decoded);
@@ -272,6 +314,7 @@ bool seekGameVideo(GameVideoDecoder* decoder, double targetSeconds, std::string&
     avcodec_flush_buffers(decoder->codec);
     decoder->inputEof = false;
     decoder->sentFlush = false;
+    decoder->hasDecodedFrame = false;
     av_packet_unref(decoder->packet);
     av_frame_unref(decoder->decoded);
     error.clear();
@@ -280,6 +323,26 @@ bool seekGameVideo(GameVideoDecoder* decoder, double targetSeconds, std::string&
 
 } // namespace
 
+#include "src/storyland/storyland_radio_stream.inc"
+
+bool StorylandMediaFile::loadRadioStream(const std::wstring& filePath, std::string& errorMessage, double startSeconds) {
+    close();
+    auto stream=std::make_shared<StorylandRadioStream>();
+    if(!stream->open(filePath,errorMessage,videoPreparationCancelled)||!stream->seek(startSeconds,errorMessage))return false;
+    StorylandMediaClip clip;
+    clip.name=std::filesystem::path(filePath).stem().u8string();
+    std::error_code sizeError;
+    clip.sourceSize=std::filesystem::file_size(std::filesystem::path(filePath),sizeError);
+    if(sizeError)clip.sourceSize=0;
+    clip.sampleRate=stream->rate();clip.channels=stream->channelCount();
+    clip.durationSeconds=stream->durationSeconds();
+    audioClips.push_back(std::move(clip));selectedAudioClip=0;
+    mediaKind=StorylandMediaKind::Audio;path=filePath;
+    radioStream=std::move(stream);errorMessage.clear();return true;
+}
+std::string StorylandMediaFile::radioPlaybackError() const {
+    return radioStream?radioStream->error():videoAudio?videoAudio->radioPlaybackError():videoAudioError;
+}
 StorylandMediaFile::StorylandMediaFile() = default;
 
 StorylandMediaFile::~StorylandMediaFile() {
@@ -290,7 +353,10 @@ StorylandMediaKind StorylandMediaFile::kind() const { return mediaKind; }
 const std::wstring& StorylandMediaFile::sourcePath() const { return path; }
 const std::vector<StorylandMediaClip>& StorylandMediaFile::clips() const { return audioClips; }
 int StorylandMediaFile::selectedClip() const { return selectedAudioClip; }
-const StorylandVideoFrame& StorylandMediaFile::videoFrame() const { return frame; }
+const StorylandVideoFrame& StorylandMediaFile::videoFrame() const {
+    static const StorylandVideoFrame pending;
+    return videoWaitingForPresentation?pending:frame;
+}
 uint32_t StorylandMediaFile::videoWidth() const { return decodedVideoWidth; }
 uint32_t StorylandMediaFile::videoHeight() const { return decodedVideoHeight; }
 double StorylandMediaFile::videoDurationSeconds() const { return decodedVideoDuration; }
@@ -332,14 +398,40 @@ bool StorylandMediaFile::replaceCurrentVideoFrame(const StorylandVideoFrame& rep
     return true;
 }
 bool StorylandMediaFile::videoDecoderReady() const { return videoReady; }
-bool StorylandMediaFile::isPlaying() const { return audioPlaying || videoPlaying; }
+bool StorylandMediaFile::isPlaying() const {
+    if(radioStream)return radioStream->isPlaying();
+#ifdef _WIN32
+    if(audioPlaying && pcmOutput)
+        return static_cast<StorylandAudioOutput*>(pcmOutput)->queued()!=0 || videoPlaying;
+#endif
+    return audioPlaying || videoPlaying;
+}
+
+bool StorylandMediaFile::playbackPositionMilliseconds(uint32_t& position) const {
+    if(radioStream)return radioStream->playbackPositionMilliseconds(position);
+#ifdef _WIN32
+    if(pcmOutput&&selectedAudioClip>=0&&size_t(selectedAudioClip)<audioClips.size()) {
+        position=static_cast<StorylandAudioOutput*>(pcmOutput)->milliseconds();
+        return true;
+    }
+#else
+    (void)position;
+#endif
+    return false;
+}
 
 void StorylandMediaFile::close() {
     stop();
+    videoAudio.reset();videoAudioError.clear();
+    radioStream.reset();
     closeVideoDecoder();
     path.clear();
     mediaKind = StorylandMediaKind::None;
     audioClips.clear();
+    sdtSourcePath.clear();
+    manhuntAudioBytes.clear();
+    manhuntSounds.clear();
+    manhuntAudioLoaded = false;
     selectedAudioClip = -1;
     frame = {};
     decodedVideoWidth = 0;
@@ -349,6 +441,11 @@ void StorylandMediaFile::close() {
     decodedVideoPosition = 0.0;
     decodedVideoFrameRate = 30.0;
     nextVideoDecodeTickMs = 0;
+    videoPlaybackStartTickMs = 0;
+    videoPlaybackStartPosition = 0;
+    decodedVideoPresentationStart = -1;
+    videoAudioLeadSeconds = 0;
+    videoWaitingForPresentation = false;
     videoDecodePath.clear();
     videoFrameOverrides.clear();
 }
@@ -357,7 +454,8 @@ bool StorylandMediaFile::loadFromFile(const std::wstring& filePath, std::string&
     close();
     const std::wstring ext = lowerExtension(filePath);
     bool ok = false;
-    if (ext == L".sdt") ok = loadSdt(filePath, errorMessage);
+    if (ext == L".ahx" || ext == L".vas" || ext == L".bnk" || ext == L".afs") ok = loadManhuntAudio(filePath, errorMessage);
+    else if (ext == L".sdt") ok = loadSdt(filePath, errorMessage);
     else if (ext == L".raw" || ext == L".vag") ok = loadRaw(filePath, errorMessage);
     else if (ext == L".vb") ok = loadVb(filePath, errorMessage);
     else if (ext == L".wav") {
@@ -376,279 +474,127 @@ bool StorylandMediaFile::loadFromFile(const std::wstring& filePath, std::string&
     else if (ext == L".pss" || ext == L".pmf" || ext == L".mpg" || ext == L".mpeg" || ext == L".mp4" ||
              ext == L".m4v" || ext == L".wmv" || ext == L".avi" || ext == L".mov" || ext == L".mkv" ||
              ext == L".ts" || ext == L".m2ts" || ext == L".mts" || ext == L".vob" ||
-             ext == L".3gp" || ext == L".3g2" || ext == L".webm" || ext == L".ogv" || ext == L".flv") {
+             ext == L".3gp" || ext == L".3g2" || ext == L".webm" || ext == L".ogv" || ext == L".flv" || ext == L".bik") {
         ok = loadVideo(filePath, errorMessage);
     } else {
         errorMessage = "Unsupported media extension.";
         return false;
     }
-    if (ok) path = filePath;
+    if (ok) {
+        path = filePath;
+        if(mediaKind==StorylandMediaKind::Video)ok=play(errorMessage);
+    }
     return ok;
+}
+
+bool StorylandMediaFile::prepareVideoPlayback(const std::wstring& filePath,
+    std::string& errorMessage,const std::shared_ptr<std::atomic<bool>>& cancelled) {
+    close();
+    videoPreparationCancelled=cancelled;
+    const auto interrupted=[&]() {
+        return cancelled&&cancelled->load(std::memory_order_acquire);
+    };
+    if(interrupted()) {errorMessage="Movie preparation cancelled.";return false;}
+    if(!loadVideo(filePath,errorMessage))return false;
+    path=filePath;
+    videoPlaying=false;
+    if(interrupted()) {close();errorMessage="Movie preparation cancelled.";return false;}
+    auto audio=std::make_shared<StorylandMediaFile>();
+    audio->videoPreparationCancelled=cancelled;
+    if(!audio->loadRadioStream(filePath,videoAudioError)) {
+        errorMessage="Movie audio: "+videoAudioError;
+        close();
+        return false;
+    }
+    if(interrupted()) {close();errorMessage="Movie preparation cancelled.";return false;}
+    videoAudioLeadSeconds=storylandVideoAudioLeadSeconds(decodedVideoPresentationStart,
+        audio->radioStream?audio->radioStream->presentationStartSeconds():-1);
+    videoAudio=std::move(audio);
+    errorMessage.clear();
+    return true;
 }
 
 bool StorylandMediaFile::decodeVag(const std::vector<uint8_t>& bytes, size_t offset, size_t size,
                                    uint32_t sampleRateHint, StorylandMediaClip& clip,
                                    std::string& errorMessage) const {
-    if (offset > bytes.size() || size > bytes.size() - offset || size < 0x30u) {
-        errorMessage = "VAG range is truncated.";
-        return false;
-    }
-    const uint8_t* base = bytes.data() + offset;
-    if (std::memcmp(base, "VAGp", 4u) != 0) {
-        errorMessage = "Audio entry does not begin with a VAGp header.";
-        return false;
-    }
-
-    uint32_t dataSize = readBe32(base + 0x0Cu);
-    uint32_t sampleRate = readBe32(base + 0x10u);
-    if (sampleRate == 0u) sampleRate = sampleRateHint;
-    if (sampleRate < 4000u || sampleRate > 192000u) {
-        errorMessage = "VAG sample rate is outside a sane range.";
-        return false;
-    }
-    if (dataSize == 0u || dataSize > size - 0x30u) dataSize = uint32_t(size - 0x30u);
-    dataSize &= ~15u;
-    if (dataSize == 0u) {
-        errorMessage = "VAG entry contains no complete ADPCM blocks.";
-        return false;
-    }
-
-    static constexpr int coefficients[5][2] = {
-        {0, 0}, {60, 0}, {115, -52}, {98, -55}, {122, -60}
-    };
-    const size_t blocks = dataSize / 16u;
-    if (blocks > kMaxDecodedPcmSamples / 28u) {
-        errorMessage = "VAG entry would decode to too many PCM samples.";
-        return false;
-    }
-
-    clip.pcm.clear();
-    clip.pcm.reserve(blocks * 28u);
-    int hist1 = 0;
-    int hist2 = 0;
-    const uint8_t* adpcm = base + 0x30u;
-    for (size_t block = 0; block < blocks; ++block) {
-        const uint8_t* packet = adpcm + block * 16u;
-        const uint8_t predictor = packet[0] >> 4u;
-        const uint8_t shift = packet[0] & 0x0Fu;
-        const uint8_t flags = packet[1];
-        if (predictor > 4u || shift > 12u) {
-            errorMessage = "VAG block has an invalid predictor or shift value.";
-            clip.pcm.clear();
-            return false;
-        }
-        for (size_t i = 0; i < 28u; ++i) {
-            const uint8_t packed = packet[2u + i / 2u];
-            int nibble = (i & 1u) == 0u ? int(packed & 0x0Fu) : int(packed >> 4u);
-            if (nibble >= 8) nibble -= 16;
-            int sample = (nibble << 12) >> shift;
-            sample += (hist1 * coefficients[predictor][0] + hist2 * coefficients[predictor][1] + 32) >> 6;
-            const int16_t pcm = clampPcm(sample);
-            hist2 = hist1;
-            hist1 = pcm;
-            clip.pcm.push_back(pcm);
-        }
-        if ((flags & 0x01u) != 0u || flags == 0x07u) break;
-    }
-
-    clip.sampleRate = sampleRate;
-    clip.channels = 1;
-    clip.durationSeconds = clip.pcm.empty() ? 0.0 : double(clip.pcm.size()) / double(sampleRate);
-    const std::string headerName = printableName(base + 0x20u, 16u);
-    if (!headerName.empty()) clip.name = headerName;
-    errorMessage.clear();
-    return true;
+    return storylandDecodeVagPcm(bytes,offset,size,sampleRateHint,clip,errorMessage);
 }
 
 bool StorylandMediaFile::loadVb(const std::wstring& filePath, std::string& errorMessage) {
-    std::vector<uint8_t> bytes;
-    if (!readFileBounded(filePath, bytes, errorMessage)) return false;
-
-    static constexpr uint32_t sampleRate = 32000u;
-    static constexpr size_t interleaveBytes = 0x2000u;
-    static constexpr size_t adpcmBlockBytes = 16u;
-    static constexpr size_t samplesPerBlock = 28u;
-    static constexpr int coefficients[5][2] = {
-        {0, 0}, {60, 0}, {115, -52}, {98, -55}, {122, -60}
-    };
-
-    if (bytes.empty() || (bytes.size() % adpcmBlockBytes) != 0u) {
-        errorMessage = "VB stream size is not aligned to 16-byte PS2 ADPCM blocks.";
-        return false;
-    }
-    if (bytes.size() < interleaveBytes * 2u) {
-        errorMessage = "VB stream is too small to contain one stereo interleave pair.";
-        return false;
-    }
-
-    const size_t blockCount = bytes.size() / adpcmBlockBytes;
-    for (size_t block = 0; block < blockCount; ++block) {
-        const uint8_t control = bytes[block * adpcmBlockBytes];
-        const uint8_t predictor = control >> 4u;
-        const uint8_t shift = control & 0x0Fu;
-        if (predictor > 4u || shift > 12u) {
-            std::ostringstream message;
-            message << "VB stream is not valid raw PS2 ADPCM: invalid block at 0x"
-                    << std::hex << (block * adpcmBlockBytes) << ".";
-            errorMessage = message.str();
-            return false;
-        }
-    }
-
-    const uint64_t decodedSamplesPerChannel =
-        (uint64_t(bytes.size()) / uint64_t(adpcmBlockBytes) / 2ull) * uint64_t(samplesPerBlock);
-    const uint64_t interleavedSampleCount = decodedSamplesPerChannel * 2ull;
-    if (interleavedSampleCount > uint64_t(kMaxDecodedPcmSamples)) {
-        errorMessage = "VB stream would decode to too many PCM samples.";
-        return false;
-    }
-
-    StorylandMediaClip clip;
-    clip.name = std::filesystem::path(filePath).stem().string();
-    clip.sourceOffset = 0u;
-    clip.sourceSize = bytes.size();
-    clip.sampleRate = sampleRate;
-    clip.channels = 2u;
-    clip.pcm.reserve(size_t(interleavedSampleCount));
-
-    std::array<int, 2> hist1{0, 0};
-    std::array<int, 2> hist2{0, 0};
-    std::array<std::vector<int16_t>, 2> channelChunk;
-    const size_t blocksPerInterleave = interleaveBytes / adpcmBlockBytes;
-    for (auto& channel : channelChunk) channel.reserve(blocksPerInterleave * samplesPerBlock);
-
-    auto decodeChannelChunk = [&](size_t byteOffset, size_t byteCount, int channelIndex) -> bool {
-        channelChunk[size_t(channelIndex)].clear();
-        const size_t chunkBlocks = byteCount / adpcmBlockBytes;
-        for (size_t block = 0; block < chunkBlocks; ++block) {
-            const uint8_t* packet = bytes.data() + byteOffset + block * adpcmBlockBytes;
-            const uint8_t predictor = packet[0] >> 4u;
-            const uint8_t shift = packet[0] & 0x0Fu;
-            for (size_t i = 0; i < samplesPerBlock; ++i) {
-                const uint8_t packed = packet[2u + i / 2u];
-                int nibble = (i & 1u) == 0u ? int(packed & 0x0Fu) : int(packed >> 4u);
-                if (nibble >= 8) nibble -= 16;
-                int sample = (nibble << 12) >> shift;
-                sample += (hist1[size_t(channelIndex)] * coefficients[predictor][0] +
-                           hist2[size_t(channelIndex)] * coefficients[predictor][1] + 32) >> 6;
-                const int16_t pcm = clampPcm(sample);
-                hist2[size_t(channelIndex)] = hist1[size_t(channelIndex)];
-                hist1[size_t(channelIndex)] = pcm;
-                channelChunk[size_t(channelIndex)].push_back(pcm);
-            }
-        }
-        return true;
-    };
-
-    size_t offset = 0u;
-    while (offset < bytes.size()) {
-        const size_t leftBytes = std::min(interleaveBytes, bytes.size() - offset);
-        if ((leftBytes % adpcmBlockBytes) != 0u) {
-            errorMessage = "VB left-channel interleave is truncated.";
-            return false;
-        }
-        if (!decodeChannelChunk(offset, leftBytes, 0)) return false;
-        offset += leftBytes;
-
-        if (offset >= bytes.size()) {
-            errorMessage = "VB stream ends after a left-channel interleave without matching right-channel data.";
-            return false;
-        }
-        const size_t rightBytes = std::min(interleaveBytes, bytes.size() - offset);
-        if ((rightBytes % adpcmBlockBytes) != 0u) {
-            errorMessage = "VB right-channel interleave is truncated.";
-            return false;
-        }
-        if (!decodeChannelChunk(offset, rightBytes, 1)) return false;
-        offset += rightBytes;
-
-        if (channelChunk[0].size() != channelChunk[1].size()) {
-            errorMessage = "VB stereo interleave channels contain different sample counts.";
-            return false;
-        }
-        for (size_t i = 0; i < channelChunk[0].size(); ++i) {
-            clip.pcm.push_back(channelChunk[0][i]);
-            clip.pcm.push_back(channelChunk[1][i]);
-        }
-    }
-
-    if (clip.pcm.empty()) {
-        errorMessage = "VB stream decoded to no PCM samples.";
-        return false;
-    }
-
-    clip.durationSeconds = double(clip.pcm.size() / 2u) / double(sampleRate);
-    audioClips.clear();
-    audioClips.push_back(std::move(clip));
-    selectedAudioClip = 0;
-    mediaKind = StorylandMediaKind::Audio;
-    errorMessage.clear();
-    return true;
+    return loadRadioStream(filePath,errorMessage);
 }
 
-bool StorylandMediaFile::loadSdt(const std::wstring& filePath, std::string& errorMessage) {
-    std::vector<uint8_t> sdt;
-    if (!readFileBounded(filePath, sdt, errorMessage)) return false;
-    if (sdt.empty() || (sdt.size() % 12u) != 0u) {
-        errorMessage = "SDT size is not a whole number of 12-byte entries.";
-        return false;
-    }
-    const size_t entryCount = sdt.size() / 12u;
-    if (entryCount > kMaxAudioClips) {
-        errorMessage = "SDT contains too many audio entries to inspect safely.";
-        return false;
-    }
 
-    std::filesystem::path rawPath(filePath);
-    rawPath.replace_extension(L".RAW");
-    if (!std::filesystem::exists(rawPath)) {
-        rawPath.replace_extension(L".raw");
-    }
-    if (!std::filesystem::exists(rawPath)) {
-        errorMessage = "The matching RAW sound bank was not found beside the SDT file.";
-        return false;
-    }
-
-    std::vector<uint8_t> raw;
-    if (!readFileBounded(rawPath.wstring(), raw, errorMessage)) return false;
-    audioClips.clear();
-    audioClips.reserve(entryCount);
-    for (size_t index = 0; index < entryCount; ++index) {
-        const uint8_t* row = sdt.data() + index * 12u;
-        const uint32_t offset = readLe32(row + 0u);
-        const uint32_t size = readLe32(row + 4u);
-        const uint32_t sampleRate = readLe32(row + 8u);
-        if (size == 0u) continue;
-        if (offset > raw.size() || size > raw.size() - offset) {
-            errorMessage = "SDT entry " + std::to_string(index) + " points outside the RAW sound bank.";
-            audioClips.clear();
-            return false;
-        }
+bool StorylandMediaFile::loadSdt(const std::wstring& filePath,std::string& errorMessage) {
+    std::vector<uint8_t> descriptors;
+    if(!readFileBounded(filePath,descriptors,errorMessage)) return false;
+    std::filesystem::path raw(filePath);raw.replace_extension(L".RAW");
+    if(!std::filesystem::is_regular_file(raw)) raw.replace_extension(L".raw");
+    std::error_code filesystemError;
+    const uint64_t rawSize=std::filesystem::file_size(raw,filesystemError);
+    if(filesystemError) {errorMessage="The matching RAW bank was not found.";return false;}
+    StorylandSdtIndex index;
+    if(!storylandDecodeSdtIndex(descriptors,rawSize,index,errorMessage)) return false;
+    audioClips.clear();audioClips.reserve(index.samples.size());
+    for(size_t row=0;row<index.samples.size();++row) {
+        const auto& sample=index.samples[row];
+        if(!sample.length) continue;
         StorylandMediaClip clip;
-        clip.sourceOffset = offset;
-        clip.sourceSize = size;
-        clip.sampleRate = sampleRate;
-        clip.name = "Sound " + std::to_string(index);
-        std::string decodeError;
-        if (!decodeVag(raw, offset, size, sampleRate, clip, decodeError)) {
-            errorMessage = "SDT entry " + std::to_string(index) + ": " + decodeError;
-            audioClips.clear();
-            return false;
-        }
-        if (clip.name.empty()) clip.name = "Sound " + std::to_string(index);
+        clip.sourceIndex=uint32_t(row);clip.sourceOffset=sample.offset;clip.sourceSize=sample.length;
+        clip.sampleRate=sample.frequency;clip.name="Sound "+std::to_string(row);
+        clip.durationSeconds=double(index.stride==20?sample.length/2:sample.length/16*28)/sample.frequency;
         audioClips.push_back(std::move(clip));
     }
-    if (audioClips.empty()) {
-        errorMessage = "SDT contains no playable VAG entries.";
-        return false;
-    }
-    selectedAudioClip = 0;
-    mediaKind = StorylandMediaKind::AudioArchive;
+    if(audioClips.empty()) {errorMessage="SDT contains no playable samples.";return false;}
+    sdtSourcePath=filePath;
+    mediaKind=StorylandMediaKind::AudioArchive;
+    return selectClip(0,errorMessage);
+}
+
+bool StorylandMediaFile::loadSdtClip(const std::wstring& filePath, size_t clipIndex,
+                                    std::string& errorMessage,uint64_t maximumBytes) {
+    close();
+    StorylandMediaClip clip;
+    const auto extension = lowerExtension(filePath);
+    const bool loaded = extension == L".raw" || extension == L".vag" ?
+        storylandLoadVagBankPcm(std::filesystem::path(filePath), clipIndex, clip, errorMessage, maximumBytes) :
+        storylandLoadSdtPcm(std::filesystem::path(filePath), clipIndex, clip, errorMessage, maximumBytes);
+    if (!loaded) return false;
+    audioClips.clear();
+    audioClips.push_back(std::move(clip));
+    selectedAudioClip=0;
+    mediaKind=StorylandMediaKind::Audio;
+    path=filePath;
     errorMessage.clear();
     return true;
 }
 
 bool StorylandMediaFile::loadRaw(const std::wstring& filePath, std::string& errorMessage) {
+    if (storylandPspVagBankNumber(std::filesystem::path(filePath)) >= 0) {
+        std::vector<StorylandVagBankSample> samples;
+        if (!storylandReadVagBankIndex(std::filesystem::path(filePath), samples, errorMessage)) return false;
+        audioClips.clear();
+        audioClips.reserve(samples.size());
+        for (size_t index = 0; index < samples.size(); ++index) {
+            const auto& sample = samples[index];
+            StorylandMediaClip clip;
+            clip.name = sample.name.empty() ? "Sound " + std::to_string(index) : sample.name;
+            clip.sourceIndex = uint32_t(index);
+            clip.sourceOffset = sample.offset;
+            clip.sourceSize = sample.length;
+            clip.sampleRate = sample.frequency;
+            clip.channels = 1;
+            clip.durationSeconds = double((sample.length - 48) / 16 * 28) / sample.frequency;
+            audioClips.push_back(std::move(clip));
+        }
+        if (audioClips.empty()) {
+            errorMessage = "The PSP VAG bank has no playable samples.";
+            return false;
+        }
+        sdtSourcePath = filePath;
+        mediaKind = audioClips.size() > 1 ? StorylandMediaKind::AudioArchive : StorylandMediaKind::Audio;
+        return selectClip(0, errorMessage);
+    }
     std::vector<uint8_t> raw;
     if (!readFileBounded(filePath, raw, errorMessage)) return false;
     if (raw.size() < 0x30u) {
@@ -777,259 +723,70 @@ bool StorylandMediaFile::loadWav(const std::wstring& filePath, std::string& erro
 }
 
 
-static bool appendAudioFrameS16(const AVFrame* frame, std::vector<int16_t>& output, std::string& error) {
-    if (!frame) {
-        error = "FFmpeg returned an empty audio frame.";
-        return false;
-    }
-    const int channels = frame->ch_layout.nb_channels;
-    const int samples = frame->nb_samples;
-    if (channels <= 0 || channels > 32 || samples < 0) {
-        error = "Decoded audio frame has invalid channel/sample counts.";
-        return false;
-    }
-    if (samples == 0) return true;
-
-    const AVSampleFormat format = static_cast<AVSampleFormat>(frame->format);
-    const bool planar = av_sample_fmt_is_planar(format) != 0;
-    const AVSampleFormat packed = planar ? av_get_packed_sample_fmt(format) : format;
-    if (packed == AV_SAMPLE_FMT_NONE) {
-        error = "Decoded audio uses an unsupported FFmpeg sample format.";
-        return false;
-    }
-
-    const uint64_t additions = uint64_t(samples) * uint64_t(channels);
-    if (additions > kMaxDecodedPcmSamples || output.size() > kMaxDecodedPcmSamples - size_t(additions)) {
-        error = "Decoded audio would exceed Storyland's PCM safety limit.";
-        return false;
-    }
-    output.reserve(output.size() + size_t(additions));
-
-    auto sampleToS16 = [&](const uint8_t* data, int index) -> int16_t {
-        switch (packed) {
-        case AV_SAMPLE_FMT_U8: {
-            const int value = int(reinterpret_cast<const uint8_t*>(data)[index]) - 128;
-            return int16_t(value << 8);
-        }
-        case AV_SAMPLE_FMT_S16:
-            return reinterpret_cast<const int16_t*>(data)[index];
-        case AV_SAMPLE_FMT_S32: {
-            const int32_t value = reinterpret_cast<const int32_t*>(data)[index];
-            return int16_t(value >> 16);
-        }
-        case AV_SAMPLE_FMT_S64: {
-            const int64_t value = reinterpret_cast<const int64_t*>(data)[index];
-            return int16_t(value >> 48);
-        }
-        case AV_SAMPLE_FMT_FLT: {
-            float value = reinterpret_cast<const float*>(data)[index];
-            if (!std::isfinite(value)) value = 0.0f;
-            value = std::max(-1.0f, std::min(1.0f, value));
-            return clampPcm(int(std::lrint(double(value) * 32767.0)));
-        }
-        case AV_SAMPLE_FMT_DBL: {
-            double value = reinterpret_cast<const double*>(data)[index];
-            if (!std::isfinite(value)) value = 0.0;
-            value = std::max(-1.0, std::min(1.0, value));
-            return clampPcm(int(std::lrint(value * 32767.0)));
-        }
-        default:
-            return 0;
-        }
-    };
-
-    switch (packed) {
-    case AV_SAMPLE_FMT_U8:
-    case AV_SAMPLE_FMT_S16:
-    case AV_SAMPLE_FMT_S32:
-    case AV_SAMPLE_FMT_S64:
-    case AV_SAMPLE_FMT_FLT:
-    case AV_SAMPLE_FMT_DBL:
-        break;
-    default:
-        error = "Decoded audio sample format is not supported by Storyland.";
-        return false;
-    }
-
-    for (int sample = 0; sample < samples; ++sample) {
-        for (int channel = 0; channel < channels; ++channel) {
-            if (planar) {
-                if (!frame->extended_data || !frame->extended_data[channel]) {
-                    error = "Decoded planar audio frame is missing a channel plane.";
-                    return false;
-                }
-                output.push_back(sampleToS16(frame->extended_data[channel], sample));
-            } else {
-                if (!frame->extended_data || !frame->extended_data[0]) {
-                    error = "Decoded packed audio frame has no sample data.";
-                    return false;
-                }
-                output.push_back(sampleToS16(frame->extended_data[0], sample * channels + channel));
-            }
-        }
-    }
-    return true;
-}
-
 bool StorylandMediaFile::loadCompressedAudio(const std::wstring& filePath, std::string& errorMessage) {
-    AVFormatContext* format = nullptr;
-    AVCodecContext* codec = nullptr;
-    AVPacket* packet = nullptr;
-    AVFrame* decoded = nullptr;
-
-    auto cleanup = [&]() {
-        if (packet) av_packet_free(&packet);
-        if (decoded) av_frame_free(&decoded);
-        if (codec) avcodec_free_context(&codec);
-        if (format) avformat_close_input(&format);
-    };
-
-    const std::string utf8Path = std::filesystem::path(filePath).u8string();
-    int result = avformat_open_input(&format, utf8Path.c_str(), nullptr, nullptr);
-    if (result < 0) {
-        errorMessage = "FFmpeg could not open this audio file: " + ffmpegError(result);
-        cleanup();
-        return false;
-    }
-    result = avformat_find_stream_info(format, nullptr);
-    if (result < 0) {
-        errorMessage = "FFmpeg could not read the audio stream information: " + ffmpegError(result);
-        cleanup();
-        return false;
-    }
-
-    const int streamIndex = av_find_best_stream(format, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
-    if (streamIndex < 0) {
-        errorMessage = "No decodable audio stream was found in this file.";
-        cleanup();
-        return false;
-    }
-    AVStream* stream = format->streams[streamIndex];
-    const AVCodec* decoder = avcodec_find_decoder(stream->codecpar->codec_id);
-    if (!decoder) {
-        errorMessage = "FFmpeg has no decoder for this audio codec.";
-        cleanup();
-        return false;
-    }
-
-    codec = avcodec_alloc_context3(decoder);
-    if (!codec) {
-        errorMessage = "Could not allocate the FFmpeg audio decoder.";
-        cleanup();
-        return false;
-    }
-    result = avcodec_parameters_to_context(codec, stream->codecpar);
-    if (result < 0 || (result = avcodec_open2(codec, decoder, nullptr)) < 0) {
-        errorMessage = "Could not initialize the FFmpeg audio decoder: " + ffmpegError(result);
-        cleanup();
-        return false;
-    }
-
-    packet = av_packet_alloc();
-    decoded = av_frame_alloc();
-    if (!packet || !decoded) {
-        errorMessage = "Could not allocate FFmpeg audio decode buffers.";
-        cleanup();
-        return false;
-    }
-
     StorylandMediaClip clip;
-    clip.name = std::filesystem::path(filePath).stem().u8string();
-    clip.sourceOffset = 0;
-    std::error_code sizeError;
-    clip.sourceSize = std::filesystem::file_size(std::filesystem::path(filePath), sizeError);
-    if (sizeError) clip.sourceSize = 0;
-
-    uint32_t sampleRate = 0;
-    uint16_t channels = 0;
-    bool sentFlush = false;
-    bool inputEof = false;
-
-    for (;;) {
-        result = avcodec_receive_frame(codec, decoded);
-        if (result == 0) {
-            const int frameChannels = decoded->ch_layout.nb_channels;
-            const int frameRate = decoded->sample_rate > 0 ? decoded->sample_rate : codec->sample_rate;
-            if (frameRate <= 0 || frameRate > 384000 || frameChannels <= 0 || frameChannels > 32) {
-                errorMessage = "Decoded audio frame reports invalid sample-rate/channel metadata.";
-                cleanup();
-                return false;
-            }
-            if (sampleRate == 0) {
-                sampleRate = uint32_t(frameRate);
-                channels = uint16_t(frameChannels);
-            } else if (sampleRate != uint32_t(frameRate) || channels != uint16_t(frameChannels)) {
-                errorMessage = "Audio stream changes sample rate or channel count mid-stream, which Storyland cannot play safely.";
-                cleanup();
-                return false;
-            }
-            if (!appendAudioFrameS16(decoded, clip.pcm, errorMessage)) {
-                cleanup();
-                return false;
-            }
-            av_frame_unref(decoded);
-            continue;
-        }
-        if (result == AVERROR_EOF) break;
-        if (result != AVERROR(EAGAIN)) {
-            errorMessage = "Audio decode failed: " + ffmpegError(result);
-            cleanup();
-            return false;
-        }
-
-        if (inputEof) {
-            if (!sentFlush) {
-                result = avcodec_send_packet(codec, nullptr);
-                sentFlush = true;
-                if (result < 0 && result != AVERROR_EOF) {
-                    errorMessage = "Could not flush the audio decoder: " + ffmpegError(result);
-                    cleanup();
-                    return false;
-                }
-                continue;
-            }
-            break;
-        }
-
-        av_packet_unref(packet);
-        result = av_read_frame(format, packet);
-        if (result == AVERROR_EOF) {
-            inputEof = true;
-            continue;
-        }
-        if (result < 0) {
-            errorMessage = "Could not read the next audio packet: " + ffmpegError(result);
-            cleanup();
-            return false;
-        }
-        if (packet->stream_index != streamIndex) {
-            av_packet_unref(packet);
-            continue;
-        }
-        result = avcodec_send_packet(codec, packet);
-        av_packet_unref(packet);
-        if (result < 0 && result != AVERROR(EAGAIN)) {
-            errorMessage = "Could not submit an audio packet to the decoder: " + ffmpegError(result);
-            cleanup();
-            return false;
-        }
-    }
-
-    cleanup();
-    if (clip.pcm.empty() || sampleRate == 0 || channels == 0) {
-        errorMessage = "The audio stream decoded to no PCM samples.";
-        return false;
-    }
-
-    clip.sampleRate = sampleRate;
-    clip.channels = channels;
-    clip.durationSeconds = double(clip.pcm.size()) / (double(sampleRate) * double(channels));
+    if (!storylandDecodeCompressedAudio(std::filesystem::path(filePath), clip, errorMessage)) return false;
     audioClips.clear();
     audioClips.push_back(std::move(clip));
     selectedAudioClip = 0;
     mediaKind = StorylandMediaKind::Audio;
-    errorMessage.clear();
     return true;
+}
+
+static bool decodeManhuntAhx(const std::vector<uint8_t>& source, const StorylandManhuntSound& sound,
+    StorylandMediaClip& clip, std::string& error) {
+    std::vector<uint8_t> mpeg;
+    if (!storylandBuildManhuntAhxMpeg(source, sound, mpeg, error)) return false;
+    const AVCodec* decoder = avcodec_find_decoder(AV_CODEC_ID_MP2);
+    AVCodecContext* codec = decoder ? avcodec_alloc_context3(decoder) : nullptr;
+    AVPacket* packet = av_packet_alloc();
+    AVFrame* frame = av_frame_alloc();
+    auto cleanup = [&]() { av_packet_free(&packet); av_frame_free(&frame); avcodec_free_context(&codec); };
+    if (!codec || !packet || !frame || avcodec_open2(codec, decoder, nullptr) < 0) {
+        error = "Could not initialize the AHX MPEG audio decoder.";
+        cleanup(); return false;
+    }
+    clip.pcm.clear();
+    for (size_t offset = 0; offset < mpeg.size(); offset += 1044) {
+        if (av_new_packet(packet, 1044) < 0) { error = "Could not allocate AHX audio packet."; cleanup(); return false; }
+        std::memcpy(packet->data, mpeg.data() + offset, 1044);
+        int result = avcodec_send_packet(codec, packet);
+        av_packet_unref(packet);
+        if (result < 0) { error = "Could not decode AHX audio packet: " + ffmpegError(result); cleanup(); return false; }
+        while ((result = avcodec_receive_frame(codec, frame)) == 0) {
+            if (!storylandAppendAudioFrameS16(frame, clip.pcm, error)) { cleanup(); return false; }
+            av_frame_unref(frame);
+        }
+        if (result != AVERROR(EAGAIN) && result != AVERROR_EOF) { error = "AHX audio decode failed."; cleanup(); return false; }
+    }
+    const size_t expected = size_t(sound.sampleCount) * sound.channels;
+    if (clip.pcm.size() < expected) { error = "AHX decoder returned incomplete audio."; cleanup(); return false; }
+    clip.pcm.resize(expected);
+    clip.sampleRate = sound.sampleRate;
+    clip.channels = sound.channels;
+    cleanup(); error.clear(); return true;
+}
+
+bool StorylandMediaFile::loadManhuntAudio(const std::wstring& filePath, std::string& errorMessage) {
+    if (!readFileBounded(filePath, manhuntAudioBytes, errorMessage)) return false;
+    if (!storylandReadManhuntSounds(manhuntAudioBytes, manhuntSounds, errorMessage)) return false;
+    manhuntAudioLoaded = true;
+    if (manhuntSounds.empty()) {
+        mediaKind = StorylandMediaKind::AudioArchive;
+        errorMessage.clear();
+        return true;
+    }
+    for (const auto& sound : manhuntSounds) {
+        StorylandMediaClip clip;
+        clip.name = sound.name;
+        clip.sourceOffset = sound.offset; clip.sourceSize = sound.size;
+        clip.sampleRate = sound.sampleRate; clip.channels = sound.channels;
+        clip.durationSeconds = sound.adx ? double(sound.sampleCount) / sound.sampleRate :
+            double(sound.pcm16 ? sound.size / 2 : sound.size / 16 * 28) / sound.sampleRate;
+        audioClips.push_back(std::move(clip));
+    }
+    mediaKind = audioClips.size() > 1 ? StorylandMediaKind::AudioArchive : StorylandMediaKind::Audio;
+    return selectClip(0, errorMessage);
 }
 
 bool StorylandMediaFile::selectClip(size_t index, std::string& errorMessage) {
@@ -1037,15 +794,31 @@ bool StorylandMediaFile::selectClip(size_t index, std::string& errorMessage) {
         errorMessage = "Audio selection is out of range.";
         return false;
     }
-    stopWaveOut();
+    stopPcmOutput();
+    if(!sdtSourcePath.empty()&&audioClips[index].pcm.empty()) {
+        StorylandMediaFile selected;
+        if(!selected.loadSdtClip(sdtSourcePath,audioClips[index].sourceIndex,errorMessage,64u*1024u*1024u)) return false;
+        for(auto& clip:audioClips) std::vector<int16_t>().swap(clip.pcm);
+        auto& decoded=selected.audioClips.front();
+        auto& destination=audioClips[index];
+        destination.pcm=std::move(decoded.pcm);destination.sampleRate=decoded.sampleRate;
+        destination.channels=decoded.channels;destination.durationSeconds=decoded.durationSeconds;
+    }
+    if (!manhuntSounds.empty()) {
+        for (auto& clip : audioClips) std::vector<int16_t>().swap(clip.pcm);
+        if (manhuntSounds[index].ahx) {
+            if (!decodeManhuntAhx(manhuntAudioBytes, manhuntSounds[index], audioClips[index], errorMessage)) return false;
+        } else if (!storylandDecodeManhuntSound(manhuntAudioBytes, manhuntSounds[index], audioClips[index].pcm, errorMessage)) return false;
+        audioClips[index].durationSeconds = double(audioClips[index].pcm.size()) / (audioClips[index].sampleRate * audioClips[index].channels);
+    }
     selectedAudioClip = int(index);
     errorMessage.clear();
     return true;
 }
 
-bool StorylandMediaFile::startWaveOut(const StorylandMediaClip& clip, std::string& errorMessage) {
+bool StorylandMediaFile::startPcmOutput(const StorylandMediaClip& clip, std::string& errorMessage) {
 #ifdef _WIN32
-    stopWaveOut();
+    stopPcmOutput();
     if (clip.pcm.empty() || clip.sampleRate == 0u || (clip.channels != 1u && clip.channels != 2u)) {
         errorMessage = "Selected sound has no decoded PCM audio.";
         return false;
@@ -1054,38 +827,38 @@ bool StorylandMediaFile::startWaveOut(const StorylandMediaClip& clip, std::strin
         errorMessage = "Selected sound is too large for the Windows wave output API.";
         return false;
     }
-    WAVEFORMATEX format{};
-    format.wFormatTag = WAVE_FORMAT_PCM;
-    format.nChannels = clip.channels;
-    format.nSamplesPerSec = clip.sampleRate;
-    format.wBitsPerSample = 16;
-    format.nBlockAlign = WORD(format.nChannels * sizeof(int16_t));
-    format.nAvgBytesPerSec = format.nSamplesPerSec * format.nBlockAlign;
-
-    HWAVEOUT handle = nullptr;
-    MMRESULT result = waveOutOpen(&handle, WAVE_MAPPER, &format, 0, 0, CALLBACK_NULL);
-    if (result != MMSYSERR_NOERROR || !handle) {
-        errorMessage = "Windows could not open an audio output device.";
-        return false;
+    auto output=std::make_unique<StorylandAudioOutput>();
+    if(!output->open(clip.sampleRate,clip.channels,errorMessage))return false;
+    size_t first=0, last=clip.pcm.size();
+    if (playbackLooping && clip.loopStartFrame>=0 && clip.loopEndFrame>clip.loopStartFrame &&
+        uint64_t(clip.loopEndFrame)*clip.channels<=clip.pcm.size()) {
+        first=size_t(clip.loopStartFrame)*clip.channels;
+        last=size_t(clip.loopEndFrame)*clip.channels;
     }
-
-    waveBytes.resize(clip.pcm.size() * sizeof(int16_t));
-    std::memcpy(waveBytes.data(), clip.pcm.data(), waveBytes.size());
-    WAVEHDR* header = new WAVEHDR{};
-    header->lpData = reinterpret_cast<LPSTR>(waveBytes.data());
-    header->dwBufferLength = DWORD(waveBytes.size());
-    if (waveOutPrepareHeader(handle, header, sizeof(*header)) != MMSYSERR_NOERROR ||
-        waveOutWrite(handle, header, sizeof(*header)) != MMSYSERR_NOERROR) {
-        waveOutReset(handle);
-        waveOutUnprepareHeader(handle, header, sizeof(*header));
-        waveOutClose(handle);
-        delete header;
-        waveBytes.clear();
-        errorMessage = "Windows could not queue the decoded audio buffer.";
-        return false;
+    if(frontendAmbience==StorylandFrontendAmbience::None) {
+        pcmBytes.resize((last-first)*sizeof(int16_t));
+        std::memcpy(pcmBytes.data(),clip.pcm.data()+first,pcmBytes.size());
+    } else {
+        std::vector<int16_t> samples(clip.pcm.begin()+first,clip.pcm.begin()+last);
+        if(frontendAmbience==StorylandFrontendAmbience::Menu&&!playbackLooping)
+            samples.resize(samples.size()+StorylandFrontendEcho::menuTailFrames(clip.sampleRate)*clip.channels,0);
+        if(samples.size()>std::numeric_limits<DWORD>::max()/sizeof(int16_t)) {
+            errorMessage="Selected sound is too large for the Windows wave output API.";
+            return false;
+        }
+        StorylandFrontendEcho echo(clip.sampleRate,clip.channels,frontendAmbience);
+        echo.process(samples.data(),samples.size());
+        pcmBytes.resize(samples.size()*sizeof(int16_t));
+        std::memcpy(pcmBytes.data(),samples.data(),pcmBytes.size());
     }
-    waveOutHandle = handle;
-    waveHeader = header;
+    output->gain(playbackGain);
+    output->pitch(playbackPitch);
+    if(!output->submit(pcmBytes.data(),uint32_t(pcmBytes.size()),playbackLooping)||
+        !output->pause(playbackPaused)) {
+        output->close();pcmBytes.clear();
+        errorMessage="Windows could not queue decoded audio.";return false;
+    }
+    pcmOutput=output.release();
     audioPlaying = true;
     errorMessage.clear();
     return true;
@@ -1096,30 +869,34 @@ bool StorylandMediaFile::startWaveOut(const StorylandMediaClip& clip, std::strin
 #endif
 }
 
-void StorylandMediaFile::stopWaveOut() {
+void StorylandMediaFile::stopPcmOutput() {
 #ifdef _WIN32
-    HWAVEOUT handle = reinterpret_cast<HWAVEOUT>(waveOutHandle);
-    WAVEHDR* header = reinterpret_cast<WAVEHDR*>(waveHeader);
-    if (handle) {
-        waveOutReset(handle);
-        if (header) waveOutUnprepareHeader(handle, header, sizeof(*header));
-        waveOutClose(handle);
-    }
-    delete header;
-    waveOutHandle = nullptr;
-    waveHeader = nullptr;
-    waveBytes.clear();
+    delete static_cast<StorylandAudioOutput*>(pcmOutput);
+    pcmOutput=nullptr;
+    pcmBytes.clear();
 #endif
     audioPlaying = false;
 }
 
+bool StorylandMediaFile::loadAudioTrackFromVideo(const std::wstring& filePath, std::string& errorMessage) {
+    close();
+    if(!loadRadioStream(filePath,errorMessage))return false;
+    setPlaybackLooping(false);
+    return true;
+}
+
 bool StorylandMediaFile::play(std::string& errorMessage) {
+    if(radioStream) {
+        radioStream->setGain(playbackGain);
+        radioStream->setPaused(playbackPaused);
+        return radioStream->play(errorMessage);
+    }
     if (mediaKind == StorylandMediaKind::Audio || mediaKind == StorylandMediaKind::AudioArchive) {
         if (selectedAudioClip < 0 || size_t(selectedAudioClip) >= audioClips.size()) {
             errorMessage = "Select a sound first.";
             return false;
         }
-        return startWaveOut(audioClips[size_t(selectedAudioClip)], errorMessage);
+        return startPcmOutput(audioClips[size_t(selectedAudioClip)], errorMessage);
     }
     if (mediaKind == StorylandMediaKind::Video) {
         if (!videoReady) {
@@ -1149,8 +926,33 @@ bool StorylandMediaFile::play(std::string& errorMessage) {
             decodedVideoPosition = 0.0;
             frame = {};
         }
-        nextVideoDecodeTickMs = 0;
+        videoPlaybackStartTickMs=GetTickCount64();
+        videoPlaybackStartPosition=decodedVideoPosition;
+        videoWaitingForPresentation=videoAudioLeadSeconds>0;
+        nextVideoDecodeTickMs=videoPlaybackStartTickMs+
+            uint64_t(std::llround(1000.0/std::max(1.0,decodedVideoFrameRate)));
 #endif
+        if(videoAudio&&!videoAudio->isPlaying()) {
+            videoAudio->setPlaybackLooping(false);
+            videoAudio->setPlaybackGain(playbackGain);
+            videoAudio->setPlaybackPaused(playbackPaused);
+            if(!videoAudio->play(videoAudioError)) {
+                if(videoPreparationCancelled) {
+                    videoPlaying=false;
+                    errorMessage="Movie audio output: "+videoAudioError;
+                    return false;
+                }
+                videoAudio.reset();
+            }
+        } else if(!videoAudio) {
+            auto audio=std::make_shared<StorylandMediaFile>();
+            if(audio->loadRadioStream(path,videoAudioError,std::max(0.0,decodedVideoPosition))) {
+                audio->setPlaybackLooping(false);
+                audio->setPlaybackGain(playbackGain);
+                audio->setPlaybackPaused(playbackPaused);
+                if(audio->play(videoAudioError))videoAudio=std::move(audio);
+            }
+        }
         videoPlaying = true;
         errorMessage.clear();
         return true;
@@ -1160,7 +962,10 @@ bool StorylandMediaFile::play(std::string& errorMessage) {
 }
 
 void StorylandMediaFile::stop() {
-    stopWaveOut();
+    if(videoAudio)videoAudio->stop();
+    if(radioStream)radioStream->stop();
+    stopPcmOutput();
+    playbackPaused = false;
     videoPlaying = false;
 }
 
@@ -1378,8 +1183,16 @@ bool StorylandMediaFile::loadVideo(const std::wstring& filePath, std::string& er
     }
 
     const std::wstring extension = lowerExtension(filePath);
-    if (extension == L".pmf" || extension == L".pss") {
-        AVFormatContext* format = nullptr;
+    if (extension == L".pmf" || extension == L".pss" || videoPreparationCancelled) {
+        AVFormatContext* format = avformat_alloc_context();
+        if(!format) {errorMessage="Could not allocate the movie input.";return false;}
+        if(extension==L".pss")format->video_codec_id=AV_CODEC_ID_MPEG2VIDEO;
+        if(videoPreparationCancelled) {
+            format->interrupt_callback.callback=[](void* value) -> int {
+                return static_cast<std::atomic<bool>*>(value)->load(std::memory_order_acquire)?1:0;
+            };
+            format->interrupt_callback.opaque=videoPreparationCancelled.get();
+        }
         const std::string utf8Path = std::filesystem::path(filePath).u8string();
         int ff = avformat_open_input(&format, utf8Path.c_str(), nullptr, nullptr);
         if (ff < 0 || !format) {
@@ -1436,6 +1249,8 @@ bool StorylandMediaFile::loadVideo(const std::wstring& filePath, std::string& er
         decoder->timeBase = stream->time_base;
         decoder->hasStartPts = stream->start_time != AV_NOPTS_VALUE;
         decoder->startPts = decoder->hasStartPts ? stream->start_time : 0;
+        decodedVideoPresentationStart=decoder->hasStartPts?
+            double(decoder->startPts)*av_q2d(stream->time_base):-1;
         if (!decoder->decoded || !decoder->packet || decoder->timeBase.num == 0 || decoder->timeBase.den == 0) {
             closeGameVideoDecoder(decoder);
             errorMessage = "Could not allocate FFmpeg frame/packet state for the game video.";
@@ -1453,6 +1268,7 @@ bool StorylandMediaFile::loadVideo(const std::wstring& filePath, std::string& er
         if (rate.num > 0 && rate.den > 0) decodedVideoFrameRate = av_q2d(rate);
         if (!std::isfinite(decodedVideoFrameRate) || decodedVideoFrameRate < 1.0 || decodedVideoFrameRate > 240.0)
             decodedVideoFrameRate = 30.0;
+        decoder->frameInterval=1.0/decodedVideoFrameRate;
         if (stream->duration != AV_NOPTS_VALUE)
             decodedVideoDuration = double(stream->duration) * av_q2d(stream->time_base);
         else if (format->duration != AV_NOPTS_VALUE)
@@ -1585,17 +1401,48 @@ bool StorylandMediaFile::tickVideo(std::string& errorMessage) {
     if (mediaKind != StorylandMediaKind::Video || !videoReady) return true;
     if (!sourceReader && !gameVideoDecoder) return true;
     if (!videoPlaying && !frame.bgra.empty()) return true;
+    if(playbackPaused)return true;
     if (gameVideoDecoder) {
         const uint64_t nowMs = GetTickCount64();
-        if (!frame.bgra.empty() && nextVideoDecodeTickMs != 0u && nowMs < nextVideoDecodeTickMs) return true;
-        const bool gotFrame = decodeNextGameVideoFrame(reinterpret_cast<GameVideoDecoder*>(gameVideoDecoder),
-                                                       frame, decodedVideoPosition, errorMessage);
-        if (!gotFrame) {
-            if (errorMessage.empty()) {
-                videoPlaying = false;
-                return true;
+        if(videoWaitingForPresentation) {
+            const auto audioError=radioPlaybackError();
+            if(!audioError.empty()||!videoAudio||!videoAudio->isPlaying()) {
+                videoPlaying=false;
+                errorMessage=audioError.empty()?"Movie audio ended before its first video presentation.":
+                    "Movie audio: "+audioError;
+                return false;
             }
-            return false;
+            uint32_t audioMilliseconds=0;
+            if(!videoAudio->playbackPositionMilliseconds(audioMilliseconds)||
+                !storylandVideoPresentationDue(double(audioMilliseconds)/1000.0,videoAudioLeadSeconds))return true;
+            videoWaitingForPresentation=false;
+            const uint64_t elapsed=uint64_t(std::llround(std::max(0.0,
+                double(audioMilliseconds)-videoAudioLeadSeconds*1000.0)));
+            videoPlaybackStartTickMs=nowMs-std::min(nowMs,elapsed);
+            videoPlaybackStartPosition=decodedVideoPosition;
+            nextVideoDecodeTickMs=videoPlaybackStartTickMs+
+                uint64_t(std::llround(1000.0/std::max(1.0,decodedVideoFrameRate)));
+        }
+        if (!frame.bgra.empty() && nextVideoDecodeTickMs != 0u && nowMs < nextVideoDecodeTickMs) return true;
+        if(!videoPlaybackStartTickMs) {
+            videoPlaybackStartTickMs=nowMs;
+            videoPlaybackStartPosition=decodedVideoPosition;
+        }
+        for(unsigned decoded=0;decoded<16;++decoded) {
+            const bool gotFrame = decodeNextGameVideoFrame(reinterpret_cast<GameVideoDecoder*>(gameVideoDecoder),
+                                                           frame, decodedVideoPosition, errorMessage);
+            if (!gotFrame) {
+                if (errorMessage.empty()) {
+                    videoPlaying = false;
+                    if(videoAudio)videoAudio->stop();
+                    return true;
+                }
+                return false;
+            }
+            const double nextSeconds=std::max(0.0,decodedVideoPosition-videoPlaybackStartPosition)+
+                1.0/std::max(1.0,decodedVideoFrameRate);
+            nextVideoDecodeTickMs=videoPlaybackStartTickMs+uint64_t(std::llround(nextSeconds*1000.0));
+            if(!videoPlaying||nowMs<nextVideoDecodeTickMs)break;
         }
         decodedVideoWidth = frame.width;
         decodedVideoHeight = frame.height;
@@ -1608,8 +1455,6 @@ bool StorylandMediaFile::tickVideo(std::string& errorMessage) {
                 frame.timestamp100ns = decodedTimestamp;
             }
         }
-        const double frameMilliseconds = 1000.0 / std::max(1.0, decodedVideoFrameRate);
-        nextVideoDecodeTickMs = nowMs + uint64_t(std::max(1.0, frameMilliseconds));
         errorMessage.clear();
         return true;
     }
@@ -1626,6 +1471,7 @@ bool StorylandMediaFile::tickVideo(std::string& errorMessage) {
     }
     if ((streamFlags & MF_SOURCE_READERF_ENDOFSTREAM) != 0u) {
         videoPlaying = false;
+                if(videoAudio)videoAudio->stop();
         if (sample) sample->Release();
         return true;
     }
@@ -1686,6 +1532,7 @@ bool StorylandMediaFile::tickVideo(std::string& errorMessage) {
 }
 
 bool StorylandMediaFile::stepVideoFrame(int direction, std::string& errorMessage) {
+    if(videoAudio)videoAudio->stop();
 #ifdef _WIN32
     if (mediaKind != StorylandMediaKind::Video || !videoReady || (!sourceReader && !gameVideoDecoder)) {
         errorMessage = "No decoded video is open.";
@@ -1789,6 +1636,7 @@ bool StorylandMediaFile::stepVideoFrame(int direction, std::string& errorMessage
 
 
 bool StorylandMediaFile::seekVideoFrame(uint64_t frameIndex, std::string& errorMessage) {
+    if(videoAudio)videoAudio->stop();
 #ifdef _WIN32
     if (mediaKind != StorylandMediaKind::Video || !videoReady || (!sourceReader && !gameVideoDecoder)) {
         errorMessage = "No decoded video is open.";
@@ -1894,4 +1742,52 @@ std::string StorylandMediaFile::summary() const {
         out << "No media loaded";
     }
     return out.str();
+}
+
+void StorylandMediaFile::setFrontendAmbience(StorylandFrontendAmbience effect) {
+    frontendAmbience=effect;
+    if(radioStream)radioStream->setFrontendAmbience(effect);
+}
+
+void StorylandMediaFile::setPlaybackGain(float gain) {
+    const float nextGain=std::isfinite(gain)?std::clamp(gain,0.0f,1.0f):1.0f;
+    if(nextGain==playbackGain)return;
+    playbackGain=nextGain;
+    if(videoAudio)videoAudio->setPlaybackGain(playbackGain);
+    if(radioStream)radioStream->setGain(playbackGain);
+#ifdef _WIN32
+    if (pcmOutput) {
+        static_cast<StorylandAudioOutput*>(pcmOutput)->gain(playbackGain);
+    }
+#endif
+}
+void StorylandMediaFile::setPlaybackLooping(bool looping) {
+    playbackLooping=looping;
+    if(radioStream)radioStream->setLooping(looping);
+}
+void StorylandMediaFile::setPlaybackPitch(float pitch) {
+    const float nextPitch=std::isfinite(pitch)?std::clamp(pitch,0.5f,2.0f):1.0f;
+    if(nextPitch==playbackPitch)return;
+    playbackPitch=nextPitch;
+#ifdef _WIN32
+    if (pcmOutput) static_cast<StorylandAudioOutput*>(pcmOutput)->pitch(playbackPitch);
+#endif
+}
+
+void StorylandMediaFile::setPlaybackPaused(bool paused) {
+    if (playbackPaused == paused) return;
+    if(videoAudio)videoAudio->setPlaybackPaused(paused);
+    if(radioStream)radioStream->setPaused(paused);
+#ifdef _WIN32
+    if (pcmOutput) {
+        if(!static_cast<StorylandAudioOutput*>(pcmOutput)->pause(paused))return;
+    }
+    if(!paused&&videoPlaying&&gameVideoDecoder) {
+        videoPlaybackStartTickMs=GetTickCount64();
+        videoPlaybackStartPosition=decodedVideoPosition;
+        nextVideoDecodeTickMs=videoPlaybackStartTickMs+
+            uint64_t(std::llround(1000.0/std::max(1.0,decodedVideoFrameRate)));
+    }
+#endif
+    playbackPaused = paused;
 }

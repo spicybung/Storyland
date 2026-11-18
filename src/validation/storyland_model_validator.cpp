@@ -1,4 +1,4 @@
-#include "storyland_model_validator.h"
+#include "src/validation/storyland_model_validator.h"
 
 #include <algorithm>
 #include <cmath>
@@ -535,6 +535,17 @@ void validateRequiredLeedsRelocations(StorylandModelIntegrityReport& report,
 void validateContainerHeader(StorylandModelIntegrityReport& report,
                              const StorylandModelFile& model,
                              const std::vector<uint8_t>& bytes) {
+    if (model.isManhuntModel()) {
+        if (bytes.size() < 0x30u) {
+            addIssue(report, StorylandModelIssueSeverity::Fatal, 0, "Manhunt PSP header is truncated.");
+            return;
+        }
+        const uint32_t table = readU32(bytes, 0x10u);
+        const uint32_t count = readU32(bytes, 0x14u);
+        if (table > bytes.size() || uint64_t(table) + uint64_t(count) * 4u > bytes.size())
+            addIssue(report, StorylandModelIssueSeverity::Fatal, 0x10u, "Manhunt PSP relocation table is truncated.");
+        return;
+    }
     if (model.isPmlcMdl()) {
         if (bytes.size() < 0x28u || std::memcmp(bytes.data(), "PMLC", 4u) != 0) {
             addIssue(report, StorylandModelIssueSeverity::Fatal, 0, "Missing PMLC model signature.");

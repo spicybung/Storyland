@@ -1,14 +1,65 @@
 #pragma once
+#include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
-#include "storyland_gim.h"
+#include "src/leeds/leeds_gim.h"
+
+struct RgbaMipLevel {
+    int width = 0;
+    int height = 0;
+    std::vector<uint8_t> rgba;
+    std::vector<uint8_t> ps2Alpha;
+    bool ps2FiveBitColor = false;
+};
 
 struct RgbaImage {
     int width = 0;
     int height = 0;
     std::vector<uint8_t> rgba;
+    // Authored levels 1 and above. Level 0 remains in the fields above.
+    std::vector<RgbaMipLevel> mipLevels;
+    // The editor keeps normalized alpha; native PS2 uploads retain all eight bits.
+    std::vector<uint8_t> ps2Alpha;
+    bool ps2FiveBitColor = false;
 };
+
+inline size_t rgbaDecodedByteTotal(size_t first, size_t second) {
+    return second > std::numeric_limits<size_t>::max() - first
+        ? std::numeric_limits<size_t>::max() : first + second;
+}
+
+inline size_t rgbaMipLevelDecodedBytes(const RgbaMipLevel& level) {
+    return rgbaDecodedByteTotal(level.rgba.size(), level.ps2Alpha.size());
+}
+
+inline size_t rgbaImageDecodedBytes(const RgbaImage& image) {
+    size_t bytes = rgbaDecodedByteTotal(image.rgba.size(), image.ps2Alpha.size());
+    for (const auto& level : image.mipLevels)
+        bytes = rgbaDecodedByteTotal(bytes, rgbaMipLevelDecodedBytes(level));
+    return bytes;
+}
+
+bool leedsBuildNativePs2Rgba(
+    const uint8_t* rgba, size_t rgbaBytes,
+    const uint8_t* ps2Alpha, size_t alphaBytes,
+    bool ps2FiveBitColor, std::vector<uint8_t>& nativeRgba,
+    std::string& errorMessage);
+
+inline bool leedsBuildNativePs2Rgba(const RgbaImage& image,
+    std::vector<uint8_t>& nativeRgba, std::string& errorMessage) {
+    return leedsBuildNativePs2Rgba(image.rgba.data(), image.rgba.size(),
+        image.ps2Alpha.data(), image.ps2Alpha.size(), image.ps2FiveBitColor,
+        nativeRgba, errorMessage);
+}
+
+inline bool leedsBuildNativePs2Rgba(const RgbaMipLevel& level,
+    std::vector<uint8_t>& nativeRgba, std::string& errorMessage) {
+    return leedsBuildNativePs2Rgba(level.rgba.data(), level.rgba.size(),
+        level.ps2Alpha.data(), level.ps2Alpha.size(), level.ps2FiveBitColor,
+        nativeRgba, errorMessage);
+}
 
 // Encode one PS2 Stories indexed texture block using the same palette, CLUT,
 // nibble packing and swizzle rules as the normal CHK/XTX writer.
@@ -35,7 +86,9 @@ enum class TextureKind {
     Ps2,
     CtwTex,
     Dds,
-    Gim
+    Gim,
+    ManhuntPsp,
+    ManhuntPs2
 };
 
 struct LeedsTextureEntry {
@@ -76,12 +129,14 @@ public:
     const std::vector<LeedsTextureEntry>& textures() const;
     bool decodeTexture(size_t textureIndex, RgbaImage& image, std::string& errorMessage) const;
     bool isMobileLcs() const;
+    bool isManhuntPc() const;
     bool decodeTextureMip(size_t textureIndex, uint32_t mipLevel, RgbaImage& image, std::string& errorMessage, MobileTextureLayout layout = MobileTextureLayout::Automatic) const;
     bool replaceTexture(size_t textureIndex, const RgbaImage& image, std::string& errorMessage);
     bool replaceTextureAsBpp(size_t textureIndex, const RgbaImage& image, uint8_t targetBpp, std::string& errorMessage);
     bool renameTexture(size_t textureIndex, const std::string& newName, std::string& errorMessage);
     bool createEmptyPs2(const std::wstring& virtualPath, std::string& errorMessage);
     bool createLcsBetaTxd(const std::wstring& virtualPath, const std::string& firstName, const RgbaImage& image, uint8_t bpp, std::string& errorMessage);
+    bool createLcsMobileTxd(const std::wstring& virtualPath, const std::string& firstName, const RgbaImage& image, uint8_t bpp, std::string& errorMessage);
     bool addTexture(const std::string& name, const RgbaImage& image, uint8_t bpp, std::string& errorMessage);
     bool swapTextureData(size_t firstTextureIndex, size_t secondTextureIndex, std::string& errorMessage);
     bool duplicateTexture(size_t textureIndex, const std::string& newName, std::string& errorMessage);
@@ -95,6 +150,7 @@ private:
     std::vector<uint8_t> dataBytes;
     std::vector<LeedsTextureEntry> entries;
     std::wstring path;
+    bool manhuntCompressed = false;
     LeedsPlatform loadedPlatform = LeedsPlatform::Auto;
     mutable std::vector<MobileTextureLayout> mobileLayoutCache;
     std::vector<StorylandGimImage> gimImages;

@@ -1,0 +1,304 @@
+{
+  "schema": 1,
+  "sources": {
+    "RETAIL_PIPELINES.md": "src/shaders/RETAIL_PIPELINES.md",
+    "aero.frag.glsl": "src/shaders/aero.frag.glsl",
+    "aero.vert.glsl": "src/shaders/aero.vert.glsl",
+    "aero_bloom.frag.glsl": "src/shaders/aero_bloom.frag.glsl",
+    "aero_deferred.frag.glsl": "src/shaders/aero_deferred.frag.glsl",
+    "aero_deferred.vert.glsl": "src/shaders/aero_deferred.vert.glsl",
+    "aero_light.glsl": "src/shaders/aero_light.glsl",
+    "console_world_vertex.glsl": "src/shaders/console_world_vertex.glsl",
+    "ctw_preview.frag.glsl": "src/shaders/ctw_preview.frag.glsl",
+    "ctw_preview.vert.glsl": "src/shaders/ctw_preview.vert.glsl",
+    "lcs_generic.frag.glsl": "src/shaders/shared/legacy_generic.frag.glsl",
+    "lcs_generic.hlsl": "src/re/reLCS2/shaders/lcs_generic.hlsl",
+    "lcs_generic.vert.glsl": "src/shaders/shared/legacy_generic.vert.glsl",
+    "lcs_pedestrian.frag.glsl": "src/shaders/shared/legacy_pedestrian.frag.glsl",
+    "lcs_pedestrian.hlsl": "src/re/reLCS2/shaders/lcs_pedestrian.hlsl",
+    "lcs_pedestrian.vert.glsl": "src/shaders/shared/legacy_pedestrian.vert.glsl",
+    "lcs_ps2_generic.frag.glsl": "src/re/reLCS2/shaders/lcs_ps2_vehicle.frag.glsl",
+    "lcs_ps2_generic.vert.glsl": "src/re/reLCS2/shaders/lcs_ps2_vehicle.vert.glsl",
+    "lcs_ps2_pedestrian.frag.glsl": "src/re/reLCS2/shaders/lcs_ps2_pedestrian.frag.glsl",
+    "lcs_ps2_pedestrian.vert.glsl": "src/re/reLCS2/shaders/lcs_ps2_vehicle.vert.glsl",
+    "lcs_ps2_vegetation.frag.glsl": "src/re/reLCS2/shaders/lcs_ps2_world.frag.glsl",
+    "lcs_ps2_vegetation.vert.glsl": "src/re/reLCS2/shaders/lcs_ps2_world.vert.glsl",
+    "lcs_ps2_vehicle.frag.glsl": "src/re/reLCS2/shaders/lcs_ps2_vehicle.frag.glsl",
+    "lcs_ps2_vehicle.vert.glsl": "src/re/reLCS2/shaders/lcs_ps2_vehicle.vert.glsl",
+    "lcs_ps2_world.frag.glsl": "src/re/reLCS2/shaders/lcs_ps2_world.frag.glsl",
+    "lcs_ps2_world.vert.glsl": "src/re/reLCS2/shaders/lcs_ps2_world.vert.glsl",
+    "lcs_psp_generic.frag.glsl": "src/re/reLCS2/shaders/lcs_psp_generic.frag.glsl",
+    "lcs_psp_generic.vert.glsl": "src/re/reLCS2/shaders/lcs_psp_generic.vert.glsl",
+    "lcs_psp_pedestrian.frag.glsl": "src/re/reLCS2/shaders/lcs_psp_pedestrian.frag.glsl",
+    "lcs_psp_pedestrian.vert.glsl": "src/re/reLCS2/shaders/lcs_psp_pedestrian.vert.glsl",
+    "lcs_psp_vegetation.frag.glsl": "src/re/reLCS2/shaders/lcs_psp_vegetation.frag.glsl",
+    "lcs_psp_vegetation.vert.glsl": "src/re/reLCS2/shaders/lcs_psp_vegetation.vert.glsl",
+    "lcs_psp_vehicle.frag.glsl": "src/re/reLCS2/shaders/lcs_psp_vehicle.frag.glsl",
+    "lcs_psp_vehicle.vert.glsl": "src/re/reLCS2/shaders/lcs_psp_vehicle.vert.glsl",
+    "lcs_psp_world.frag.glsl": "src/re/reLCS2/shaders/lcs_psp_world.frag.glsl",
+    "lcs_psp_world.vert.glsl": "src/re/reLCS2/shaders/lcs_psp_world.vert.glsl",
+    "lcs_vegetation.frag.glsl": "src/shaders/shared/legacy_vegetation.frag.glsl",
+    "lcs_vegetation.hlsl": "src/re/reLCS2/shaders/lcs_vegetation.hlsl",
+    "lcs_vegetation.vert.glsl": "src/shaders/shared/legacy_vegetation.vert.glsl",
+    "lcs_vehicle.frag.glsl": "src/shaders/shared/legacy_vehicle.frag.glsl",
+    "lcs_vehicle.hlsl": "src/re/reLCS2/shaders/lcs_vehicle.hlsl",
+    "lcs_vehicle.vert.glsl": "src/shaders/shared/legacy_vehicle.vert.glsl",
+    "lcs_world.frag.glsl": "src/shaders/shared/legacy_world.frag.glsl",
+    "lcs_world.hlsl": "src/re/reLCS2/shaders/lcs_world.hlsl",
+    "lcs_world.vert.glsl": "src/shaders/shared/legacy_world.vert.glsl",
+    "mobile_vehicle_fragment.glsl": "src/shaders/mobile_vehicle_fragment.glsl",
+    "mobile_vehicle_vertex.glsl": "src/shaders/mobile_vehicle_vertex.glsl",
+    "mobile_world_fragment.glsl": "src/shaders/mobile_world_fragment.glsl",
+    "mobile_world_vertex.glsl": "src/shaders/mobile_world_vertex.glsl",
+    "neo.vert.glsl": "src/shaders/neo.vert.glsl",
+    "ps2_fragment.glsl": "src/shaders/ps2_fragment.glsl",
+    "ps2_vertex.glsl": "src/shaders/ps2_vertex.glsl",
+    "san_andreas.frag.glsl": "src/shaders/san_andreas.frag.glsl",
+    "skygfx.frag.glsl": "src/shaders/skygfx.frag.glsl",
+    "skygfx.vert.glsl": "src/shaders/skygfx.vert.glsl",
+    "storyland_aero_portable.h": "src/shaders/storyland_aero_portable.h",
+    "storyland_aero_water_dx.h": "src/shaders/storyland_aero_water_dx.h",
+    "storyland_fxaa_dx.h": "src/shaders/storyland_fxaa_dx.h",
+    "storyland_fxaa_gl.h": "src/shaders/storyland_fxaa_gl.h",
+    "storyland_ps2_dx.h": "src/shaders/storyland_ps2_dx.h",
+    "storyland_ps2_postfx_dx.h": "src/shaders/storyland_ps2_postfx_dx.h",
+    "storyland_shader_sources.h.in": "src/shaders/storyland_shader_sources.h.in",
+    "storyland_shaders.cpp": "src/shaders/storyland_shaders.cpp",
+    "storyland_shaders.h": "src/shaders/storyland_shaders.h",
+    "storyland_vcs_psp_dx.h": "src/re/reVCS/shaders/storyland_vcs_psp_dx.h",
+    "timecyc.dat": "src/shaders/timecyc.dat",
+    "vcs_generic.frag.glsl": "src/shaders/shared/legacy_generic.frag.glsl",
+    "vcs_generic.hlsl": "src/re/reVCS/shaders/vcs_generic.hlsl",
+    "vcs_generic.vert.glsl": "src/shaders/shared/legacy_generic.vert.glsl",
+    "vcs_pedestrian.frag.glsl": "src/shaders/shared/legacy_pedestrian.frag.glsl",
+    "vcs_pedestrian.hlsl": "src/re/reVCS/shaders/vcs_pedestrian.hlsl",
+    "vcs_pedestrian.vert.glsl": "src/shaders/shared/legacy_pedestrian.vert.glsl",
+    "vcs_ps2_generic.frag.glsl": "src/re/reVCS/shaders/vcs_ps2_vehicle.frag.glsl",
+    "vcs_ps2_generic.vert.glsl": "src/re/reVCS/shaders/vcs_ps2_vehicle.vert.glsl",
+    "vcs_ps2_pedestrian.frag.glsl": "src/re/reVCS/shaders/vcs_ps2_pedestrian.frag.glsl",
+    "vcs_ps2_pedestrian.vert.glsl": "src/re/reVCS/shaders/vcs_ps2_pedestrian.vert.glsl",
+    "vcs_ps2_vegetation.frag.glsl": "src/re/reVCS/shaders/vcs_ps2_world.frag.glsl",
+    "vcs_ps2_vegetation.vert.glsl": "src/re/reVCS/shaders/vcs_ps2_world.vert.glsl",
+    "vcs_ps2_vehicle.frag.glsl": "src/re/reVCS/shaders/vcs_ps2_vehicle.frag.glsl",
+    "vcs_ps2_vehicle.vert.glsl": "src/re/reVCS/shaders/vcs_ps2_vehicle.vert.glsl",
+    "vcs_ps2_world.frag.glsl": "src/re/reVCS/shaders/vcs_ps2_world.frag.glsl",
+    "vcs_ps2_world.vert.glsl": "src/re/reVCS/shaders/vcs_ps2_world.vert.glsl",
+    "vcs_psp_fragment.glsl": "src/re/reVCS/shaders/vcs_psp_fragment.glsl",
+    "vcs_psp_generic.frag.glsl": "src/re/reVCS/shaders/vcs_psp_world.frag.glsl",
+    "vcs_psp_generic.vert.glsl": "src/re/reVCS/shaders/vcs_psp_vehicle.vert.glsl",
+    "vcs_psp_pedestrian.frag.glsl": "src/re/reVCS/shaders/vcs_psp_world.frag.glsl",
+    "vcs_psp_pedestrian.vert.glsl": "src/re/reVCS/shaders/vcs_psp_vehicle.vert.glsl",
+    "vcs_psp_vegetation.frag.glsl": "src/re/reVCS/shaders/vcs_psp_world.frag.glsl",
+    "vcs_psp_vegetation.vert.glsl": "src/re/reVCS/shaders/vcs_psp_world.vert.glsl",
+    "vcs_psp_vehicle.frag.glsl": "src/re/reVCS/shaders/vcs_psp_world.frag.glsl",
+    "vcs_psp_vehicle.vert.glsl": "src/re/reVCS/shaders/vcs_psp_vehicle.vert.glsl",
+    "vcs_psp_vertex.glsl": "src/re/reVCS/shaders/vcs_psp_vertex.glsl",
+    "vcs_psp_world.frag.glsl": "src/re/reVCS/shaders/vcs_psp_world.frag.glsl",
+    "vcs_psp_world.vert.glsl": "src/re/reVCS/shaders/vcs_psp_world.vert.glsl",
+    "vcs_vegetation.frag.glsl": "src/shaders/shared/legacy_vegetation.frag.glsl",
+    "vcs_vegetation.hlsl": "src/re/reVCS/shaders/vcs_vegetation.hlsl",
+    "vcs_vegetation.vert.glsl": "src/shaders/shared/legacy_vegetation.vert.glsl",
+    "vcs_vehicle.frag.glsl": "src/shaders/shared/legacy_vehicle.frag.glsl",
+    "vcs_vehicle.hlsl": "src/re/reVCS/shaders/vcs_vehicle.hlsl",
+    "vcs_vehicle.vert.glsl": "src/shaders/shared/legacy_vehicle.vert.glsl",
+    "vcs_world.frag.glsl": "src/shaders/shared/legacy_world.frag.glsl",
+    "vcs_world.hlsl": "src/re/reVCS/shaders/vcs_world.hlsl",
+    "vcs_world.vert.glsl": "src/shaders/shared/legacy_world.vert.glsl"
+  },
+  "aliases": [
+    {
+      "canonical": "src/shaders/shared/legacy_world.vert.glsl",
+      "original_files": [
+        "src/shaders/lcs_world.vert.glsl",
+        "src/shaders/vcs_world.vert.glsl"
+      ],
+      "sha256": "52ccfe7abf12930988d0f56dbf657e0cf2347f0536d9395474a95b860917abec",
+      "byte_identical": true
+    },
+    {
+      "canonical": "src/re/reVCS/shaders/vcs_ps2_world.frag.glsl",
+      "original_files": [
+        "src/shaders/vcs_ps2_vegetation.frag.glsl",
+        "src/shaders/vcs_ps2_world.frag.glsl"
+      ],
+      "sha256": "ce28feaedcbe7bd9c6544733c9c56d4063cf891a3a041d0cf23e5f5b4901b467",
+      "byte_identical": true
+    },
+    {
+      "canonical": "src/shaders/shared/legacy_pedestrian.frag.glsl",
+      "original_files": [
+        "src/shaders/lcs_pedestrian.frag.glsl",
+        "src/shaders/vcs_pedestrian.frag.glsl"
+      ],
+      "sha256": "ddb6a37f73479a011a680ab1cc304a4c097ec57c57aa80f0254f901905c7de0c",
+      "byte_identical": true
+    },
+    {
+      "canonical": "src/shaders/shared/legacy_vegetation.frag.glsl",
+      "original_files": [
+        "src/shaders/lcs_vegetation.frag.glsl",
+        "src/shaders/vcs_vegetation.frag.glsl"
+      ],
+      "sha256": "0ba39b6a06f1f405ddfe2054b16164d523170cf3dac902928e461018a83cc0f7",
+      "byte_identical": true
+    },
+    {
+      "canonical": "src/re/reVCS/shaders/vcs_psp_world.frag.glsl",
+      "original_files": [
+        "src/shaders/vcs_psp_generic.frag.glsl",
+        "src/shaders/vcs_psp_pedestrian.frag.glsl",
+        "src/shaders/vcs_psp_vegetation.frag.glsl",
+        "src/shaders/vcs_psp_vehicle.frag.glsl",
+        "src/shaders/vcs_psp_world.frag.glsl"
+      ],
+      "sha256": "0a9d44bda233c2461dc69c3c5878f9e9565c8033e8498829611d55ef36213251",
+      "byte_identical": true
+    },
+    {
+      "canonical": "src/shaders/shared/legacy_vehicle.vert.glsl",
+      "original_files": [
+        "src/shaders/lcs_vehicle.vert.glsl",
+        "src/shaders/vcs_vehicle.vert.glsl"
+      ],
+      "sha256": "37271d3b4eb0616963faa3a45f693cb832ad34197c73f9a2bce73b93bf09f6a9",
+      "byte_identical": true
+    },
+    {
+      "canonical": "src/shaders/shared/legacy_vehicle.frag.glsl",
+      "original_files": [
+        "src/shaders/lcs_vehicle.frag.glsl",
+        "src/shaders/vcs_vehicle.frag.glsl"
+      ],
+      "sha256": "30ad0d762fad8d158c0d5f45294ba4fbf04ed7dc1886f158d9302017b8093e05",
+      "byte_identical": true
+    },
+    {
+      "canonical": "src/re/reVCS/shaders/vcs_psp_vehicle.vert.glsl",
+      "original_files": [
+        "src/shaders/vcs_psp_generic.vert.glsl",
+        "src/shaders/vcs_psp_pedestrian.vert.glsl",
+        "src/shaders/vcs_psp_vehicle.vert.glsl"
+      ],
+      "sha256": "96dc4d0e63efedd7543c53a1e3eddd5ed19bf8b6426e31bda6b5f686423acd41",
+      "byte_identical": true
+    },
+    {
+      "canonical": "src/re/reVCS/shaders/vcs_ps2_world.vert.glsl",
+      "original_files": [
+        "src/shaders/vcs_ps2_vegetation.vert.glsl",
+        "src/shaders/vcs_ps2_world.vert.glsl"
+      ],
+      "sha256": "2c750eb058b7eef80413c6471fba6515de9efc90b0783966d6f967fac467f62e",
+      "byte_identical": true
+    },
+    {
+      "canonical": "src/re/reLCS2/shaders/lcs_ps2_vehicle.frag.glsl",
+      "original_files": [
+        "src/shaders/lcs_ps2_generic.frag.glsl",
+        "src/shaders/lcs_ps2_vehicle.frag.glsl"
+      ],
+      "sha256": "f35bf719a14f0b9d1b5e6deed4d75a0ec366cdbbf9e45afa633cf640ab893738",
+      "byte_identical": true
+    },
+    {
+      "canonical": "src/re/reVCS/shaders/vcs_ps2_vehicle.frag.glsl",
+      "original_files": [
+        "src/shaders/vcs_ps2_generic.frag.glsl",
+        "src/shaders/vcs_ps2_vehicle.frag.glsl"
+      ],
+      "sha256": "1b068289b1f41303240577af44a6907d2c0c4b2126c9a3507e733c81f0002c4d",
+      "byte_identical": true
+    },
+    {
+      "canonical": "src/shaders/shared/legacy_pedestrian.vert.glsl",
+      "original_files": [
+        "src/shaders/lcs_pedestrian.vert.glsl",
+        "src/shaders/vcs_pedestrian.vert.glsl"
+      ],
+      "sha256": "e101e96ab14bd3333079244b5ea22c939b052bb62cba1906131e624e85c6cf84",
+      "byte_identical": true
+    },
+    {
+      "canonical": "src/shaders/shared/legacy_generic.frag.glsl",
+      "original_files": [
+        "src/shaders/lcs_generic.frag.glsl",
+        "src/shaders/vcs_generic.frag.glsl"
+      ],
+      "sha256": "9e1f0c48051cb3bf29427a38217d212b18c6bfc2e8ff31b8972e20d36ee84ff8",
+      "byte_identical": true
+    },
+    {
+      "canonical": "src/re/reVCS/shaders/vcs_ps2_vehicle.vert.glsl",
+      "original_files": [
+        "src/shaders/vcs_ps2_generic.vert.glsl",
+        "src/shaders/vcs_ps2_vehicle.vert.glsl"
+      ],
+      "sha256": "79f70fe735eca04f8f762e133ceba1cdd45e6f73b7929871ef16e4c1189cc997",
+      "byte_identical": true
+    },
+    {
+      "canonical": "src/re/reVCS/shaders/vcs_psp_world.vert.glsl",
+      "original_files": [
+        "src/shaders/vcs_psp_vegetation.vert.glsl",
+        "src/shaders/vcs_psp_world.vert.glsl"
+      ],
+      "sha256": "8bd93912affcd59dc89ab5fc4298bc36470d84c679313bb5bf5d09b35c90f331",
+      "byte_identical": true
+    },
+    {
+      "canonical": "src/shaders/shared/legacy_generic.vert.glsl",
+      "original_files": [
+        "src/shaders/lcs_generic.vert.glsl",
+        "src/shaders/vcs_generic.vert.glsl"
+      ],
+      "sha256": "65b0ca365881afa41e0cfd2459bbc4d5652d0bb357bcb97058e8aa46ad9807e5",
+      "byte_identical": true
+    },
+    {
+      "canonical": "src/shaders/shared/legacy_vegetation.vert.glsl",
+      "original_files": [
+        "src/shaders/lcs_vegetation.vert.glsl",
+        "src/shaders/vcs_vegetation.vert.glsl"
+      ],
+      "sha256": "328e1520044abeb11d3ca3e6643b6421635709da8cd07840fc88443fb3b5a472",
+      "byte_identical": true
+    },
+    {
+      "canonical": "src/re/reLCS2/shaders/lcs_ps2_world.vert.glsl",
+      "original_files": [
+        "src/shaders/lcs_ps2_vegetation.vert.glsl",
+        "src/shaders/lcs_ps2_world.vert.glsl"
+      ],
+      "sha256": "5895d005df338f5a039c1e35766acb7b5b621781c454256383ed673bf90388e7",
+      "byte_identical": true
+    },
+    {
+      "canonical": "src/shaders/shared/legacy_world.frag.glsl",
+      "original_files": [
+        "src/shaders/lcs_world.frag.glsl",
+        "src/shaders/vcs_world.frag.glsl"
+      ],
+      "sha256": "ec5b31645362cce0fbaf2958195b2d5861aba6347b533e38921c29e175929af7",
+      "byte_identical": true
+    },
+    {
+      "canonical": "src/re/reLCS2/shaders/lcs_ps2_vehicle.vert.glsl",
+      "original_files": [
+        "src/shaders/lcs_ps2_generic.vert.glsl",
+        "src/shaders/lcs_ps2_pedestrian.vert.glsl",
+        "src/shaders/lcs_ps2_vehicle.vert.glsl"
+      ],
+      "sha256": "7680721b71c6cf8a4c319cb1dd11f578a412e1af4234c3ccc9fc9fbefc951939",
+      "byte_identical": true
+    },
+    {
+      "canonical": "src/re/reLCS2/shaders/lcs_ps2_world.frag.glsl",
+      "original_files": [
+        "src/shaders/lcs_ps2_vegetation.frag.glsl",
+        "src/shaders/lcs_ps2_world.frag.glsl"
+      ],
+      "sha256": "fb678282061effcd024dec729f823a54afd8240939ebfc2c872e882f21d76e72",
+      "byte_identical": true
+    }
+  ]
+}

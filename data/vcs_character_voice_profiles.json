@@ -1,0 +1,533 @@
+{
+  "format": "storyland_character_voice_profiles",
+  "format_version": 2,
+  "game": "vcs",
+  "status": "profile_definitions_with_localized_catalogue_and_selected_backend",
+  "voice_identity": "Character voice directions for reference-conditioned neural speech. Reference recordings are selected in external backend configuration; a profile definition alone does not provide a matching voice. eSpeak NG remains an explicitly selected diagnostic stand-in backend.",
+  "parameter_semantics": "Engine-neutral authoring direction. Pitch is relative to a selected backend voice; rate is a multiplier, not words per minute. A backend must explicitly support or translate controls.",
+  "shared_policy_id": "storyland.generated_multilingual.strict.v2",
+  "emotion_presets": [
+    {
+      "id": "neutral",
+      "rate_multiplier": 1.0,
+      "pitch_offset_semitones": 0.0,
+      "energy_offset": 0.0
+    },
+    {
+      "id": "urgent",
+      "rate_multiplier": 1.12,
+      "pitch_offset_semitones": 0.6,
+      "energy_offset": 0.2
+    },
+    {
+      "id": "angry",
+      "rate_multiplier": 1.04,
+      "pitch_offset_semitones": 0.2,
+      "energy_offset": 0.3
+    },
+    {
+      "id": "quiet",
+      "rate_multiplier": 0.92,
+      "pitch_offset_semitones": -0.4,
+      "energy_offset": -0.2
+    },
+    {
+      "id": "reassuring",
+      "rate_multiplier": 0.95,
+      "pitch_offset_semitones": 0.0,
+      "energy_offset": -0.1
+    }
+  ],
+  "profiles": [
+    {
+      "id": "vcs.victor_vance",
+      "display_name": "Victor Vance",
+      "voice_kind": "character_voice_direction",
+      "language": "en",
+      "policy_id": "storyland.generated_multilingual.strict.v2",
+      "backend_binding": "storyland.mission_voice.selected.v2",
+      "actor_reference_audio": null,
+      "timbre": "Low-mid, steady and clear",
+      "accent_direction": "Light American English",
+      "performance_direction": "Grounded adult voice. Use economical phrasing and firm consonants. Concern is audible without making every line angry.",
+      "pitch_offset_semitones": -1.0,
+      "speaking_rate_multiplier": 0.97,
+      "energy": 0.5,
+      "roughness": 0.15,
+      "allowed_emotions": [
+        "neutral",
+        "urgent",
+        "angry",
+        "quiet",
+        "reassuring"
+      ],
+      "supported_languages": [
+        "en",
+        "ru"
+      ]
+    },
+    {
+      "id": "vcs.lance_vance",
+      "display_name": "Lance Vance",
+      "voice_kind": "character_voice_direction",
+      "language": "en",
+      "policy_id": "storyland.generated_multilingual.strict.v2",
+      "backend_binding": "storyland.mission_voice.selected.v2",
+      "actor_reference_audio": null,
+      "timbre": "Mid, bright and animated",
+      "accent_direction": "Light American English",
+      "performance_direction": "Expressive adult voice with a smile in confident lines. Let confidence falter under pressure. Keep excited delivery intelligible rather than shrill.",
+      "pitch_offset_semitones": 1.0,
+      "speaking_rate_multiplier": 1.08,
+      "energy": 0.75,
+      "roughness": 0.1,
+      "allowed_emotions": [
+        "neutral",
+        "urgent",
+        "angry",
+        "quiet",
+        "reassuring"
+      ],
+      "supported_languages": [
+        "en",
+        "ru"
+      ]
+    },
+    {
+      "id": "vcs.jerry_martinez",
+      "display_name": "Jerry Martinez",
+      "voice_kind": "character_voice_direction",
+      "language": "en",
+      "policy_id": "storyland.generated_multilingual.strict.v2",
+      "backend_binding": "storyland.mission_voice.selected.v2",
+      "actor_reference_audio": null,
+      "timbre": "Low-mid, dry and clipped",
+      "accent_direction": "Light American English",
+      "performance_direction": "Adult voice with relaxed authority and dry amusement. Use short instructions and deliberate pauses. Threats stay controlled instead of becoming constant shouting.",
+      "pitch_offset_semitones": -0.5,
+      "speaking_rate_multiplier": 0.94,
+      "energy": 0.45,
+      "roughness": 0.35,
+      "allowed_emotions": [
+        "neutral",
+        "urgent",
+        "angry",
+        "quiet",
+        "reassuring"
+      ],
+      "supported_languages": [
+        "en",
+        "ru"
+      ]
+    },
+    {
+      "id": "vcs.phil_cassidy",
+      "display_name": "Phil Cassidy",
+      "voice_kind": "character_voice_direction",
+      "language": "en",
+      "policy_id": "storyland.generated_multilingual.strict.v2",
+      "backend_binding": "storyland.mission_voice.selected.v2",
+      "actor_reference_audio": null,
+      "timbre": "Low, broad and weathered",
+      "accent_direction": "Light Southern American English",
+      "performance_direction": "Resonant adult voice with a rough edge and hearty emphasis. Use readable regional rhythm, not exaggerated pronunciation or intoxicated slurring.",
+      "pitch_offset_semitones": -2.0,
+      "speaking_rate_multiplier": 0.95,
+      "energy": 0.7,
+      "roughness": 0.65,
+      "allowed_emotions": [
+        "neutral",
+        "urgent",
+        "angry",
+        "quiet",
+        "reassuring"
+      ],
+      "supported_languages": [
+        "en",
+        "ru"
+      ]
+    },
+    {
+      "id": "vcs.louise_cassidy_williams",
+      "display_name": "Louise Cassidy-Williams",
+      "voice_kind": "character_voice_direction",
+      "language": "en",
+      "policy_id": "storyland.generated_multilingual.strict.v2",
+      "backend_binding": "storyland.mission_voice.selected.v2",
+      "actor_reference_audio": null,
+      "timbre": "Mid, warm and direct",
+      "accent_direction": "Light Southern American English",
+      "performance_direction": "Warm adult voice with clear emotional changes. Fear shortens phrases, while resolve strengthens them. Preserve agency; do not make all delivery sound helpless.",
+      "pitch_offset_semitones": 0.5,
+      "speaking_rate_multiplier": 0.99,
+      "energy": 0.5,
+      "roughness": 0.1,
+      "allowed_emotions": [
+        "neutral",
+        "urgent",
+        "angry",
+        "quiet",
+        "reassuring"
+      ],
+      "supported_languages": [
+        "en",
+        "ru"
+      ]
+    },
+    {
+      "id": "vcs.marty_jay_williams",
+      "display_name": "Marty Jay Williams",
+      "voice_kind": "character_voice_direction",
+      "language": "en",
+      "policy_id": "storyland.generated_multilingual.strict.v2",
+      "backend_binding": "storyland.mission_voice.selected.v2",
+      "actor_reference_audio": null,
+      "timbre": "Low, rough and forceful",
+      "accent_direction": "Light Southern American English",
+      "performance_direction": "Coarse adult voice with heavy stress on short phrases. Anger changes rhythm and energy, not the permitted vocabulary. Avoid caricatured regional delivery.",
+      "pitch_offset_semitones": -1.8,
+      "speaking_rate_multiplier": 0.96,
+      "energy": 0.8,
+      "roughness": 0.7,
+      "allowed_emotions": [
+        "neutral",
+        "urgent",
+        "angry",
+        "quiet",
+        "reassuring"
+      ],
+      "supported_languages": [
+        "en",
+        "ru"
+      ]
+    },
+    {
+      "id": "vcs.armando_mendez",
+      "display_name": "Armando Mendez",
+      "voice_kind": "character_voice_direction",
+      "language": "en",
+      "policy_id": "storyland.generated_multilingual.strict.v2",
+      "backend_binding": "storyland.mission_voice.selected.v2",
+      "actor_reference_audio": null,
+      "timbre": "Low-mid, smooth and deliberate",
+      "accent_direction": "Light Spanish-influenced English",
+      "performance_direction": "Polished adult voice. Convey control through even pacing and precise articulation. Threatening lines remain courteous and quiet rather than theatrical.",
+      "pitch_offset_semitones": -1.2,
+      "speaking_rate_multiplier": 0.91,
+      "energy": 0.4,
+      "roughness": 0.1,
+      "allowed_emotions": [
+        "neutral",
+        "urgent",
+        "angry",
+        "quiet",
+        "reassuring"
+      ],
+      "supported_languages": [
+        "en",
+        "ru"
+      ]
+    },
+    {
+      "id": "vcs.diego_mendez",
+      "display_name": "Diego Mendez",
+      "voice_kind": "character_voice_direction",
+      "language": "en",
+      "policy_id": "storyland.generated_multilingual.strict.v2",
+      "backend_binding": "storyland.mission_voice.selected.v2",
+      "actor_reference_audio": null,
+      "timbre": "Low, spare and restrained",
+      "accent_direction": "Light Spanish-influenced English",
+      "performance_direction": "Restrained adult voice with short phrases and minimal ornament. Use longer pauses sparingly. Quiet intensity should remain intelligible.",
+      "pitch_offset_semitones": -2.4,
+      "speaking_rate_multiplier": 0.88,
+      "energy": 0.3,
+      "roughness": 0.2,
+      "allowed_emotions": [
+        "neutral",
+        "urgent",
+        "angry",
+        "quiet",
+        "reassuring"
+      ],
+      "supported_languages": [
+        "en",
+        "ru"
+      ]
+    },
+    {
+      "id": "vcs.ricardo_diaz",
+      "display_name": "Ricardo Diaz",
+      "voice_kind": "character_voice_direction",
+      "language": "en",
+      "policy_id": "storyland.generated_multilingual.strict.v2",
+      "backend_binding": "storyland.mission_voice.selected.v2",
+      "actor_reference_audio": null,
+      "timbre": "Low-mid, sharp and volatile",
+      "accent_direction": "Light Spanish-influenced English",
+      "performance_direction": "Energetic adult voice with abrupt changes in emphasis. Use bursts of anger separated by controlled lines. Do not make the accent or loudness a joke.",
+      "pitch_offset_semitones": -0.6,
+      "speaking_rate_multiplier": 1.06,
+      "energy": 0.85,
+      "roughness": 0.4,
+      "allowed_emotions": [
+        "neutral",
+        "urgent",
+        "angry",
+        "quiet",
+        "reassuring"
+      ],
+      "supported_languages": [
+        "en",
+        "ru"
+      ]
+    },
+    {
+      "id": "vcs.reni_wassulmaier",
+      "display_name": "Reni Wassulmaier",
+      "voice_kind": "character_voice_direction",
+      "language": "en",
+      "policy_id": "storyland.generated_multilingual.strict.v2",
+      "backend_binding": "storyland.mission_voice.selected.v2",
+      "actor_reference_audio": null,
+      "timbre": "Mid-high, airy and theatrical",
+      "accent_direction": "Light German-influenced English",
+      "performance_direction": "Expressive adult voice with playful timing, clear diction, and varied melody. Theatricality comes from performance direction, not mockery of identity or accent.",
+      "pitch_offset_semitones": 1.5,
+      "speaking_rate_multiplier": 1.07,
+      "energy": 0.75,
+      "roughness": 0.05,
+      "allowed_emotions": [
+        "neutral",
+        "urgent",
+        "angry",
+        "quiet",
+        "reassuring"
+      ],
+      "supported_languages": [
+        "en",
+        "ru"
+      ]
+    },
+    {
+      "id": "vcs.umberto_robina",
+      "display_name": "Umberto Robina",
+      "voice_kind": "character_voice_direction",
+      "language": "en",
+      "policy_id": "storyland.generated_multilingual.strict.v2",
+      "backend_binding": "storyland.mission_voice.selected.v2",
+      "actor_reference_audio": null,
+      "timbre": "Mid-low, full and assertive",
+      "accent_direction": "Light Cuban Spanish-influenced English",
+      "performance_direction": "Full adult voice that balances pride, warmth, and authority. Use strong emphasis without exaggerating pronunciation.",
+      "pitch_offset_semitones": -0.7,
+      "speaking_rate_multiplier": 1.02,
+      "energy": 0.8,
+      "roughness": 0.25,
+      "allowed_emotions": [
+        "neutral",
+        "urgent",
+        "angry",
+        "quiet",
+        "reassuring"
+      ],
+      "supported_languages": [
+        "en",
+        "ru"
+      ]
+    },
+    {
+      "id": "vcs.bryan_forbes",
+      "display_name": "Bryan Forbes",
+      "voice_kind": "character_voice_direction",
+      "language": "en",
+      "policy_id": "storyland.generated_multilingual.strict.v2",
+      "backend_binding": "storyland.mission_voice.selected.v2",
+      "actor_reference_audio": null,
+      "timbre": "Mid, smooth with a tense edge",
+      "accent_direction": "Light American English",
+      "performance_direction": "Conversational adult voice. Sound reassuring when composed, then increasingly hurried under pressure. Keep the underlying voice identity consistent.",
+      "pitch_offset_semitones": 0.2,
+      "speaking_rate_multiplier": 1.03,
+      "energy": 0.55,
+      "roughness": 0.1,
+      "allowed_emotions": [
+        "neutral",
+        "urgent",
+        "angry",
+        "quiet",
+        "reassuring"
+      ],
+      "supported_languages": [
+        "en",
+        "ru"
+      ]
+    },
+    {
+      "id": "vcs.gonzalez",
+      "display_name": "Gonzalez",
+      "voice_kind": "character_voice_direction",
+      "language": "en",
+      "policy_id": "storyland.generated_multilingual.strict.v2",
+      "backend_binding": "storyland.mission_voice.selected.v2",
+      "actor_reference_audio": null,
+      "timbre": "Low-mid, measured and slightly breathy",
+      "accent_direction": "Light Spanish-influenced English",
+      "performance_direction": "Measured adult voice with relaxed beginnings and firmer endings. Impatience should tighten timing, not change the accent or introduce additional profanity.",
+      "pitch_offset_semitones": -1.2,
+      "speaking_rate_multiplier": 0.93,
+      "energy": 0.4,
+      "roughness": 0.15,
+      "allowed_emotions": [
+        "neutral",
+        "urgent",
+        "angry",
+        "quiet",
+        "reassuring"
+      ],
+      "supported_languages": [
+        "en",
+        "ru"
+      ]
+    },
+    {
+      "id": "vcs.barry_mickelthwaite",
+      "display_name": "Barry Mickelthwaite",
+      "voice_kind": "character_voice_direction",
+      "language": "en",
+      "policy_id": "storyland.generated_multilingual.strict.v2",
+      "backend_binding": "storyland.mission_voice.selected.v2",
+      "actor_reference_audio": null,
+      "timbre": "Mid-high, quick and anxious",
+      "accent_direction": "Light Northern English",
+      "performance_direction": "Brisk adult voice with nervous pauses and occasional rushed phrases. Keep the regional colour light and every instruction understandable.",
+      "pitch_offset_semitones": 0.7,
+      "speaking_rate_multiplier": 1.1,
+      "energy": 0.65,
+      "roughness": 0.15,
+      "allowed_emotions": [
+        "neutral",
+        "urgent",
+        "angry",
+        "quiet",
+        "reassuring"
+      ],
+      "supported_languages": [
+        "en",
+        "ru"
+      ]
+    },
+    {
+      "id": "vcs.mary_jo_cassidy",
+      "display_name": "Mary-Jo Cassidy",
+      "voice_kind": "character_voice_direction",
+      "language": "en",
+      "policy_id": "storyland.generated_multilingual.strict.v2",
+      "backend_binding": "storyland.mission_voice.selected.v2",
+      "actor_reference_audio": null,
+      "timbre": "Mid, brisk and firm",
+      "accent_direction": "Light Southern American English",
+      "performance_direction": "Practical adult voice with direct phrasing and little hesitation. Show concern through urgency rather than softness alone.",
+      "pitch_offset_semitones": 0.7,
+      "speaking_rate_multiplier": 1.02,
+      "energy": 0.65,
+      "roughness": 0.15,
+      "allowed_emotions": [
+        "neutral",
+        "urgent",
+        "angry",
+        "quiet",
+        "reassuring"
+      ],
+      "supported_languages": [
+        "en",
+        "ru"
+      ]
+    },
+    {
+      "id": "vcs.alberto_robina",
+      "display_name": "Alberto Robina",
+      "voice_kind": "character_voice_direction",
+      "language": "en",
+      "policy_id": "storyland.generated_multilingual.strict.v2",
+      "backend_binding": "storyland.mission_voice.selected.v2",
+      "actor_reference_audio": null,
+      "timbre": "Low-mid, measured and warm",
+      "accent_direction": "Light Cuban Spanish-influenced English",
+      "performance_direction": "Mature adult voice with warm resonance and measured pauses. Use age as a subtle performance quality, not exaggerated frailty.",
+      "pitch_offset_semitones": -1.4,
+      "speaking_rate_multiplier": 0.9,
+      "energy": 0.35,
+      "roughness": 0.35,
+      "allowed_emotions": [
+        "neutral",
+        "urgent",
+        "angry",
+        "quiet",
+        "reassuring"
+      ],
+      "supported_languages": [
+        "en",
+        "ru"
+      ]
+    },
+    {
+      "id": "vcs.janet_vance",
+      "display_name": "Janet Vance",
+      "voice_kind": "character_voice_direction",
+      "language": "en",
+      "policy_id": "storyland.generated_multilingual.strict.v2",
+      "backend_binding": "storyland.mission_voice.selected.v2",
+      "actor_reference_audio": null,
+      "timbre": "Mid, loose and expressive",
+      "accent_direction": "Light American English",
+      "performance_direction": "Adult voice with conversational variation and uneven confidence. Emotional shifts should remain readable without adding slurs or unsupported content.",
+      "pitch_offset_semitones": 0.3,
+      "speaking_rate_multiplier": 0.98,
+      "energy": 0.6,
+      "roughness": 0.3,
+      "allowed_emotions": [
+        "neutral",
+        "urgent",
+        "angry",
+        "quiet",
+        "reassuring"
+      ],
+      "supported_languages": [
+        "en",
+        "ru"
+      ]
+    },
+    {
+      "id": "vcs.phil_collins_standin",
+      "display_name": "Phil Collins",
+      "voice_kind": "character_voice_direction",
+      "language": "en",
+      "policy_id": "storyland.generated_multilingual.strict.v2",
+      "backend_binding": "storyland.mission_voice.selected.v2",
+      "actor_reference_audio": null,
+      "timbre": "Mid, neutral and composed",
+      "accent_direction": "Light British English",
+      "performance_direction": "Adult speaking voice with clear, conversational phrasing.",
+      "pitch_offset_semitones": 0.0,
+      "speaking_rate_multiplier": 0.98,
+      "energy": 0.4,
+      "roughness": 0.05,
+      "allowed_emotions": [
+        "neutral",
+        "urgent",
+        "angry",
+        "quiet",
+        "reassuring"
+      ],
+      "supported_languages": [
+        "en",
+        "ru"
+      ]
+    }
+  ],
+  "supported_languages": [
+    "en",
+    "ru"
+  ]
+}

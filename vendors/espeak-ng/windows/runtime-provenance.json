@@ -1,0 +1,43 @@
+{
+  "backend": "eSpeak NG",
+  "version": "1.52.0",
+  "windows": {
+    "url": "https://github.com/espeak-ng/espeak-ng/releases/download/1.52.0/espeak-ng.msi",
+    "size": 12765862,
+    "sha256": "7f673c709ea5dd579d3b5ebb98688cc575328a6ab7438d2bc405b88cedaeafb9",
+    "checksum_note": "SHA-256 measured locally. Release metadata supplies asset size; it does not publish a digest.",
+    "dll_sha256": "e737572df0a35a32b7bd444537c661c1c916b13b0b91351030c7f1d531307beb",
+    "architecture": "x86_64",
+    "required_runtime": "Microsoft Visual C++ 2015-2022 x64 runtime (MSVCP140, VCRUNTIME140, VCRUNTIME140_1), UCRT and Windows system libraries"
+  },
+  "linux": {
+    "architecture": "x86_64",
+    "distribution": "Debian13 trixie",
+    "packages": [
+      {
+        "package": "espeak-ng-data_1.52.0+dfsg-5_amd64.deb",
+        "sha256": "7c239b30e419897313b5b8c98123cf3ec871cfedbf43bbb956b985a492e37f19"
+      },
+      {
+        "package": "libespeak-ng1_1.52.0+dfsg-5_amd64.deb",
+        "sha256": "845886095f5be3ba7680c8e15de068f76d67600275cbd7b6f6c7d00e53c05b34"
+      },
+      {
+        "package": "libpcaudio0_1.3-1_amd64.deb",
+        "sha256": "db95c30434707a60774ed9ad0193ba680e061ae7d99f354a1a93f147317a4ea5"
+      },
+      {
+        "package": "libsonic0_0.2.0-13+b1_amd64.deb",
+        "sha256": "07a1d67546465f07638be05f0931d79e0d6bb1a7831e1f67ac6611d1ba297009"
+      }
+    ],
+    "required_system_libraries": [
+      "glibc",
+      "libm",
+      "ALSA",
+      "PulseAudio client library and its dependencies"
+    ]
+  },
+  "changes_to_vendor_runtime": "None. Platform runtime libraries and voice data copied from their official packages.",
+  "voice_identity": "Stock original formant voice variants. No actor recordings or cloning model."
+}

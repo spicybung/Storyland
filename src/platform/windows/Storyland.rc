@@ -1,17 +1,43 @@
-#include "resource.h"
+#include "src/platform/windows/resource.h"
+#include "storyland_version.h"
 
 IDI_STORYLAND ICON "../../resources/storyland_icon.ico"
+IDI_STORYLAND_PLATFORM_PC ICON "../../resources/platform/pc.ico"
+IDI_STORYLAND_PLATFORM_PS2 ICON "../../resources/platform/ps2.ico"
+IDI_STORYLAND_PLATFORM_PSP ICON "../../resources/platform/psp.ico"
+IDI_STORYLAND_PLATFORM_MOBILE ICON "../../resources/platform/mobile.ico"
+IDR_STORYLAND_PLATFORM_PC_PIXELS RCDATA "../../resources/platform/pc.rgba"
+IDR_STORYLAND_PLATFORM_PS2_PIXELS RCDATA "../../resources/platform/ps2.rgba"
+IDR_STORYLAND_PLATFORM_PSP_PIXELS RCDATA "../../resources/platform/psp.rgba"
+IDR_STORYLAND_PLATFORM_MOBILE_PIXELS RCDATA "../../resources/platform/mobile.rgba"
 IDR_VCS_TIMECYC RCDATA "../../shaders/timecyc.dat"
+#ifdef STORYLAND_HAS_CUSTOM_INTRO_THEME
+IDR_STORYLAND_INTRO_THEME WAVE "../../resources/storyland_intro.wav"
+#else
+IDR_STORYLAND_INTRO_THEME WAVE "../../resources/fallback_storyland_intro.wav"
+#endif
+#ifdef STORYLAND_HAS_REIGNS_ERROR_THEME
 IDR_REIGNS_ERROR_THEME WAVE "../../resources/reigns_error_theme.wav"
+#endif
 IDR_REIGNS_SPLASH_MEME_GIF RCDATA "../../resources/sopranos_bigpussy.gif"
+#ifdef STORYLAND_HAS_VCS_ERROR_WARNING_THEME
 IDR_VCS_ERROR_WARNING_THEME WAVE "../../resources/vcs_error_warning_theme.wav"
+#endif
+#ifdef STORYLAND_HAS_GTA3_ERROR_THEME
 IDR_GTA3_ERROR_THEME WAVE "../../resources/gta3_error_theme.wav"
+#endif
+#ifdef STORYLAND_HAS_GTAVC_ERROR_THEME
 IDR_GTAVC_ERROR_THEME WAVE "../../resources/gtavc_error_theme.wav"
+#endif
+#ifdef STORYLAND_HAS_GTASA_ERROR_THEME
 IDR_GTASA_ERROR_THEME WAVE "../../resources/gtasa_error_theme.wav"
+#endif
+IDR_MANHUNT2_CRASH_THEME WAVE "../../resources/manhunt2_crash_theme.wav"
+IDR_STORYLAND_SPECIAL_THANKS_MUSIC WAVE "../../resources/storyland_about_credits.wav"
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 1,1,9,0
- PRODUCTVERSION 1,1,9,0
+ FILEVERSION STORYLAND_VERSION_RESOURCE_NUMBER
+ PRODUCTVERSION STORYLAND_VERSION_RESOURCE_NUMBER
  FILEFLAGSMASK 0x3fL
 #ifdef _DEBUG
  FILEFLAGS 0x1L
@@ -28,12 +54,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Reigns Studios\0"
             VALUE "FileDescription", "Storyland - GTA Stories file analyzer, editor, and viewer\0"
-            VALUE "FileVersion", "1.1.9\0"
+            VALUE "FileVersion", STORYLAND_VERSION_RESOURCE_STRING
             VALUE "InternalName", "Storyland\0"
             VALUE "LegalCopyright", "Storyland contributors\0"
             VALUE "OriginalFilename", "Storyland.exe\0"
             VALUE "ProductName", "Storyland\0"
-            VALUE "ProductVersion", "1.1.9\0"
+            VALUE "ProductVersion", STORYLAND_VERSION_RESOURCE_STRING
         END
     END
     BLOCK "VarFileInfo"

@@ -44,6 +44,27 @@ public:
         }
         valid_ = true;
     }
+    // World-space AABBs from the resident detail plan are cheaper to test
+    // than repeatedly transforming the eight corners of each placement.
+    bool visibleWorld(const StorylandMeshBounds& bounds, double padding = 0.0) const {
+        if (!valid_ || !bounds.valid) return true;
+        if (!std::isfinite(padding) || padding < 0.0) return true;
+        for (unsigned axis = 0; axis < 3; ++axis)
+            if (!std::isfinite(bounds.minimum[axis]) ||
+                !std::isfinite(bounds.maximum[axis])) return true;
+        for (const auto& plane : planes_) {
+            double furthest = plane[3];
+            for (size_t axis = 0; axis < 3; ++axis) {
+                const double point = plane[axis] >= 0.0 ?
+                    bounds.maximum[axis] + padding : bounds.minimum[axis] - padding;
+                furthest += plane[axis] * point;
+            }
+            if (furthest < -1.0e-6 * (1.0 + std::fabs(furthest))) return false;
+        }
+        return true;
+    }
+
+    // Test local bounds through the placement matrix so rotated props stay in view.
     bool visible(const StorylandMeshBounds& bounds, const float* transform) const {
         if (!valid_ || !bounds.valid || !transform) return true;
         for (size_t i = 0; i < 16; ++i) if (!std::isfinite(transform[i])) return true;

@@ -5,9 +5,14 @@
 #include <string>
 #include <vector>
 
+class StorylandGxtFile;
+
+enum class StorylandScmDialect { Unknown, Lcs, Vcs };
+
 struct StorylandScmHeader {
     bool valid = false;
     char targetGame = 0;
+    StorylandScmDialect dialect = StorylandScmDialect::Unknown;
     uint32_t mainScriptSize = 0;
     uint32_t largestMissionScriptSize = 0;
     uint32_t mainScriptOffset = 0;
@@ -25,6 +30,7 @@ struct StorylandScmMission {
     int id = -1;
     std::string label;
     std::string name;
+    std::string scriptName, textTable, category;
     size_t sourceBegin = 0;
     size_t sourceEnd = 0;
     std::string source;
@@ -35,10 +41,12 @@ struct StorylandScmMission {
 
 class StorylandScmFile {
 public:
-    bool loadFromFile(const std::wstring& filePath, std::string& errorMessage);
+    bool loadFromFile(const std::wstring& filePath, std::string& errorMessage, bool loadNearbyText = true);
     bool setDecompiledSource(const std::string& text, const std::string& mode, std::string& errorMessage);
     bool replaceMissionSource(size_t missionIndex, const std::string& text, std::string& errorMessage);
     bool applyMissionNamesFile(const std::wstring& filePath, std::string& errorMessage);
+
+    void applyRetailMissionTitles(const StorylandGxtFile& text);
 
     const std::wstring& sourcePath() const;
     const std::vector<uint8_t>& rawBytes() const;
@@ -47,6 +55,11 @@ public:
     const StorylandScmHeader& header() const;
     const std::vector<StorylandScmMission>& missions() const;
 
+    std::string scriptObjectName(int32_t reference) const {
+        if(reference>=0)return {};
+        const auto index=uint64_t(-int64_t(reference));
+        return index<objectNames.size()?objectNames[size_t(index)]:std::string{};
+    }
     bool hasNativeMissionTable() const;
     bool hasDecompiledSource() const;
     std::string missionSource(size_t missionIndex) const;
@@ -59,6 +72,7 @@ private:
     std::string decompiledSource;
     std::string activeMode;
     StorylandScmHeader nativeHeader;
+    std::vector<std::string> objectNames;
     std::vector<StorylandScmMission> nativeMissionRows;
     std::vector<StorylandScmMission> missionRows;
 

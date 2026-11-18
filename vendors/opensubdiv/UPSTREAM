@@ -1,0 +1,3 @@
+Source: https://github.com/PixarAnimationStudios/OpenSubdiv
+Tag: v3_6_1
+Components: Far, Sdc, Vtr (CPU Loop refinement)

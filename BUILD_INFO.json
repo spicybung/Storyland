@@ -1,0 +1,19 @@
+{
+  "name": "Storyland",
+  "version": "1.3.6",
+  "internal_save_schema_version": 75,
+  "package_revision": "1.3.6-clean-full-source",
+  "archive_root": "Storyland",
+  "source_layout": {
+    "shared": "src",
+    "LCS": "src/re/reLCS2",
+    "VCS": "src/re/reVCS",
+    "Android": "android"
+  },
+  "platforms": [
+    "Windows",
+    "Linux",
+    "Android"
+  ],
+  "note": "Full application source, game runtimes, build inputs and media assets. Optional vendor test suites, example programs, generated release-proof inventories and build-wide hash stamps are omitted."
+}

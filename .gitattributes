@@ -4,7 +4,22 @@
 *.cmd text eol=crlf
 *.wav -text
 *.mp3 -text
+*.pss -text
 *.gif -text
 *.png -text
 *.ico -text
 *.dat -text
+*.xz -text
+*.zip -text
+*.gz -text
+*.a -text
+*.lib -text
+*.dll -text
+*.so -text
+*.ttf -text
+*.xtx -text
+*.txd -text
+
+# Preserve upstream bytes and historical validation receipts across checkouts.
+/vendors/** -text
+/docs/** -text
